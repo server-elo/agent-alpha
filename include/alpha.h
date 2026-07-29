@@ -24,7 +24,7 @@
  * silently truncated to this size. */
 #define ALPHA_EDIT_MAX_BYTES 2000000
 /* Hard wall-clock cap for one user request (seconds). */
-#define ALPHA_REQUEST_MAX_SECONDS 3600
+#define ALPHA_REQUEST_MAX_SECONDS 10800
 
 typedef struct {
     const char *base_url;   /* e.g. http://127.0.0.1:8317/v1 */

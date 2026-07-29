@@ -82,8 +82,37 @@ static size_t history_bytes(cJSON *history) {
     return total;
 }
 
+/* Tool observations are only useful for the request that produced them. Kept
+ * forever they dominate the session (measured: 170 KB of a 202 KB history) and
+ * are re-uploaded on EVERY llm call, so a 27-turn request resent ~5 MB and burnt
+ * its wall-clock budget on reconnaissance instead of work. Keep the most recent
+ * few; older ones are superseded by the assistant's own summaries. */
+#define ALPHA_KEEP_OBSERVATIONS 4
+
+static int is_observation(cJSON *m) {
+    const char *c = cJSON_GetStringValue(cJSON_GetObjectItem(m, "content"));
+    return c && strncmp(c, "[tool observations", 18) == 0;
+}
+
+static void prune_observations(cJSON *history) {
+    int n = cJSON_GetArraySize(history);
+    int total = 0;
+    for (int i = 0; i < n; i++)
+        if (is_observation(cJSON_GetArrayItem(history, i))) total++;
+    int drop = total - ALPHA_KEEP_OBSERVATIONS;
+    for (int i = 0; i < cJSON_GetArraySize(history) && drop > 0; ) {
+        if (is_observation(cJSON_GetArrayItem(history, i))) {
+            cJSON_DeleteItemFromArray(history, i);
+            drop--;
+            continue;   /* indices shifted */
+        }
+        i++;
+    }
+}
+
 static void session_save(const char *path, cJSON *history) {
     if (!path || !path[0] || !history) return;
+    prune_observations(history);
     int n = cJSON_GetArraySize(history);
     while (n > ALPHA_HISTORY_MAX_MSGS) {
         cJSON_DeleteItemFromArray(history, 0);
