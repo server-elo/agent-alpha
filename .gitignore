@@ -1,0 +1,10 @@
+# Secrets — .env holds the live Telegram bot token. Never commit.
+.env
+.env.local
+
+# Build output
+alpha
+*.o
+
+# Chat history / poll state
+sessions/

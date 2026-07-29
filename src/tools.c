@@ -1,0 +1,548 @@
+#include "alpha.h"
+#include <fcntl.h>
+#include <sys/types.h>
+#include <signal.h>
+#include <stdint.h>
+#include <sys/sysctl.h>
+
+/* NO security: any path, any shell. User asked open coding shell. */
+
+static sds read_file_all(const char *path, size_t max_bytes) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return sdscatprintf(sdsempty(), "ERROR open %s: %s", path, strerror(errno));
+    sds out = sdsempty();
+    char buf[8192];
+    size_t total = 0;
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (total + n > max_bytes) {
+            out = sdscatlen(out, buf, max_bytes - total);
+            out = sdscat(out, "\n… truncated");
+            break;
+        }
+        out = sdscatlen(out, buf, n);
+        total += n;
+    }
+    fclose(f);
+    return out;
+}
+
+/* mkdir -p without a shell. Never pass a path through system(): a path like
+ * /tmp/x$(touch /tmp/PWNED)y would execute the substitution. */
+static int mkdir_p(const char *dir) {
+    if (!dir || !dir[0]) return -1;
+    char tmp[PATH_MAX];
+    if (snprintf(tmp, sizeof(tmp), "%s", dir) >= (int)sizeof(tmp)) return -1;
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = 0;
+        if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+        *p = '/';
+    }
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+static int write_file_all(const char *path, const char *data, size_t len) {
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash && slash != dir) {
+        *slash = 0;
+        if (mkdir_p(dir) != 0) return -1;
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    if (len && fwrite(data, 1, len, f) != len) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    return 0;
+}
+
+/* Descendant tracking.
+ *
+ * kill(-pgid) alone is NOT enough: a grandchild that calls setsid() leaves our
+ * process group and survives every time (measured: 20/20 leaks). macOS has no
+ * /proc and hides other processes' env, so we sample the kernel process table
+ * and remember every PID that is ever seen linked to our tree — by process
+ * group, or by parent chain — before it can detach. */
+#define ALPHA_MAX_TRACKED 512
+/* Membership bitmap over the pid space so pt_has() is O(1) instead of a linear
+ * scan run 4 x 666 x 5000 times a second. */
+#define ALPHA_PID_BITS   (1 << 18)          /* covers default pid_max */
+#define ALPHA_PID_WORDS  (ALPHA_PID_BITS / 32)
+
+typedef struct {
+    pid_t pids[ALPHA_MAX_TRACKED];
+    int n;
+    uint32_t seen[ALPHA_PID_WORDS];
+} proctrack_t;
+
+static int pt_has(const proctrack_t *t, pid_t p) {
+    if (p <= 0 || p >= ALPHA_PID_BITS) return 0;
+    return (t->seen[p >> 5] >> (p & 31)) & 1u;
+}
+
+static void pt_add(proctrack_t *t, pid_t p) {
+    /* A pid outside the bitmap could never be marked seen, so it would be
+     * appended again on every pass and fill the array. Ignore it instead. */
+    if (p <= 1 || p >= ALPHA_PID_BITS) return;
+    if (pt_has(t, p) || t->n >= ALPHA_MAX_TRACKED) return;
+    t->seen[p >> 5] |= 1u << (p & 31);
+    t->pids[t->n++] = p;
+}
+
+/* Scratch buffer reused across samples: the old code malloc'd and freed a full
+ * ~430 KB process-table snapshot on every pass (~2 GB/s of churn). */
+typedef struct {
+    struct kinfo_proc *buf;
+    size_t cap;
+} pt_scratch_t;
+
+/* One pass over the kernel process table; add anything belonging to our tree. */
+static void pt_sample_buf(proctrack_t *t, pid_t root, pt_scratch_t *sc) {
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+    size_t len = 0;
+    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || len == 0) return;
+    if (len > sc->cap) {
+        size_t want = len + len / 2;            /* headroom, avoid realloc churn */
+        struct kinfo_proc *nb = realloc(sc->buf, want);
+        if (!nb) return;
+        sc->buf = nb;
+        sc->cap = want;
+    }
+    len = sc->cap;
+    if (sysctl(mib, 4, sc->buf, &len, NULL, 0) != 0) return;
+    int count = (int)(len / sizeof(struct kinfo_proc));
+    /* Repeat so multi-level chains are captured in the same sample. Stop as
+     * soon as a pass adds nothing new instead of always running 4 passes. */
+    for (int pass = 0; pass < 4; pass++) {
+        int before = t->n;
+        for (int i = 0; i < count; i++) {
+            pid_t pid  = sc->buf[i].kp_proc.p_pid;
+            pid_t ppid = sc->buf[i].kp_eproc.e_ppid;
+            pid_t pgid = sc->buf[i].kp_eproc.e_pgid;
+            if (pid <= 1) continue;
+            if (pgid == root || pid == root || pt_has(t, ppid) || pt_has(t, pgid))
+                pt_add(t, pid);
+        }
+        if (t->n == before) break;
+    }
+}
+
+/* Convenience wrapper for the one-shot calls outside the sampler thread. */
+static void pt_sample(proctrack_t *t, pid_t root) {
+    pt_scratch_t sc = { .buf = NULL, .cap = 0 };
+    pt_sample_buf(t, root, &sc);
+    free(sc.buf);
+}
+
+static void pt_kill_all(proctrack_t *t) {
+    for (int i = 0; i < t->n; i++) kill(t->pids[i], SIGKILL);
+}
+
+/* A daemonizing grandchild detaches within ~1ms, long before a 100ms poll
+ * notices it. Sample continuously from a thread so the window is as small as
+ * the scheduler allows. */
+typedef struct {
+    proctrack_t *track;
+    pid_t root;
+    volatile int stop;
+    pthread_mutex_t lock;
+} sampler_t;
+
+static void *sampler_main(void *arg) {
+    sampler_t *s = arg;
+    pt_scratch_t sc = { .buf = NULL, .cap = 0 };
+    /* Daemonizing happens in the first milliseconds of a command, so only that
+     * window needs 200us polling. After it, back off hard: the tail exists just
+     * to notice processes spawned later, which is not latency-critical.
+     * Measured before backoff: ~38% of a core for the whole command. */
+    int i = 0;
+    while (!s->stop) {
+        pthread_mutex_lock(&s->lock);
+        pt_sample_buf(s->track, s->root, &sc);
+        pthread_mutex_unlock(&s->lock);
+        useconds_t iv = (i < 250)   ? 200      /* first ~50ms: catch daemonizers */
+                      : (i < 500)   ? 5000     /* next ~1.2s: settling */
+                                    : 50000;   /* steady state: 20 Hz */
+        i++;
+        usleep(iv);
+    }
+    free(sc.buf);
+    return NULL;
+}
+
+static sds shell_run(const char *cmd, const char *cwd) {
+    if (!cmd || !cmd[0]) return sdsnew("ERROR: empty command");
+
+    /* Write command to temp script to avoid quoting hell.
+     * fdopen the mkstemp fd directly — never reopen by name (symlink race in /tmp). */
+    char script[] = "/tmp/alpha-cmd-XXXXXX";
+    int sfd = mkstemp(script);
+    if (sfd < 0) return sdsnew("ERROR mkstemp script");
+    FILE *sf = fdopen(sfd, "w");
+    if (!sf) {
+        close(sfd);
+        unlink(script);
+        return sdsnew("ERROR write script");
+    }
+    fprintf(sf, "#!/bin/zsh\nset +e\n");
+    if (cwd && cwd[0]) {
+        fprintf(sf, "cd ");
+        /* single-quote cwd */
+        fputc('\'', sf);
+        for (const char *p = cwd; *p; p++) {
+            if (*p == '\'') fputs("'\\''", sf);
+            else fputc(*p, sf);
+        }
+        fputc('\'', sf);
+        fputs(" || exit 90\n", sf);
+    }
+    fputs("(\n", sf);
+    fputs(cmd, sf);
+    fputs("\n)\nEC=$?\necho\necho __ALPHA_EXIT:$EC\nexit $EC\n", sf);
+    fflush(sf);
+    fchmod(fileno(sf), 0700);
+    fclose(sf);
+
+    char outf[] = "/tmp/alpha-out-XXXXXX";
+    int ofd = mkstemp(outf);
+    if (ofd < 0) {
+        unlink(script);
+        return sdsnew("ERROR mkstemp out");
+    }
+
+    /* Hard cap shell (60s). Run in its own process group so a timeout kills
+     * the whole tree, not just the top shell (background children survived before). */
+    int timed_out = 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        dup2(ofd, STDOUT_FILENO);
+        dup2(ofd, STDERR_FILENO);
+        close(ofd);
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) { dup2(devnull, STDIN_FILENO); close(devnull); }
+        execl("/bin/zsh", "zsh", script, (char *)NULL);
+        _exit(127);
+    }
+    if (pid < 0) {
+        close(ofd);
+        unlink(script);
+        unlink(outf);
+        return sdsnew("ERROR fork");
+    }
+    close(ofd);
+
+    int status = 0;
+    proctrack_t track = { .n = 0 };
+    pt_add(&track, pid);
+    sampler_t smp = { .track = &track, .root = pid, .stop = 0 };
+    pthread_mutex_init(&smp.lock, NULL);
+    pthread_t sth;
+    int sth_ok = (pthread_create(&sth, NULL, sampler_main, &smp) == 0);
+
+    for (int waited = 0; waited < 600; waited++) {   /* 600 * 100ms = 60s */
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) { timed_out = 0; goto stop_sampler; }
+        if (r < 0) break;
+        usleep(100000);
+    }
+    timed_out = 1;
+
+stop_sampler:
+    smp.stop = 1;
+    if (sth_ok) pthread_join(sth, NULL);
+    pthread_mutex_destroy(&smp.lock);
+
+    if (timed_out) {
+        pt_sample(&track, pid);
+        kill(-pid, SIGKILL);
+        kill(pid, SIGKILL);
+        pt_kill_all(&track);
+        waitpid(pid, &status, 0);
+    }
+
+    sds out = read_file_all(outf, 200000);
+    unlink(script);
+    unlink(outf);
+    if (!out || !out[0]) {
+        if (out) sdsfree(out);
+        out = sdsnew("(no output)");
+    }
+    if (timed_out)
+        out = sdscat(out, "\nERROR: command exceeded 60s timeout — killed (process group).");
+    return out;
+}
+
+/* macOS Desktop/iCloud File Provider often hangs opendir forever — refuse early. */
+static int path_is_hang_prone(const char *path) {
+    if (!path || !path[0]) return 0;
+    if (strstr(path, "/Desktop") || strstr(path, "/Desktop/") ||
+        strcmp(path, "Desktop") == 0 || strncmp(path, "Desktop/", 8) == 0 ||
+        strstr(path, "/Library/Mobile Documents") ||
+        strstr(path, "com~apple~CloudDocs"))
+        return 1;
+    return 0;
+}
+
+static sds list_dir_sync(const char *p) {
+    DIR *d = opendir(p);
+    if (!d) return sdscatprintf(sdsempty(), "ERROR opendir %s: %s", p, strerror(errno));
+    sds out = sdsempty();
+    struct dirent *de;
+    char names[512][256];
+    int n = 0;
+    while ((de = readdir(d)) != NULL && n < 512) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        snprintf(names[n], sizeof(names[n]), "%s", de->d_name);
+        n++;
+    }
+    closedir(d);
+    for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n; j++)
+            if (strcasecmp(names[i], names[j]) > 0) {
+                char t[256];
+                snprintf(t, sizeof(t), "%s", names[i]);
+                snprintf(names[i], sizeof(names[i]), "%s", names[j]);
+                snprintf(names[j], sizeof(names[j]), "%s", t);
+            }
+    for (int i = 0; i < n; i++) {
+        char full[PATH_MAX];
+        snprintf(full, sizeof(full), "%s/%s", p, names[i]);
+        struct stat st;
+        if (stat(full, &st) == 0 && S_ISDIR(st.st_mode))
+            out = sdscatprintf(out, "dir  %s\n", names[i]);
+        else
+            out = sdscatprintf(out, "file %s\n", names[i]);
+    }
+    if (n == 0) out = sdscat(out, "(empty)\n");
+    return out;
+}
+
+/* list_dir with hard fail-closed on Desktop + 8s wall timeout via fork. */
+static sds list_dir(const char *path) {
+    const char *p = (path && path[0]) ? path : ".";
+    if (path_is_hang_prone(p)) {
+        return sdscatprintf(sdsempty(),
+            "ERROR: path hangs on this host (Desktop/iCloud File Provider): %s\n"
+            "Use /Users/lorenc/projects or /Users/lorenc/agent-desktop instead.\n",
+            p);
+    }
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return list_dir_sync(p);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]); close(pipefd[1]);
+        return list_dir_sync(p);
+    }
+    if (pid == 0) {
+        /* child */
+        close(pipefd[0]);
+        alarm(8);
+        sds out = list_dir_sync(p);
+        size_t len = out ? sdslen(out) : 0;
+        if (out && len) {
+            /* write length + body */
+            uint32_t n = (uint32_t)len;
+            if (write(pipefd[1], &n, sizeof(n)) == (ssize_t)sizeof(n))
+                write(pipefd[1], out, len);
+        } else {
+            uint32_t n = 0;
+            write(pipefd[1], &n, sizeof(n));
+        }
+        if (out) sdsfree(out);
+        close(pipefd[1]);
+        _exit(0);
+    }
+
+    close(pipefd[1]);
+    /* parent: wait up to 9s */
+    int status = 0;
+    int waited = 0;
+    while (waited < 90) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) break;
+        usleep(100000);
+        waited++;
+    }
+    if (waited >= 90) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+        close(pipefd[0]);
+        return sdscatprintf(sdsempty(),
+            "ERROR: list_dir timed out after 8s on %s\n"
+            "Prefer ~/projects or ~/agent-desktop (Desktop often hangs).\n", p);
+    }
+
+    uint32_t n = 0;
+    ssize_t nr = read(pipefd[0], &n, sizeof(n));
+    sds out = sdsempty();
+    if (nr == (ssize_t)sizeof(n) && n > 0 && n < 2000000) {
+        char *buf = malloc(n + 1);
+        if (buf) {
+            size_t got = 0;
+            while (got < n) {
+                ssize_t r = read(pipefd[0], buf + got, n - got);
+                if (r <= 0) break;
+                got += (size_t)r;
+            }
+            buf[got] = 0;
+            out = sdscatlen(out, buf, got);
+            free(buf);
+        }
+    }
+    close(pipefd[0]);
+    if (!out[0]) {
+        sdsfree(out);
+        return sdscatprintf(sdsempty(), "ERROR: list_dir empty/fail on %s", p);
+    }
+    return out;
+}
+
+sds tools_run(const char *name, cJSON *args, const char *cwd) {
+    if (!name) return sdsnew("ERROR: no tool name");
+    if (!args) args = cJSON_CreateObject();
+
+    if (strcmp(name, "execute_bash") == 0 || strcmp(name, "bash") == 0) {
+        const char *cmd = cJSON_GetStringValue(cJSON_GetObjectItem(args, "command"));
+        if (!cmd) cmd = cJSON_GetStringValue(cJSON_GetObjectItem(args, "cmd"));
+        /* block known hang paths before 60s shell wait */
+        if (cmd && (strstr(cmd, "/Desktop") || strstr(cmd, " ~/Desktop") ||
+                    strstr(cmd, "Desktop/") || strstr(cmd, "ls Desktop"))) {
+            return sdsnew(
+                "ERROR: command touches Desktop which hangs on this host.\n"
+                "Use /Users/lorenc/projects or /Users/lorenc/agent-desktop instead.\n");
+        }
+        return shell_run(cmd, cwd);
+    }
+    if (strcmp(name, "read_file") == 0) {
+        const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(args, "path"));
+        if (!path) return sdsnew("ERROR: path required");
+        char full[PATH_MAX];
+        if (path[0] == '/' || !cwd || !cwd[0])
+            snprintf(full, sizeof(full), "%s", path);
+        else
+            snprintf(full, sizeof(full), "%s/%s", cwd, path);
+        return read_file_all(full, 250000);
+    }
+    if (strcmp(name, "write_file") == 0) {
+        const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(args, "path"));
+        const char *content = cJSON_GetStringValue(cJSON_GetObjectItem(args, "content"));
+        if (!path) return sdsnew("ERROR: path required");
+        if (!content) content = "";
+        char full[PATH_MAX];
+        if (path[0] == '/' || !cwd || !cwd[0])
+            snprintf(full, sizeof(full), "%s", path);
+        else
+            snprintf(full, sizeof(full), "%s/%s", cwd, path);
+        if (write_file_all(full, content, strlen(content)) != 0)
+            return sdscatprintf(sdsempty(), "ERROR write %s: %s", full, strerror(errno));
+        return sdscatprintf(sdsempty(), "OK wrote %zu bytes → %s", strlen(content), full);
+    }
+    if (strcmp(name, "edit_file") == 0) {
+        const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(args, "path"));
+        const char *old_s = cJSON_GetStringValue(cJSON_GetObjectItem(args, "old_str"));
+        const char *new_s = cJSON_GetStringValue(cJSON_GetObjectItem(args, "new_str"));
+        if (!path || !old_s) return sdsnew("ERROR: path + old_str required");
+        if (!new_s) new_s = "";
+        char full[PATH_MAX];
+        if (path[0] == '/' || !cwd || !cwd[0])
+            snprintf(full, sizeof(full), "%s", path);
+        else
+            snprintf(full, sizeof(full), "%s/%s", cwd, path);
+        /* read_file_all truncates silently at its cap and appends a marker.
+         * Editing that result would write the truncated text back and destroy
+         * everything past the cap, while still reporting "OK". Refuse instead:
+         * the uniqueness check is unsound on a partial file anyway. */
+        struct stat est;
+        if (stat(full, &est) == 0 && (size_t)est.st_size > ALPHA_EDIT_MAX_BYTES)
+            return sdscatprintf(sdsempty(),
+                "ERROR: %s is %lld bytes, over the %zu byte edit limit. "
+                "Editing it would truncate the file.",
+                full, (long long)est.st_size, (size_t)ALPHA_EDIT_MAX_BYTES);
+        sds body = read_file_all(full, ALPHA_EDIT_MAX_BYTES);
+        if (strncmp(body, "ERROR", 5) == 0) return body;
+        char *pos = strstr(body, old_s);
+        if (!pos) {
+            sdsfree(body);
+            return sdsnew("ERROR: old_str not found");
+        }
+        if (strstr(pos + strlen(old_s), old_s)) {
+            sdsfree(body);
+            return sdsnew("ERROR: old_str not unique");
+        }
+        size_t pre = (size_t)(pos - body);
+        sds out = sdsnewlen(body, pre);
+        out = sdscat(out, new_s);
+        out = sdscat(out, pos + strlen(old_s));
+        sdsfree(body);
+        if (write_file_all(full, out, sdslen(out)) != 0) {
+            sdsfree(out);
+            return sdscatprintf(sdsempty(), "ERROR write %s", full);
+        }
+        sds msg = sdscatprintf(sdsempty(), "OK edited %s (%zu bytes now)", full, sdslen(out));
+        sdsfree(out);
+        return msg;
+    }
+    if (strcmp(name, "list_dir") == 0 || strcmp(name, "ls") == 0) {
+        const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(args, "path"));
+        char full[PATH_MAX];
+        if (!path || !path[0]) {
+            if (cwd && cwd[0]) snprintf(full, sizeof(full), "%s", cwd);
+            else snprintf(full, sizeof(full), ".");
+        } else if (path[0] == '/' || !cwd || !cwd[0]) {
+            snprintf(full, sizeof(full), "%s", path);
+        } else {
+            snprintf(full, sizeof(full), "%s/%s", cwd, path);
+        }
+        /* expand ~ */
+        if (full[0] == '~') {
+            const char *home = getenv("HOME");
+            if (home && home[0]) {
+                char exp[PATH_MAX];
+                if (full[1] == '/' || full[1] == 0)
+                    snprintf(exp, sizeof(exp), "%s%s", home, full + 1);
+                else
+                    snprintf(exp, sizeof(exp), "%s", full);
+                snprintf(full, sizeof(full), "%s", exp);
+            }
+        }
+        return list_dir(full);
+    }
+    if (strcmp(name, "browser") == 0 || strcmp(name, "web_browser") == 0) {
+        return browser_tool_run(args);
+    }
+    return sdscatprintf(sdsempty(), "ERROR: unknown tool %s", name);
+}
+
+cJSON *tools_schema(void) {
+    const char *json =
+        "["
+        "{\"type\":\"function\",\"function\":{\"name\":\"execute_bash\","
+        "\"description\":\"Run any shell command (open; no sandbox).\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"read_file\","
+        "\"description\":\"Read a file (any path).\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"write_file\","
+        "\"description\":\"Write full file contents (creates parents).\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"edit_file\","
+        "\"description\":\"Replace unique old_str with new_str in file.\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"path\":{\"type\":\"string\"},\"old_str\":{\"type\":\"string\"},\"new_str\":{\"type\":\"string\"}},"
+        "\"required\":[\"path\",\"old_str\",\"new_str\"]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"list_dir\","
+        "\"description\":\"List directory entries (any path).\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"path\":{\"type\":\"string\"}}}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"browser\",\"description\":\"OpenClaw-style pure-C browser. ONE sticky CDP tab. Loop: status/tabs -> open/navigate -> snapshot -> click/type/press/eval. close_others cleans junk. NEVER bash for click. Login/OAuth: snapshot+one click then stop. PROOF required.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\"},\"url\":{\"type\":\"string\"},\"selector\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"expression\":{\"type\":\"string\"},\"tab_id\":{\"type\":\"string\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"}},\"required\":[]}}}"
+        "]";
+    return cJSON_Parse(json);
+}
