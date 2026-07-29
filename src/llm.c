@@ -29,7 +29,7 @@ sds llm_chat_ex(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message,
         body = sdscatprintf(sdsempty(),
             "{\"model\":\"%s\",\"messages\":%s,\"tools\":%s,"
             "\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,"
-            "\"temperature\":0.2,\"max_tokens\":4096}",
+            "\"temperature\":0.2,\"max_tokens\":16384}",
             cfg->model ? cfg->model : "claude-opus-5",
             msgs_s ? msgs_s : "[]",
             tools_s ? tools_s : "[]");
@@ -40,7 +40,7 @@ sds llm_chat_ex(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message,
          * cut those answers off mid-sentence. */
         body = sdscatprintf(sdsempty(),
             "{\"model\":\"%s\",\"messages\":%s,"
-            "\"temperature\":0.4,\"max_tokens\":2048}",
+            "\"temperature\":0.4,\"max_tokens\":8192}",
             cfg->model ? cfg->model : "claude-opus-5",
             msgs_s ? msgs_s : "[]");
     }
@@ -66,7 +66,8 @@ sds llm_chat_ex(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message,
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, with_tools ? 120L : 45L);
+    /* Raised token caps mean longer generations; 45s cut off summaries mid-call. */
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, with_tools ? 300L : 240L);
     /* shell_run spawns threads; libcurl's default alarm/longjmp DNS timeout is
      * not safe in a threaded process. */
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
@@ -105,13 +106,26 @@ sds llm_chat_ex(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message,
         return sdsnew("ERROR: no message in LLM response");
     }
 
+    /* finish_reason == "length" means the reply was cut off mid-sentence.
+     * This was silently ignored: the truncated text became the final answer and
+     * the agent then reported a plausible-but-invented reason for stopping. */
+    const char *fr = cJSON_GetStringValue(cJSON_GetObjectItem(c0, "finish_reason"));
+    int truncated = (fr && strcmp(fr, "length") == 0);
+
     /* detach message for caller */
     cJSON *dup = cJSON_Duplicate(msg, 1);
     cJSON_Delete(root);
     if (out_message) *out_message = dup;
 
     const char *content = cJSON_GetStringValue(cJSON_GetObjectItem(dup, "content"));
-    return sdsnew(content ? content : "");
+    sds out = sdsnew(content ? content : "");
+    if (truncated) {
+        fprintf(stderr, "[alpha] WARNING: reply hit the token cap and was truncated\n");
+        out = sdscat(out,
+            "\n\n[TRUNCATED: this reply hit the output token limit and stops "
+            "mid-thought. It is incomplete \u2014 ask me to continue.]");
+    }
+    return out;
 }
 
 sds llm_chat(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message, int with_tools) {
