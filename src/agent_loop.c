@@ -201,6 +201,51 @@ static void notes_append(sds *notes, const char *name, const char *result) {
     }
 }
 
+/* The in-flight message array is resent in full on every LLM call, so its size
+ * drives cost quadratically across a long request (measured: 10 MB per call by
+ * turn 40, 216 MB cumulative). Only session_save() was bounded; nothing capped
+ * the live array. Trim the oldest tool results, which are the bulk of it and
+ * are already digested into tool_notes.
+ *
+ * The system prompt (index 0) and the most recent exchanges are never dropped. */
+#define ALPHA_LIVE_MAX_BYTES 400000
+
+static size_t messages_bytes(cJSON *messages) {
+    size_t t = 0;
+    int n = cJSON_GetArraySize(messages);
+    for (int i = 0; i < n; i++) {
+        const char *c = cJSON_GetStringValue(
+            cJSON_GetObjectItem(cJSON_GetArrayItem(messages, i), "content"));
+        if (c) t += strlen(c);
+    }
+    return t;
+}
+
+static void trim_live_messages(cJSON *messages) {
+    /* Walk forward from index 1 (keep the system prompt) and replace the oldest
+     * oversized tool results with a stub. A tool message must stay present so
+     * its tool_call_id still pairs with the assistant turn that requested it. */
+    int n = cJSON_GetArraySize(messages);
+    for (int i = 1; i < n - 6 && messages_bytes(messages) > ALPHA_LIVE_MAX_BYTES; i++) {
+        cJSON *m = cJSON_GetArrayItem(messages, i);
+        const char *role = cJSON_GetStringValue(cJSON_GetObjectItem(m, "role"));
+        if (!role) continue;
+        int is_tool = (strcmp(role, "tool") == 0);
+        int is_asst = (strcmp(role, "assistant") == 0);
+        if (!is_tool && !is_asst) continue;
+        cJSON *c = cJSON_GetObjectItem(m, "content");
+        const char *s = cJSON_GetStringValue(c);
+        if (!s || strlen(s) < 2000) continue;
+        /* An assistant turn carrying tool_calls must keep its structure; only
+         * its prose is replaced, never the message itself. */
+        cJSON_ReplaceItemInObject(m, "content", cJSON_CreateString(
+            is_tool
+              ? "[earlier tool output dropped to stay within the context budget — "
+                "re-run the tool if you need it again]"
+              : "[earlier reply abridged to stay within the context budget]"));
+    }
+}
+
 static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
     sds last = sdsempty();
     /* Turns alone do not bound a request: 40 turns x (120s LLM + 60s tool) is
@@ -220,6 +265,7 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
                 "answer now in plain text with what you already found.");
             break;
         }
+        trim_live_messages(messages);
         cJSON *msg = NULL;
         int failed = 0;
         sds content = llm_chat_ex(cfg, messages, &msg, 1 /* always tools available */, &failed);
