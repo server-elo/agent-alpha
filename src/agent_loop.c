@@ -61,6 +61,17 @@ static cJSON *session_load(const char *path) {
     free(buf);
     if (!arr || !cJSON_IsArray(arr)) {
         if (arr) cJSON_Delete(arr);
+        /* Unreadable history was silently replaced by an empty one, and the
+         * next save then overwrote the damaged file for good. Keep a copy so
+         * the conversation is recoverable, and say so. */
+        char keep[PATH_MAX];
+        snprintf(keep, sizeof(keep), "%s.corrupt", path);
+        if (rename(path, keep) == 0)
+            fprintf(stderr, "[alpha] session %s was unreadable; kept a copy at %s\n",
+                    path, keep);
+        else
+            fprintf(stderr, "[alpha] session %s was unreadable and could not be saved\n",
+                    path);
         return cJSON_CreateArray();
     }
     return arr;
