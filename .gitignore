@@ -8,3 +8,7 @@ alpha
 
 # Chat history / poll state
 sessions/
+tests/bin/
+
+# Runtime logs
+telegram.log

@@ -11,7 +11,7 @@ static void usage(const char *argv0) {
         "\nEnv:\n"
         "  ALPHA_BASE_URL   default http://127.0.0.1:8317/v1  (vibeproxy)\n"
         "  ALPHA_API_KEY    default none\n"
-        "  ALPHA_MODEL      default claude-opus-5 only\n"
+        "  ALPHA_MODEL      default vibeproxy/claude-opus-5\n"
         "  ALPHA_CWD        default $PWD\n"
         "  ALPHA_MAX_TURNS  default 24\n"
         "  TELEGRAM_BOT_TOKEN or ALPHA_TELEGRAM_BOT_TOKEN\n"

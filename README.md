@@ -6,7 +6,7 @@ Open AI coding shell in C. **No path pin / sandbox locks** — tools can read, w
 
 - CLI one-shot, REPL, or Telegram long-poll
 - Tools: `execute_bash`, `read_file`, `write_file`, `edit_file`, `list_dir`
-- LLM: **vibeproxy `claude-opus-5` only** (`http://127.0.0.1:8317/v1`) — no model shopping
+- LLM: **vibeproxy `claude-opus-5`** (`http://127.0.0.1:8317/v1`)
 - One tool per turn (`parallel_tool_calls: false`)
 
 ## Build

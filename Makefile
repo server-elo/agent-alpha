@@ -6,7 +6,7 @@ SRC = src/main.c src/agent_loop.c src/llm.c src/tools.c src/browser.c src/telegr
 OBJ = $(SRC:.c=.o)
 TARGET = alpha
 
-.PHONY: all clean run telegram repl install
+.PHONY: all clean run telegram repl install test
 
 all: $(TARGET)
 
@@ -19,8 +19,33 @@ src/%.o: src/%.c include/alpha.h
 deps/%.o: deps/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Tests include the module under test directly to reach its static functions,
+# so they compile their own copy -- run after `make`.
+TEST_SRC = tests/test_tools.c tests/test_session.c tests/test_telegram.c
+TEST_BIN = $(TEST_SRC:tests/%.c=tests/bin/%)
+TEST_DEPS = src/browser.o deps/cJSON.o deps/sds.o
+
+tests/bin/test_tools: tests/test_tools.c $(TEST_DEPS) | tests/bin
+	$(CC) $(CFLAGS) -o $@ $< $(TEST_DEPS) $(LDFLAGS)
+
+tests/bin/test_session: tests/test_session.c src/llm.o src/tools.o $(TEST_DEPS) | tests/bin
+	$(CC) $(CFLAGS) -o $@ $< src/llm.o src/tools.o $(TEST_DEPS) $(LDFLAGS)
+
+tests/bin/test_telegram: tests/test_telegram.c src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) | tests/bin
+	$(CC) $(CFLAGS) -o $@ $< src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) $(LDFLAGS)
+
+tests/bin:
+	mkdir -p tests/bin
+
+test: $(TEST_BIN)
+	@fail=0; for t in $(TEST_BIN); do \
+		echo "=== $$t ==="; ./$$t || fail=1; \
+	done; \
+	if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; exit 1; fi
+
 clean:
 	rm -f $(OBJ) $(TARGET)
+	rm -rf tests/bin
 
 run: $(TARGET)
 	./$(TARGET) $(ARGS)

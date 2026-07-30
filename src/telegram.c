@@ -51,6 +51,12 @@ static size_t utf8_safe_len(const char *s, size_t max) {
     return n;
 }
 
+/* Test seam: the suite substitutes a recorder so the real chunking path is
+ * exercised without a network. Production always uses tg_api. */
+#ifndef ALPHA_TG_SEND_HOOK
+#define ALPHA_TG_SEND_HOOK(tok, body) tg_api((tok), "sendMessage", (body))
+#endif
+
 static void tg_send(const char *token, long long chat_id, const char *text) {
     if (!text) text = "";
     size_t len = strlen(text);
@@ -72,7 +78,7 @@ static void tg_send(const char *token, long long chat_id, const char *text) {
         }
         sds body = sdscatprintf(sdsempty(),
             "{\"chat_id\":%lld,\"text\":\"%s\"}", chat_id, esc);
-        sds r = tg_api(token, "sendMessage", body);
+        sds r = ALPHA_TG_SEND_HOOK(token, body);
         /* A failed send used to be discarded silently — the user just saw
          * nothing. At minimum make it visible in the log. */
         if (r && (strncmp(r, "ERROR", 5) == 0 || strstr(r, "\"ok\":false")))
@@ -437,7 +443,7 @@ int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv) {
                 tg_send(token, chat_id,
                     "Agent Alpha — OpenClaw-style coding chat on Telegram.\n"
                     "Continuous memory in this chat. Open tools (no pin).\n"
-                    "Model: vibeproxy claude-opus-5\n\n"
+                    "Model: claude-opus-5\n\n"
                     "Talk normally. For code, just say what to change/test.\n"
                     "/status · /cwd <path> · /new (reset memory)\n");
                 continue;
