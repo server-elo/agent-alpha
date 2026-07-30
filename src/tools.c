@@ -4,6 +4,8 @@
 #include <signal.h>
 #include <stdint.h>
 #include <sys/sysctl.h>
+#include <libproc.h>
+#include <sys/proc_info.h>
 
 /* NO security: any path, any shell. User asked open coding shell. */
 
@@ -139,40 +141,56 @@ static void pt_sample(proctrack_t *t, pid_t root) {
     free(sc.buf);
 }
 
-static void pt_kill_all(proctrack_t *t) {
-    for (int i = 0; i < t->n; i++) kill(t->pids[i], SIGKILL);
+/* Sampling by ppid/pgid is a race the sampler cannot reliably win: a
+ * grandchild calls setsid() microseconds after fork, and once it does the
+ * ancestry link is gone (it reparents to launchd). So identify descendants by
+ * something they cannot shed — the stdout/stderr file this run created. fds
+ * are inherited across fork, exec and setsid, and the temp file's inode is
+ * unique to this command.
+ *
+ * This also sidesteps pid reuse: the check is "does this live process hold
+ * our file right now", not "was this number ours a minute ago".
+ *
+ * Escapes only if a child closes its inherited fds outright. */
+static void pt_sample_fd(proctrack_t *t, uint64_t ino, pid_t self) {
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+    size_t len = 0;
+    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || len == 0) return;
+    struct kinfo_proc *procs = malloc(len);
+    if (!procs) return;
+    if (sysctl(mib, 4, procs, &len, NULL, 0) != 0) { free(procs); return; }
+    int count = (int)(len / sizeof(struct kinfo_proc));
+
+    struct proc_fdinfo *fds = NULL;
+    int fds_cap = 0;
+    for (int i = 0; i < count; i++) {
+        pid_t pid = procs[i].kp_proc.p_pid;
+        if (pid <= 1 || pid == self || pt_has(t, pid)) continue;
+        int sz = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, NULL, 0);
+        if (sz <= 0) continue;                  /* gone, or not ours to inspect */
+        if (sz > fds_cap) {
+            struct proc_fdinfo *nb = realloc(fds, (size_t)sz);
+            if (!nb) break;
+            fds = nb;
+            fds_cap = sz;
+        }
+        sz = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds, fds_cap);
+        if (sz <= 0) continue;
+        int nfd = sz / (int)sizeof(struct proc_fdinfo);
+        for (int f = 0; f < nfd; f++) {
+            if (fds[f].proc_fdtype != PROX_FDTYPE_VNODE) continue;
+            struct vnode_fdinfowithpath v;
+            if (proc_pidfdinfo(pid, fds[f].proc_fd, PROC_PIDFDVNODEPATHINFO,
+                               &v, sizeof(v)) < (int)sizeof(v)) continue;
+            if (v.pvip.vip_vi.vi_stat.vst_ino == ino) { pt_add(t, pid); break; }
+        }
+    }
+    free(fds);
+    free(procs);
 }
 
-/* A daemonizing grandchild detaches within ~1ms, long before a 100ms poll
- * notices it. Sample continuously from a thread so the window is as small as
- * the scheduler allows. */
-typedef struct {
-    proctrack_t *track;
-    pid_t root;
-    volatile int stop;
-    pthread_mutex_t lock;
-} sampler_t;
-
-static void *sampler_main(void *arg) {
-    sampler_t *s = arg;
-    pt_scratch_t sc = { .buf = NULL, .cap = 0 };
-    /* Daemonizing happens in the first milliseconds of a command, so only that
-     * window needs 200us polling. After it, back off hard: the tail exists just
-     * to notice processes spawned later, which is not latency-critical.
-     * Measured before backoff: ~38% of a core for the whole command. */
-    int i = 0;
-    while (!s->stop) {
-        pthread_mutex_lock(&s->lock);
-        pt_sample_buf(s->track, s->root, &sc);
-        pthread_mutex_unlock(&s->lock);
-        useconds_t iv = (i < 250)   ? 200      /* first ~50ms: catch daemonizers */
-                      : (i < 500)   ? 5000     /* next ~1.2s: settling */
-                                    : 50000;   /* steady state: 20 Hz */
-        i++;
-        usleep(iv);
-    }
-    free(sc.buf);
-    return NULL;
+static void pt_kill_all(proctrack_t *t) {
+    for (int i = 0; i < t->n; i++) kill(t->pids[i], SIGKILL);
 }
 
 static sds shell_run(const char *cmd, const char *cwd) {
@@ -215,6 +233,12 @@ static sds shell_run(const char *cmd, const char *cwd) {
         return sdsnew("ERROR mkstemp out");
     }
 
+    /* Every descendant inherits this fd as stdout/stderr, so the inode
+     * identifies the tree even after a child calls setsid(). */
+    uint64_t out_ino = 0;
+    struct stat ost;
+    if (fstat(ofd, &ost) == 0) out_ino = (uint64_t)ost.st_ino;
+
     /* Hard cap shell (60s). Run in its own process group so a timeout kills
      * the whole tree, not just the top shell (background children survived before). */
     int timed_out = 0;
@@ -238,30 +262,23 @@ static sds shell_run(const char *cmd, const char *cwd) {
     close(ofd);
 
     int status = 0;
-    proctrack_t track = { .n = 0 };
-    pt_add(&track, pid);
-    sampler_t smp = { .track = &track, .root = pid, .stop = 0 };
-    pthread_mutex_init(&smp.lock, NULL);
-    pthread_t sth;
-    int sth_ok = (pthread_create(&sth, NULL, sampler_main, &smp) == 0);
-
     for (int waited = 0; waited < 600; waited++) {   /* 600 * 100ms = 60s */
         pid_t r = waitpid(pid, &status, WNOHANG);
-        if (r == pid) { timed_out = 0; goto stop_sampler; }
+        if (r == pid) { timed_out = 0; break; }
         if (r < 0) break;
         usleep(100000);
+        if (waited == 599) timed_out = 1;
     }
-    timed_out = 1;
-
-stop_sampler:
-    smp.stop = 1;
-    if (sth_ok) pthread_join(sth, NULL);
-    pthread_mutex_destroy(&smp.lock);
 
     if (timed_out) {
-        pt_sample(&track, pid);
+        proctrack_t track = { .n = 0 };
+        /* Group first: reaps everything that stayed in the session. */
         kill(-pid, SIGKILL);
         kill(pid, SIGKILL);
+        /* Then the ones that left it. Sampling by ancestry misses these, so
+         * find them by the output file they still hold open. */
+        pt_sample(&track, pid);
+        pt_sample_fd(&track, out_ino, getpid());
         pt_kill_all(&track);
         waitpid(pid, &status, 0);
     }
