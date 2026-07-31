@@ -508,6 +508,106 @@ static void test_only_one_poller_may_hold_the_lock(void) {
     sdsfree(body);
 }
 
+/* The log is written by redirecting stderr and was never truncated: it grew
+ * unbounded, ~95% of it "poll ok". Rotation must bound it without losing the
+ * fd the launcher redirected, and must not fire on a terminal. */
+static void test_log_rotates_when_large(void) {
+    TEST_BEGIN("log: an oversized log is rotated, and writing continues");
+
+    char dir[PATH_MAX], path[PATH_MAX], old[PATH_MAX];
+    session_dir(dir, sizeof(dir));
+    snprintf(path, sizeof(path), "%s/rot_test.log", dir);
+    snprintf(old, sizeof(old), "%s.1", path);
+    unlink(path); unlink(old);
+
+    int saved = dup(fileno(stderr));
+    CHECK(saved >= 0, "stderr saved");
+
+    /* Under threshold: must be left completely alone. */
+    FILE *f = fopen(path, "w");
+    if (f) { fputs("small\n", f); fclose(f); }
+    CHECK(freopen(path, "a", stderr) != NULL, "stderr redirected to the log");
+    log_rotate_if_large();
+    struct stat st;
+    int rotated_small = (stat(old, &st) == 0);
+
+    /* Over threshold: rotate. Write past the cap through stderr itself, the
+     * way the real process does, rather than out of band. */
+    char pad[4096];
+    memset(pad, 'x', sizeof(pad) - 1);
+    pad[sizeof(pad) - 1] = '\n';
+    for (long i = 0; i <= ALPHA_LOG_MAX_BYTES / (long)sizeof(pad); i++)
+        fwrite(pad, 1, sizeof(pad), stderr);
+    fflush(stderr);
+
+    long long before = 0;
+    if (stat(path, &st) == 0) before = (long long)st.st_size;
+
+    log_rotate_if_large();
+    /* A line written AFTER rotation must land in the new file: if the fd were
+     * still on the renamed inode, the log would silently stop growing. */
+    fprintf(stderr, "POSTROTATE_MARKER\n");
+    fflush(stderr);
+
+    long long after = 0, kept = 0;
+    int have_new = (stat(path, &st) == 0);
+    if (have_new) after = (long long)st.st_size;
+    int have_old = (stat(old, &st) == 0);
+    if (have_old) kept = (long long)st.st_size;
+
+    /* Restore before any CHECK, so failures are still reportable. */
+    dup2(saved, fileno(stderr));
+    close(saved);
+    clearerr(stderr);
+
+    CHECK(!rotated_small, "a log under the cap is not rotated");
+    CHECK(before >= ALPHA_LOG_MAX_BYTES, "log really exceeded the cap");
+    CHECK(have_old, "previous generation kept as .1");
+    CHECK(kept >= ALPHA_LOG_MAX_BYTES, "the .1 file holds the old content");
+    CHECK(have_new, "a fresh log exists after rotation");
+    CHECK(after < before, "the live log shrank");
+
+    char buf[256] = "";
+    FILE *nf = fopen(path, "rb");
+    if (nf) { size_t n = fread(buf, 1, sizeof(buf) - 1, nf); buf[n] = 0; fclose(nf); }
+    CHECK(strstr(buf, "POSTROTATE_MARKER") != NULL,
+          "writes after rotation reach the new file");
+
+    unlink(path); unlink(old);
+}
+
+/* Rotation keys off stderr being a regular file; on a terminal or pipe there
+ * is nothing to rotate and F_GETPATH would be meaningless. */
+static void test_log_rotation_ignores_non_files(void) {
+    TEST_BEGIN("log: rotation is a no-op when stderr is a pipe");
+
+    int fds[2];
+    CHECK(pipe(fds) == 0, "pipe created");
+    /* Non-blocking: if a broken rotation reopened stderr onto a file, nothing
+     * is ever written here and a blocking read would hang the whole suite
+     * instead of failing it (observed while sabotage-testing). */
+    fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK);
+    int saved = dup(fileno(stderr));
+    CHECK(dup2(fds[1], fileno(stderr)) >= 0, "stderr points at the pipe");
+
+    log_rotate_if_large();   /* must not crash, rename, or freopen */
+
+    /* stderr must still be the pipe afterwards. A rotation that reopened it
+     * onto a file here would send every later diagnostic somewhere invisible,
+     * so read the write back rather than merely asserting we did not crash. */
+    fprintf(stderr, "PIPE_STILL_LIVE\n");
+    fflush(stderr);
+    char buf[64] = "";
+    ssize_t n = read(fds[0], buf, sizeof(buf) - 1);
+    if (n > 0) buf[n] = 0;
+
+    dup2(saved, fileno(stderr));
+    close(saved); close(fds[0]); close(fds[1]);
+    clearerr(stderr);
+    CHECK(strstr(buf, "PIPE_STILL_LIVE") != NULL,
+          "stderr is untouched when it is not a regular file");
+}
+
 /* Concurrent voice notes must not collide on one temp path. */
 static void test_voice_downloads_do_not_share_a_path(void) {
     TEST_BEGIN("voice: concurrent downloads get distinct temp files");
@@ -544,6 +644,8 @@ int main(int argc, char **argv) {
     test_session_dir_matches_session_path();
     test_main_does_not_pin_root_to_cwd();
     test_only_one_poller_may_hold_the_lock();
+    test_log_rotates_when_large();
+    test_log_rotation_ignores_non_files();
     test_voice_downloads_do_not_share_a_path();
 
     /* The sandbox must have absorbed the writes, and the real install must be

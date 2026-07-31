@@ -41,7 +41,7 @@ tests/bin/test_session: tests/test_session.c src/agent_loop.c src/llm.o src/tool
 # The voice timeout is 3 minutes in production; the suite must not wait that
 # long to prove a wedged transcriber gets killed, so it is compiled short.
 tests/bin/test_telegram: tests/test_telegram.c src/telegram.c src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
-	$(CC) $(CFLAGS) -DALPHA_VOICE_TIMEOUT_MS=3000 -o $@ $< src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -DALPHA_VOICE_TIMEOUT_MS=3000 -DALPHA_LOG_MAX_BYTES=65536 -o $@ $< src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) $(LDFLAGS)
 
 tests/bin/test_llm: tests/test_llm.c src/llm.c src/tools.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< src/tools.o $(TEST_DEPS) $(LDFLAGS)

@@ -475,6 +475,43 @@ static int telegram_lock_acquire(void) {
     return fd;
 }
 
+/* Keep the log bounded.
+ *
+ * stderr is redirected to a file by the launcher and nothing ever truncated
+ * it: 3000 lines had accumulated, ~95% of them "poll ok". Rotating in here
+ * rather than in the wrapper means it also applies to `./alpha --telegram`
+ * run directly, and it can happen while the process is live.
+ *
+ * One generation is kept (.1) so an error just before rotation is still
+ * recoverable. Called from the poll loop, which is the only frequent writer.
+ * Does nothing when stderr is not a regular file (a terminal, a pipe). */
+#ifndef ALPHA_LOG_MAX_BYTES
+#define ALPHA_LOG_MAX_BYTES (2 * 1024 * 1024)
+#endif
+
+static void log_rotate_if_large(void) {
+    struct stat st;
+    if (fstat(fileno(stderr), &st) != 0) return;
+    if (!S_ISREG(st.st_mode)) return;
+    if (st.st_size < ALPHA_LOG_MAX_BYTES) return;
+
+    /* The path stderr points at, not a guess: the launcher's ALPHA_LOG is not
+     * visible here, and `./alpha --telegram >foo` uses neither. */
+    char path[PATH_MAX];
+    if (fcntl(fileno(stderr), F_GETPATH, path) != 0) return;
+
+    char old[PATH_MAX];
+    if (snprintf(old, sizeof(old), "%s.1", path) >= (int)sizeof(old)) return;
+    if (rename(path, old) != 0) return;
+
+    /* Reopen onto the same fd so the launcher's redirect keeps working and
+     * every existing FILE* (including this one) writes to the new file. */
+    if (!freopen(path, "a", stderr)) return;
+    setvbuf(stderr, NULL, _IOLBF, 0);
+    fprintf(stderr, "[alpha-tg] log rotated at %lld bytes -> %s\n",
+            (long long)st.st_size, old);
+}
+
 static void session_path_for_chat(char *out, size_t outsz, long long chat_id) {
     char dir[PATH_MAX];
     session_dir(dir, sizeof(dir));
@@ -710,6 +747,7 @@ int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv) {
         sds r = tg_api(token, "getUpdates", body);
         sdsfree(body);
         cycles++;
+        log_rotate_if_large();
         if (cycles % 3 == 1)
             fprintf(stderr, "[alpha-tg] poll ok offset=%lld cycles=%d\n", offset, cycles);
 
