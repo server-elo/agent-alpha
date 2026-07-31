@@ -25,6 +25,15 @@
 #define ALPHA_EDIT_MAX_BYTES 2000000
 /* Hard wall-clock cap for one user request (seconds). */
 #define ALPHA_REQUEST_MAX_SECONDS 10800
+/* Cap on one voice transcription. It runs on the Telegram poll thread, so an
+ * unbounded one stops every chat. Generous: the medium model takes ~11s for a
+ * 15s note, and a first run may download the model. */
+#ifndef ALPHA_VOICE_TIMEOUT_MS   /* overridable so tests need not wait 3 minutes */
+#define ALPHA_VOICE_TIMEOUT_MS 180000
+#endif
+/* Largest voice note accepted for download (bytes). Telegram's own cap is
+ * 20 MB; anything near that is minutes of transcription on the poll thread. */
+#define ALPHA_VOICE_MAX_BYTES (8 * 1024 * 1024)
 
 typedef struct {
     const char *base_url;   /* e.g. http://127.0.0.1:8317/v1 */

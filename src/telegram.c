@@ -1,6 +1,8 @@
 #include "alpha.h"
 #include <curl/curl.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -176,9 +178,21 @@ static void chat_cwd_set(long long chat_id, const char *cwd) {
  * never leaves the machine.
  *
  * Returns the transcript, or NULL if anything failed. */
+/* CURLOPT_MAXFILESIZE only rejects up front when the server declares a
+ * Content-Length, so the limit is enforced on the received bytes as well.
+ * Returning short aborts the transfer. */
+typedef struct {
+    FILE *f;
+    size_t written;
+} voice_sink_t;
+
 static size_t voice_write(char *ptr, size_t size, size_t nmemb, void *ud) {
-    FILE *f = ud;
-    return fwrite(ptr, size, nmemb, f);
+    voice_sink_t *s = ud;
+    size_t n = size * nmemb;
+    if (s->written + n > ALPHA_VOICE_MAX_BYTES) return 0;
+    size_t w = fwrite(ptr, size, nmemb, s->f);
+    s->written += w * size;
+    return w;
 }
 
 /* A voice note's scratch file. The pid alone is not unique: notes are
@@ -207,6 +221,7 @@ static int voice_download(const char *token, const char *file_id, char *out, siz
     voice_tmp_path(out, outsz);
     FILE *f = fopen(out, "wb");
     if (!f) { cJSON_Delete(root); return 0; }
+    voice_sink_t sink = { .f = f, .written = 0 };
 
     sds url = sdscatprintf(sdsempty(), "https://api.telegram.org/file/bot%s/%s", token, fpath);
     cJSON_Delete(root);
@@ -216,8 +231,11 @@ static int voice_download(const char *token, const char *file_id, char *out, siz
     if (curl) {
         curl_easy_setopt(curl, CURLOPT_URL, url);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, voice_write);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, f);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sink);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+        /* Telegram allows files up to 20 MB. Transcribing one costs minutes of
+         * CPU on the poll thread, so refuse oversized audio outright. */
+        curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)ALPHA_VOICE_MAX_BYTES);
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
         ok = (curl_easy_perform(curl) == CURLE_OK);
         curl_easy_cleanup(curl);
@@ -306,18 +324,80 @@ static sds voice_transcribe(const char *audio_path) {
     close(pipefd[1]);
     close(errfd[1]);
 
+    /* Collect both pipes under one deadline.
+     *
+     * This runs on the poll thread, so a transcriber that never finishes froze
+     * every chat until the bot was restarted: there was no timeout here and
+     * none in the script. The wait must cover the reads, not just waitpid --
+     * a wedged child blocks the parent in read() and waitpid is never reached
+     * (measured: SIGALRM fired in read(), the waitpid line was never executed).
+     *
+     * Draining both descriptors together also removes a deadlock: reading
+     * stdout to EOF first meant a child that filled the 64 KB stderr pipe
+     * buffer blocked writing, never closed stdout, and hung the parent
+     * (measured: OK at 60000 bytes of stderr, hung at 70000). */
     sds text = sdsempty();
     sds err = sdsempty();
-    char buf[4096];
-    ssize_t n;
-    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0)
-        text = sdscatlen(text, buf, (size_t)n);
-    close(pipefd[0]);
-    while ((n = read(errfd[0], buf, sizeof(buf))) > 0)
-        err = sdscatlen(err, buf, (size_t)n);
-    close(errfd[0]);
-
     int status = 0;
+    int timed_out = 0;
+    {
+        int fds[2] = { pipefd[0], errfd[0] };
+        sds *dst[2] = { &text, &err };
+        int open_fds = 2;
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        while (open_fds > 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed_ms = (now.tv_sec - t0.tv_sec) * 1000 +
+                              (now.tv_nsec - t0.tv_nsec) / 1000000;
+            long left = ALPHA_VOICE_TIMEOUT_MS - elapsed_ms;
+            if (left <= 0) { timed_out = 1; break; }
+
+            struct pollfd pfd[2];
+            int np = 0;
+            int idx[2];
+            for (int i = 0; i < 2; i++) {
+                if (fds[i] < 0) continue;
+                pfd[np].fd = fds[i];
+                pfd[np].events = POLLIN;
+                pfd[np].revents = 0;
+                idx[np] = i;
+                np++;
+            }
+            int pr = poll(pfd, (nfds_t)np, (int)left);
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (pr == 0) { timed_out = 1; break; }
+
+            for (int k = 0; k < np; k++) {
+                if (!(pfd[k].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+                char buf[4096];
+                ssize_t n = read(pfd[k].fd, buf, sizeof(buf));
+                if (n > 0) {
+                    *dst[idx[k]] = sdscatlen(*dst[idx[k]], buf, (size_t)n);
+                } else {
+                    close(pfd[k].fd);
+                    fds[idx[k]] = -1;
+                    open_fds--;
+                }
+            }
+        }
+        for (int i = 0; i < 2; i++) if (fds[i] >= 0) close(fds[i]);
+    }
+
+    if (timed_out) {
+        fprintf(stderr, "[alpha-tg] transcriber exceeded %ds, killing pid %d\n",
+                ALPHA_VOICE_TIMEOUT_MS / 1000, (int)pid);
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+        sdsfree(text);
+        sdsfree(err);
+        return NULL;
+    }
     waitpid(pid, &status, 0);
     sdstrim(text, " \t\r\n");
     sdstrim(err, " \t\r\n");
@@ -333,10 +413,29 @@ static sds voice_transcribe(const char *audio_path) {
     return text;
 }
 
+/* The one place that decides where sessions live. Both the path builder and
+ * the directory creation must agree, so they share this rather than each
+ * composing their own -- they used to disagree (paths from the install root,
+ * mkdir relative to the cwd) and every session_save silently failed. */
+static void session_dir(char *out, size_t outsz) {
+    snprintf(out, outsz, "%s/sessions", alpha_install_root());
+}
+
+/* Create it, returning 0 on success. */
+static int session_dir_ensure(void) {
+    char dir[PATH_MAX];
+    session_dir(dir, sizeof(dir));
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+        fprintf(stderr, "[alpha-tg] cannot create %s: %s\n", dir, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 static void session_path_for_chat(char *out, size_t outsz, long long chat_id) {
-    const char *root = getenv("ALPHA_ROOT");
-    if (!root || !root[0]) root = ".";
-    snprintf(out, outsz, "%s/sessions/chat_%lld.json", root, chat_id);
+    char dir[PATH_MAX];
+    session_dir(dir, sizeof(dir));
+    snprintf(out, outsz, "%s/chat_%lld.json", dir, chat_id);
 }
 
 /* Work queue.
@@ -511,11 +610,10 @@ int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv) {
         fprintf(stderr, "[alpha-tg] missing TELEGRAM token\n");
         return 1;
     }
-    char off_path[PATH_MAX];
-    const char *root = getenv("ALPHA_ROOT");
-    if (!root || !root[0]) root = ".";
-    snprintf(off_path, sizeof(off_path), "%s/sessions/tg_offset", root);
-    system("mkdir -p sessions");
+    if (session_dir_ensure() != 0) return 1;
+    char sess_dir[PATH_MAX], off_path[PATH_MAX];
+    session_dir(sess_dir, sizeof(sess_dir));
+    snprintf(off_path, sizeof(off_path), "%s/tg_offset", sess_dir);
 
     long long offset = 0;
     load_offset(off_path, &offset);
@@ -611,8 +709,8 @@ int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv) {
              * one, with the medium model). That is accepted: the transcript
              * must exist before the job can be queued, and Telegram's
              * getUpdates simply resumes from the same offset afterwards. What
-             * it must not do is exceed Telegram's tolerance for a slow poller,
-             * which is why the transcriber, not this loop, owns the timeout. */
+             * it must not do is stall forever, so voice_transcribe enforces
+             * ALPHA_VOICE_TIMEOUT_MS and kills the child past it. */
             sds voice_text = NULL;
             if (!text || !text[0]) {
                 cJSON *voice = cJSON_GetObjectItem(msg, "voice");

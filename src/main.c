@@ -107,8 +107,11 @@ int main(int argc, char **argv) {
         const char *allow = getenv("ALPHA_TELEGRAM_ALLOW");
         if (!allow || !allow[0]) allow = getenv("AGENT_TELEGRAM_ALLOW");
         if (!allow || !allow[0]) allow = "5433551381";
-        char root[PATH_MAX];
-        if (getcwd(root, sizeof(root))) setenv("ALPHA_ROOT", root, 0);
+        /* ALPHA_ROOT is deliberately NOT set from getcwd() here. It short-circuits
+         * the install-root lookup in telegram.c, so seeding it with the cwd made
+         * that lookup dead code and put sessions and the transcriber wherever the
+         * bot happened to be launched from. Leave it unset unless the operator
+         * sets it explicitly. */
         int rc = telegram_run(&cfg, tok, allow);
         curl_global_cleanup();
         return rc;

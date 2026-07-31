@@ -258,6 +258,191 @@ static void test_transcriber_path_is_independent_of_cwd(void) {
     else unsetenv("ALPHA_ROOT");
 }
 
+/* A transcriber that never finishes must not block the caller forever.
+ *
+ * This ran on the poll thread with a bare blocking waitpid and no guard in the
+ * script either, so one wedged Whisper stopped every chat until the bot was
+ * restarted. The wait must also cover the READS: a stuck child blocks the
+ * parent in read() and waitpid is never reached. */
+static void test_transcriber_timeout(void) {
+    TEST_BEGIN("voice: a wedged transcriber is killed, not waited on forever");
+
+    /* alpha_install_root() caches on first use (workers read it concurrently,
+     * so a re-resolving static buffer would race). Setting ALPHA_ROOT here
+     * would therefore be ignored, and an earlier draft of this test silently
+     * probed a stale path. Plant the fake transcriber at the real resolved
+     * root instead. */
+    char scripts[PATH_MAX], script[PATH_MAX];
+    snprintf(scripts, sizeof(scripts), "%s/scripts", alpha_install_root());
+    int made_scripts = (mkdir(scripts, 0700) == 0);
+    CHECK(made_scripts || errno == EEXIST, "scripts dir available");
+    snprintf(script, sizeof(script), "%s/alpha-transcribe.py", scripts);
+
+    /* Sleeps far past the timeout and never writes anything. */
+    FILE *f = fopen(script, "w");
+    CHECK(f != NULL, "wedged transcriber written");
+    if (f) {
+        fputs("#!/usr/bin/env python3\nimport time\ntime.sleep(600)\n", f);
+        fclose(f);
+    }
+
+    time_t t0 = time(NULL);
+    sds out = voice_transcribe("/dev/null");
+    long elapsed_ms = (long)(time(NULL) - t0) * 1000;
+
+    CHECK(out == NULL, "a wedged transcriber yields no transcript");
+    /* The real bug was unbounded: assert it returned near the deadline rather
+     * than merely 'eventually'. */
+    CHECK(elapsed_ms < ALPHA_VOICE_TIMEOUT_MS * 3,
+          "returned close to the deadline instead of hanging");
+    if (out) sdsfree(out);
+
+    /* Large stderr must not deadlock. Draining stdout to EOF first meant a
+     * child filling the 64 KB stderr pipe buffer blocked writing, never closed
+     * stdout, and hung the parent (measured: fine at 60000 bytes, hung at
+     * 70000). Well past one buffer here, and it must still succeed. */
+    f = fopen(script, "w");
+    CHECK(f != NULL, "stderr-flooding transcriber written");
+    if (f) {
+        fputs("#!/usr/bin/env python3\n"
+              "import sys\n"
+              "sys.stderr.write('E' * 300000)\n"
+              "sys.stderr.flush()\n"
+              "print('flood ok')\n", f);
+        fclose(f);
+    }
+    sds flood = voice_transcribe("/dev/null");
+    CHECK(flood != NULL, "a transcriber writing 300 KB of stderr still succeeds");
+    if (flood) {
+        CHECK(strcmp(flood, "flood ok") == 0, "its stdout is intact");
+        sdsfree(flood);
+    }
+
+    unlink(script);
+    if (made_scripts) rmdir(scripts);
+}
+
+/* An oversized voice note must be refused mid-download.
+ *
+ * Telegram allows 20 MB, and transcribing that costs minutes of CPU on the
+ * poll thread. CURLOPT_MAXFILESIZE only rejects up front when the server
+ * declares a Content-Length, so the limit is enforced on received bytes too:
+ * returning short from the write callback aborts the transfer. */
+static void test_voice_download_size_cap(void) {
+    TEST_BEGIN("voice: an oversized download is aborted, not written whole");
+
+    char path[] = "/tmp/alpha_vc_XXXXXX";
+    int fd = mkstemp(path);
+    CHECK(fd >= 0, "temp sink created");
+    FILE *f = fdopen(fd, "wb");
+    CHECK(f != NULL, "sink opened");
+    if (!f) return;
+
+    voice_sink_t sink = { .f = f, .written = 0 };
+    const size_t chunk = 64 * 1024;
+    char *buf = malloc(chunk);
+    CHECK(buf != NULL, "chunk buffer");
+    if (!buf) { fclose(f); unlink(path); return; }
+    memset(buf, 'A', chunk);
+
+    /* Feed well past the cap and find where it refuses. */
+    size_t offered = 0;
+    int aborted = 0;
+    for (int i = 0; i < (int)(ALPHA_VOICE_MAX_BYTES / chunk) + 64; i++) {
+        size_t r = voice_write(buf, 1, chunk, &sink);
+        offered += chunk;
+        if (r != chunk) { aborted = 1; break; }
+    }
+    CHECK(aborted, "the write callback eventually refuses");
+    CHECK(sink.written <= (size_t)ALPHA_VOICE_MAX_BYTES,
+          "never writes more than the cap");
+    CHECK(offered > (size_t)ALPHA_VOICE_MAX_BYTES,
+          "the test really did offer more than the cap");
+
+    fclose(f);
+    struct stat st;
+    CHECK(stat(path, &st) == 0 && st.st_size <= (off_t)ALPHA_VOICE_MAX_BYTES,
+          "the file on disk is within the cap");
+    free(buf);
+    unlink(path);
+}
+
+/* Sessions must be written where the code says they are.
+ *
+ * The directory was created with system("mkdir -p sessions"), relative to the
+ * cwd, while the paths were built from the install root. Whenever the two
+ * differed, every session_save silently failed to open its file and the chat
+ * had no memory -- with no error anywhere. */
+static void test_session_dir_matches_session_path(void) {
+    TEST_BEGIN("session: the directory is created where the paths point");
+
+    char elsewhere[] = "/tmp/alpha_cwd_XXXXXX";
+    CHECK(mkdtemp(elsewhere) != NULL, "unrelated cwd created");
+
+    char saved_cwd[PATH_MAX];
+    CHECK(getcwd(saved_cwd, sizeof(saved_cwd)) != NULL, "cwd readable");
+
+    /* Move away from the install root so the two genuinely disagree -- exactly
+     * the ALPHA_CWD case that lost every session. */
+    CHECK(chdir(elsewhere) == 0, "moved to an unrelated cwd");
+
+    /* Call the SAME functions telegram_run uses -- not a copy of their logic,
+     * which would keep passing if telegram_run started composing its own path
+     * again. */
+    char sess_dir[PATH_MAX];
+    session_dir(sess_dir, sizeof(sess_dir));
+    struct stat pre;
+    int existed = (stat(sess_dir, &pre) == 0);
+    CHECK(session_dir_ensure() == 0, "session dir created at the install root");
+    CHECK(stat(sess_dir, &pre) == 0, "and it really exists on disk");
+    int made = !existed;
+
+    char spath[PATH_MAX];
+    session_path_for_chat(spath, sizeof(spath), 4242);
+    FILE *f = fopen(spath, "w");
+    CHECK(f != NULL, "a session file can actually be opened for writing");
+    if (f) { fputs("{}", f); fclose(f); }
+
+    /* The path must be anchored to the install root, not the cwd. */
+    CHECK(strncmp(spath, alpha_install_root(), strlen(alpha_install_root())) == 0,
+          "session path is under the install root");
+    CHECK(strncmp(spath, elsewhere, strlen(elsewhere)) != 0,
+          "session path is not under the cwd");
+
+    /* And nothing may be created beside the cwd. */
+    char stray[PATH_MAX];
+    snprintf(stray, sizeof(stray), "%s/sessions", elsewhere);
+    struct stat st;
+    CHECK(stat(stray, &st) != 0, "no stray sessions dir beside the cwd");
+
+    CHECK(chdir(saved_cwd) == 0, "cwd restored");
+    unlink(spath);
+    if (made) rmdir(sess_dir);
+    rmdir(elsewhere);
+}
+
+/* main.c must not seed ALPHA_ROOT from the cwd: it short-circuits the install
+ * root lookup, making that resolution dead code in the real binary. */
+static void test_main_does_not_pin_root_to_cwd(void) {
+    TEST_BEGIN("main: ALPHA_ROOT is not seeded from getcwd()");
+    FILE *f = fopen("src/main.c", "rb");
+    if (!f) f = fopen("../src/main.c", "rb");
+    if (!f) f = fopen("../../src/main.c", "rb");
+    CHECK(f != NULL, "main.c is readable");
+    if (!f) return;
+    sds body = sdsempty();
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) body = sdscatlen(body, buf, n);
+    fclose(f);
+    /* Look for an actual setenv of ALPHA_ROOT outside a comment. */
+    int found = 0;
+    const char *p = body;
+    while ((p = strstr(p, "setenv(\"ALPHA_ROOT\"")) != NULL) { found = 1; p++; }
+    CHECK(!found, "main.c does not setenv ALPHA_ROOT");
+    sdsfree(body);
+}
+
 /* Concurrent voice notes must not collide on one temp path. */
 static void test_voice_downloads_do_not_share_a_path(void) {
     TEST_BEGIN("voice: concurrent downloads get distinct temp files");
@@ -269,6 +454,19 @@ static void test_voice_downloads_do_not_share_a_path(void) {
 
 int main(int argc, char **argv) {
     if (argc > 0) alpha_argv0 = argv[0];
+
+    /* Tests that plant a fake transcriber or write session files must never do
+     * so in the real install: ALPHA_ROOT is commonly exported (the launcher and
+     * .env both set it), and an earlier version of this suite resolved to the
+     * repo and deleted scripts/alpha-transcribe.py on cleanup, silently
+     * breaking voice notes. Pin a private sandbox before anything calls
+     * alpha_install_root(), whose result is cached from first use.
+     * test_transcriber_path_is_independent_of_cwd is unaffected: it clears
+     * ALPHA_ROOT itself and calls the uncached resolver. */
+    char sandbox[] = "/tmp/alpha_test_root_XXXXXX";
+    if (!mkdtemp(sandbox)) { perror("mkdtemp"); return 2; }
+    setenv("ALPHA_ROOT", sandbox, 1);
+
     test_utf8_chunking();
     test_fast_lane_routing();
     test_chat_cwd_thread_safety();
@@ -276,6 +474,19 @@ int main(int argc, char **argv) {
     test_queue_overflow();
     test_allowlist();
     test_transcriber_path_is_independent_of_cwd();
+    test_transcriber_timeout();
+    test_voice_download_size_cap();
+    test_session_dir_matches_session_path();
+    test_main_does_not_pin_root_to_cwd();
     test_voice_downloads_do_not_share_a_path();
+
+    /* The sandbox must have absorbed the writes, and the real install must be
+     * untouched -- assert it rather than trusting it. */
+    char probe[PATH_MAX];
+    struct stat st;
+    snprintf(probe, sizeof(probe), "%s/scripts/alpha-transcribe.py", sandbox);
+    CHECK(stat(probe, &st) != 0, "sandbox transcriber cleaned up");
+    rmdir(sandbox);
+
     return test_report("telegram");
 }
