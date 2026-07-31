@@ -20,18 +20,21 @@ deps/%.o: deps/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Tests include the module under test directly to reach its static functions,
-# so they compile their own copy -- run after `make`.
+# so they compile their own copy -- and must therefore depend on that .c file.
+# Without it make considers a test up to date after the module changed, and
+# silently re-runs a stale binary (observed: a deliberately broken source
+# still reported all checks passing).
 TEST_SRC = tests/test_tools.c tests/test_session.c tests/test_telegram.c
 TEST_BIN = $(TEST_SRC:tests/%.c=tests/bin/%)
 TEST_DEPS = src/browser.o deps/cJSON.o deps/sds.o
 
-tests/bin/test_tools: tests/test_tools.c $(TEST_DEPS) | tests/bin
+tests/bin/test_tools: tests/test_tools.c src/tools.c $(TEST_DEPS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< $(TEST_DEPS) $(LDFLAGS)
 
-tests/bin/test_session: tests/test_session.c src/llm.o src/tools.o $(TEST_DEPS) | tests/bin
+tests/bin/test_session: tests/test_session.c src/agent_loop.c src/llm.o src/tools.o $(TEST_DEPS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< src/llm.o src/tools.o $(TEST_DEPS) $(LDFLAGS)
 
-tests/bin/test_telegram: tests/test_telegram.c src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) | tests/bin
+tests/bin/test_telegram: tests/test_telegram.c src/telegram.c src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) $(LDFLAGS)
 
 tests/bin:

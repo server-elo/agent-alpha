@@ -48,8 +48,12 @@ Hold the mic in Telegram and talk; the note is transcribed locally by Whisper
 (`scripts/alpha-transcribe.py`) and becomes the turn's text. No API key, no
 network, audio never leaves the machine.
 
-The `medium` model runs on CPU, so expect roughly half a minute per note.
+The `medium` model runs on CPU: measured 7s for a 3s note and 11s for a 15s
+one. Polling pauses for that time, which Telegram tolerates.
 `ALPHA_VOICE_MODEL=small` is about 3x faster and noticeably worse on jargon.
+
+If a note comes back "could not transcribe", the reason is in the log --
+usually a missing `ffmpeg`, which Whisper shells out to for decoding.
 
 Transcription is biased with a list of project terms, since Whisper otherwise
 spells them as ordinary English -- "Goldcrit" for buildcrit, "fan out" for

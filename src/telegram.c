@@ -1,6 +1,9 @@
 #include "alpha.h"
 #include <curl/curl.h>
 #include <fcntl.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 typedef struct {
     sds body;
@@ -178,6 +181,16 @@ static size_t voice_write(char *ptr, size_t size, size_t nmemb, void *ud) {
     return fwrite(ptr, size, nmemb, f);
 }
 
+/* A voice note's scratch file. The pid alone is not unique: notes are
+ * downloaded one per update but a restart within the same second, or any
+ * future concurrency, would reuse the path and let one download truncate
+ * another's. */
+static void voice_tmp_path(char *out, size_t outsz) {
+    static unsigned long seq;
+    unsigned long n = __atomic_add_fetch(&seq, 1, __ATOMIC_RELAXED);
+    snprintf(out, outsz, "/tmp/alpha-voice-%lld-%lu.ogg", (long long)getpid(), n);
+}
+
 static int voice_download(const char *token, const char *file_id, char *out, size_t outsz) {
     sds body = sdscatprintf(sdsempty(), "{\"file_id\":\"%s\"}", file_id);
     sds r = tg_api(token, "getFile", body);
@@ -191,7 +204,7 @@ static int voice_download(const char *token, const char *file_id, char *out, siz
     const char *fpath = res ? cJSON_GetStringValue(cJSON_GetObjectItem(res, "file_path")) : NULL;
     if (!fpath || !fpath[0]) { cJSON_Delete(root); return 0; }
 
-    snprintf(out, outsz, "/tmp/alpha-voice-%lld.ogg", (long long)getpid());
+    voice_tmp_path(out, outsz);
     FILE *f = fopen(out, "wb");
     if (!f) { cJSON_Delete(root); return 0; }
 
@@ -215,42 +228,108 @@ static int voice_download(const char *token, const char *file_id, char *out, siz
     return ok;
 }
 
-/* Run the transcriber and collect stdout. Caller frees. */
+/* Locate scripts/alpha-transcribe.py.
+ *
+ * ALPHA_ROOT is normally unset and the old code then fell back to ".", which
+ * only works when the bot happens to be started from the repo. Launching it
+ * from anywhere else -- or setting ALPHA_CWD, which /status advertises --
+ * left the script unfindable and every voice note answered "could not
+ * transcribe". The install directory is a property of the binary, not of
+ * wherever it was launched, so derive it from argv[0] and keep the cwd
+ * fallback only as a last resort. */
+static void alpha_resolve_install_root(char *root, size_t rootsz) {
+    const char *env = getenv("ALPHA_ROOT");
+    if (env && env[0]) { snprintf(root, rootsz, "%s", env); return; }
+
+    char exe[PATH_MAX];
+    uint32_t sz = sizeof(exe);
+#ifdef __APPLE__
+    if (_NSGetExecutablePath(exe, &sz) == 0) {
+#else
+    ssize_t rl = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (rl > 0 && (exe[rl] = 0, 1)) {
+#endif
+        char resolved[PATH_MAX];
+        if (realpath(exe, resolved)) {
+            char *slash = strrchr(resolved, '/');
+            if (slash) {
+                *slash = 0;
+                snprintf(root, rootsz, "%s", resolved);
+                return;
+            }
+        }
+    }
+    snprintf(root, rootsz, ".");
+}
+
+/* Cached wrapper: resolution is stable for the life of the process. */
+static const char *alpha_install_root(void) {
+    static char root[PATH_MAX];
+    static int done;
+    if (!done) { alpha_resolve_install_root(root, sizeof(root)); done = 1; }
+    return root;
+}
+
+/* Run the transcriber and collect stdout. Caller frees.
+ *
+ * On failure the child's stderr is captured and logged: it used to go to
+ * /dev/null, so a missing ffmpeg or model surfaced to the user as a bare
+ * "could not transcribe" with nothing in the log to act on. */
 static sds voice_transcribe(const char *audio_path) {
-    const char *root = getenv("ALPHA_ROOT");
     char script[PATH_MAX];
     snprintf(script, sizeof(script), "%s/scripts/alpha-transcribe.py",
-             (root && root[0]) ? root : ".");
+             alpha_install_root());
+    if (access(script, R_OK) != 0) {
+        fprintf(stderr, "[alpha-tg] transcriber not found at %s\n", script);
+        return NULL;
+    }
 
-    int pipefd[2];
+    int pipefd[2], errfd[2];
     if (pipe(pipefd) != 0) return NULL;
+    if (pipe(errfd) != 0) { close(pipefd[0]); close(pipefd[1]); return NULL; }
     pid_t pid = fork();
-    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return NULL; }
+    if (pid < 0) {
+        close(pipefd[0]); close(pipefd[1]);
+        close(errfd[0]); close(errfd[1]);
+        return NULL;
+    }
     if (pid == 0) {
         close(pipefd[0]);
+        close(errfd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
+        dup2(errfd[1], STDERR_FILENO);
         close(pipefd[1]);
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+        close(errfd[1]);
         execl("/usr/bin/env", "env", "python3", script, audio_path, (char *)NULL);
         _exit(127);
     }
     close(pipefd[1]);
+    close(errfd[1]);
 
     sds text = sdsempty();
+    sds err = sdsempty();
     char buf[4096];
     ssize_t n;
     while ((n = read(pipefd[0], buf, sizeof(buf))) > 0)
         text = sdscatlen(text, buf, (size_t)n);
     close(pipefd[0]);
+    while ((n = read(errfd[0], buf, sizeof(buf))) > 0)
+        err = sdscatlen(err, buf, (size_t)n);
+    close(errfd[0]);
 
     int status = 0;
     waitpid(pid, &status, 0);
     sdstrim(text, " \t\r\n");
+    sdstrim(err, " \t\r\n");
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || sdslen(text) == 0) {
+        fprintf(stderr, "[alpha-tg] transcription failed (exit %d): %.300s\n",
+                WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                sdslen(err) ? err : "(no stderr)");
         sdsfree(text);
+        sdsfree(err);
         return NULL;
     }
+    sdsfree(err);
     return text;
 }
 
@@ -525,10 +604,15 @@ int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv) {
             }
             const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(msg, "text"));
 
-            /* A voice note becomes the turn's text. Transcription takes a few
-             * seconds, so it happens on the worker, not the poll thread --
-             * hence the transcript is resolved here and queued like any
-             * message, rather than blocking the loop. */
+            /* A voice note becomes the turn's text.
+             *
+             * This runs on the poll thread, so polling stalls for the length
+             * of the transcription (measured: 7s for a 3s note, 11s for a 15s
+             * one, with the medium model). That is accepted: the transcript
+             * must exist before the job can be queued, and Telegram's
+             * getUpdates simply resumes from the same offset afterwards. What
+             * it must not do is exceed Telegram's tolerance for a slow poller,
+             * which is why the transcriber, not this loop, owns the timeout. */
             sds voice_text = NULL;
             if (!text || !text[0]) {
                 cJSON *voice = cJSON_GetObjectItem(msg, "voice");
@@ -544,7 +628,8 @@ int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv) {
                     }
                     if (!voice_text) {
                         tg_send(token, chat_id,
-                                "Could not transcribe that voice message.");
+                                "Could not transcribe that voice message. "
+                                "See /tmp/agent-alpha-telegram.log for why.");
                         continue;
                     }
                     fprintf(stderr, "[alpha-tg] transcript: %.80s\n", voice_text);

@@ -197,12 +197,85 @@ static void test_allowlist(void) {
     CHECK(!allowed("1,2,3", 4LL), "absent id in a list is rejected");
 }
 
-int main(void) {
+static const char *alpha_argv0 = "";
+
+/* --- voice ----------------------------------------------------------------- */
+/* The transcriber used to be located relative to the CURRENT DIRECTORY, so
+ * voice notes worked only when the bot was launched from the repo and failed
+ * everywhere else. Assert the path is a property of the binary instead: it
+ * must not move when the cwd does. */
+static void test_transcriber_path_is_independent_of_cwd(void) {
+    TEST_BEGIN("voice: the transcriber is found regardless of cwd");
+
+    char saved[PATH_MAX];
+    CHECK(getcwd(saved, sizeof(saved)) != NULL, "cwd readable");
+
+    /* ALPHA_ROOT short-circuits the lookup, so leaving the developer's own
+     * value in the environment would make this pass without ever exercising
+     * the fallback that voice notes actually rely on. */
+    char *had_root = getenv("ALPHA_ROOT");
+    char saved_root[PATH_MAX];
+    saved_root[0] = 0;
+    if (had_root) snprintf(saved_root, sizeof(saved_root), "%s", had_root);
+    unsetenv("ALPHA_ROOT");
+
+    /* Resolve fresh at each cwd -- calling the cached accessor would compare
+     * one stored string against itself and pass no matter what. */
+    char from_repo[PATH_MAX], from_root[PATH_MAX], from_tmp[PATH_MAX];
+    alpha_resolve_install_root(from_repo, sizeof(from_repo));
+
+    CHECK(chdir("/") == 0, "moved to an unrelated cwd");
+    alpha_resolve_install_root(from_root, sizeof(from_root));
+
+    CHECK(chdir("/tmp") == 0, "moved again");
+    alpha_resolve_install_root(from_tmp, sizeof(from_tmp));
+
+    CHECK(chdir(saved) == 0, "cwd restored");
+
+    CHECK(strcmp(from_root, from_repo) == 0, "install root unchanged by chdir");
+    CHECK(strcmp(from_tmp, from_repo) == 0, "still unchanged from a second cwd");
+
+    /* Guard against agreeing on a uniformly wrong answer: compare against an
+     * independently obtained value -- argv[0] via the OS, rather than the
+     * executable-path call the function itself uses. (This binary lives in
+     * tests/bin, so its root is tests/bin, not the repo.) */
+    CHECK(from_repo[0] == '/', "resolved root is absolute, not cwd-relative");
+    char expect[PATH_MAX];
+    if (realpath(alpha_argv0, expect)) {
+        char *slash = strrchr(expect, '/');
+        if (slash) *slash = 0;
+        CHECK(strcmp(from_repo, expect) == 0,
+              "resolved root is the directory holding this binary");
+    }
+
+    /* ALPHA_ROOT must still win when it is set. */
+    setenv("ALPHA_ROOT", "/nonexistent-root", 1);
+    char forced[PATH_MAX];
+    alpha_resolve_install_root(forced, sizeof(forced));
+    CHECK(strcmp(forced, "/nonexistent-root") == 0, "ALPHA_ROOT overrides the default");
+
+    if (saved_root[0]) setenv("ALPHA_ROOT", saved_root, 1);
+    else unsetenv("ALPHA_ROOT");
+}
+
+/* Concurrent voice notes must not collide on one temp path. */
+static void test_voice_downloads_do_not_share_a_path(void) {
+    TEST_BEGIN("voice: concurrent downloads get distinct temp files");
+    char a[PATH_MAX], b[PATH_MAX];
+    voice_tmp_path(a, sizeof(a));
+    voice_tmp_path(b, sizeof(b));
+    CHECK(strcmp(a, b) != 0, "two in-flight notes do not share one file");
+}
+
+int main(int argc, char **argv) {
+    if (argc > 0) alpha_argv0 = argv[0];
     test_utf8_chunking();
     test_fast_lane_routing();
     test_chat_cwd_thread_safety();
     test_queue_semantics();
     test_queue_overflow();
     test_allowlist();
+    test_transcriber_path_is_independent_of_cwd();
+    test_voice_downloads_do_not_share_a_path();
     return test_report("telegram");
 }
