@@ -294,8 +294,44 @@ static void test_wiring(void) {
           "truncated replies are detected");
 }
 
+/* A tool result cut at a fixed byte offset used to split a multi-byte
+ * character; the broken bytes reached the session file, which then failed to
+ * parse as UTF-8 and took the entire conversation with it. */
+static int valid_utf8(const char *s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = (unsigned char)s[i];
+        int seq = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2
+                : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : -1;
+        if (seq < 0 || i + (size_t)seq > n) return 0;
+        i += (size_t)seq;
+    }
+    return 1;
+}
+
+static void test_notes_never_split_utf8(void) {
+    TEST_BEGIN("notes_append: truncation never splits a multi-byte character");
+    /* Multi-byte fillers at every width, so head and tail cuts land mid-char. */
+    const char *units[] = { "\xc3\xbc", "\xe2\x80\xa6", "\xf0\x9f\x98\x80", NULL };
+    for (int u = 0; units[u]; u++) {
+        for (int pad = 0; pad < 4; pad++) {
+            sds body = sdsempty();
+            for (int i = 0; i < pad; i++) body = sdscat(body, "a");
+            while (sdslen(body) < (size_t)ALPHA_NOTE_PER_TOOL * 3)
+                body = sdscat(body, units[u]);
+            sds notes = sdsempty();
+            notes_append(&notes, "execute_bash", body);
+            CHECK(valid_utf8(notes, sdslen(notes)),
+                  "note stays valid UTF-8 after truncation");
+            sdsfree(notes);
+            sdsfree(body);
+        }
+    }
+}
+
 int main(void) {
     test_wiring();
+    test_notes_never_split_utf8();
     test_corrupt_history_is_preserved();
     test_atomic_save();
     test_observation_pruning();

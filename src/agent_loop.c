@@ -187,6 +187,12 @@ static void notes_append(sds *notes, const char *name, const char *result) {
          * the result/exit status that actually matters. */
         size_t head = (size_t)(ALPHA_NOTE_PER_TOOL * 0.7);
         size_t tail = ALPHA_NOTE_PER_TOOL - head;
+        /* Cutting at a fixed byte offset splits multi-byte characters, and the
+         * broken bytes were written straight into the session file -- which
+         * then failed to parse as UTF-8 and cost the whole conversation.
+         * Pull each cut back to a character boundary. */
+        while (head > 0 && ((unsigned char)result[head] & 0xC0) == 0x80) head--;
+        while (tail > 0 && ((unsigned char)result[full - tail] & 0xC0) == 0x80) tail--;
         /* Say explicitly that the middle is GONE from memory, so a later turn
          * re-reads the source instead of confidently answering from a hole. */
         *notes = sdscatprintf(*notes,
