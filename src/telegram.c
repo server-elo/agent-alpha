@@ -1,5 +1,6 @@
 #include "alpha.h"
 #include <curl/curl.h>
+#include <fcntl.h>
 
 typedef struct {
     sds body;
@@ -162,6 +163,95 @@ static void chat_cwd_set(long long chat_id, const char *cwd) {
     snprintf(chat_cwds[chat_cwd_n].cwd, sizeof(chat_cwds[chat_cwd_n].cwd), "%s", cwd);
     chat_cwd_n++;
     pthread_mutex_unlock(&chat_cwd_lock);
+}
+
+/* Voice notes.
+ *
+ * Telegram delivers audio as a file_id, so it takes two calls: getFile for the
+ * path, then a plain GET on /file/bot<token>/<path>. Transcription is a local
+ * Whisper run via scripts/alpha-transcribe.py -- no API key, and the audio
+ * never leaves the machine.
+ *
+ * Returns the transcript, or NULL if anything failed. */
+static size_t voice_write(char *ptr, size_t size, size_t nmemb, void *ud) {
+    FILE *f = ud;
+    return fwrite(ptr, size, nmemb, f);
+}
+
+static int voice_download(const char *token, const char *file_id, char *out, size_t outsz) {
+    sds body = sdscatprintf(sdsempty(), "{\"file_id\":\"%s\"}", file_id);
+    sds r = tg_api(token, "getFile", body);
+    sdsfree(body);
+    if (!r) return 0;
+
+    cJSON *root = cJSON_Parse(r);
+    sdsfree(r);
+    if (!root) return 0;
+    cJSON *res = cJSON_GetObjectItem(root, "result");
+    const char *fpath = res ? cJSON_GetStringValue(cJSON_GetObjectItem(res, "file_path")) : NULL;
+    if (!fpath || !fpath[0]) { cJSON_Delete(root); return 0; }
+
+    snprintf(out, outsz, "/tmp/alpha-voice-%lld.ogg", (long long)getpid());
+    FILE *f = fopen(out, "wb");
+    if (!f) { cJSON_Delete(root); return 0; }
+
+    sds url = sdscatprintf(sdsempty(), "https://api.telegram.org/file/bot%s/%s", token, fpath);
+    cJSON_Delete(root);
+
+    CURL *curl = curl_easy_init();
+    int ok = 0;
+    if (curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, voice_write);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, f);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        ok = (curl_easy_perform(curl) == CURLE_OK);
+        curl_easy_cleanup(curl);
+    }
+    sdsfree(url);
+    fclose(f);
+    if (!ok) unlink(out);
+    return ok;
+}
+
+/* Run the transcriber and collect stdout. Caller frees. */
+static sds voice_transcribe(const char *audio_path) {
+    const char *root = getenv("ALPHA_ROOT");
+    char script[PATH_MAX];
+    snprintf(script, sizeof(script), "%s/scripts/alpha-transcribe.py",
+             (root && root[0]) ? root : ".");
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return NULL;
+    pid_t pid = fork();
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return NULL; }
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+        execl("/usr/bin/env", "env", "python3", script, audio_path, (char *)NULL);
+        _exit(127);
+    }
+    close(pipefd[1]);
+
+    sds text = sdsempty();
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0)
+        text = sdscatlen(text, buf, (size_t)n);
+    close(pipefd[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    sdstrim(text, " \t\r\n");
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || sdslen(text) == 0) {
+        sdsfree(text);
+        return NULL;
+    }
+    return text;
 }
 
 static void session_path_for_chat(char *out, size_t outsz, long long chat_id) {
@@ -434,6 +524,33 @@ int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv) {
                 continue;
             }
             const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(msg, "text"));
+
+            /* A voice note becomes the turn's text. Transcription takes a few
+             * seconds, so it happens on the worker, not the poll thread --
+             * hence the transcript is resolved here and queued like any
+             * message, rather than blocking the loop. */
+            sds voice_text = NULL;
+            if (!text || !text[0]) {
+                cJSON *voice = cJSON_GetObjectItem(msg, "voice");
+                if (!voice) voice = cJSON_GetObjectItem(msg, "audio");
+                const char *fid = voice ?
+                    cJSON_GetStringValue(cJSON_GetObjectItem(voice, "file_id")) : NULL;
+                if (fid && fid[0]) {
+                    char audio[PATH_MAX];
+                    fprintf(stderr, "[alpha-tg] chat=%lld voice note\n", chat_id);
+                    if (voice_download(token, fid, audio, sizeof(audio))) {
+                        voice_text = voice_transcribe(audio);
+                        unlink(audio);
+                    }
+                    if (!voice_text) {
+                        tg_send(token, chat_id,
+                                "Could not transcribe that voice message.");
+                        continue;
+                    }
+                    fprintf(stderr, "[alpha-tg] transcript: %.80s\n", voice_text);
+                    text = voice_text;
+                }
+            }
             if (!text || !text[0]) continue;
 
             char spath[PATH_MAX];
@@ -446,13 +563,13 @@ int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv) {
                     "Model: claude-opus-5\n\n"
                     "Talk normally. For code, just say what to change/test.\n"
                     "/status · /cwd <path> · /new (reset memory)\n");
-                continue;
+                { if (voice_text) sdsfree(voice_text); continue; }
             }
             if (strcmp(text, "/new") == 0 || strcmp(text, "/clear") == 0) {
                 agent_session_clear(spath);
                 tg_send(token, chat_id, "Memory cleared. Fresh conversation.");
                 fprintf(stderr, "[alpha-tg] chat=%lld cleared\n", chat_id);
-                continue;
+                { if (voice_text) sdsfree(voice_text); continue; }
             }
             if (strncmp(text, "/cwd ", 5) == 0) {
                 const char *p = text + 5;
@@ -466,7 +583,7 @@ int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv) {
                 } else {
                     tg_send(token, chat_id, "bad path");
                 }
-                continue;
+                { if (voice_text) sdsfree(voice_text); continue; }
             }
             if (strcmp(text, "/status") == 0 || strcmp(text, "/cwd") == 0) {
                 char st_cwd[PATH_MAX];
@@ -482,7 +599,7 @@ int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv) {
                     spath);
                 tg_send(token, chat_id, m);
                 sdsfree(m);
-                continue;
+                { if (voice_text) sdsfree(voice_text); continue; }
             }
 
             /* light instant hellos still OK — also store into memory via agent path for continuity? 
@@ -498,7 +615,7 @@ int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv) {
                     low[--ln] = 0;
                 if (!strcmp(low, "ping")) {
                     tg_send(token, chat_id, "pong");
-                    continue;
+                    { if (voice_text) sdsfree(voice_text); continue; }
                 }
             }
 
@@ -507,9 +624,11 @@ int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv) {
              * make Telegram redeliver and re-execute the same tools. */
             save_offset(off_path, offset);
 
-            /* Hand off to a worker so polling continues immediately. */
+            /* Hand off to a worker so polling continues immediately.
+             * q_push copies the text, so the transcript can be freed here. */
             if (!q_push(&g_queue, chat_id, text))
                 tg_send(token, chat_id, "Busy — too many queued requests. Try again shortly.");
+            if (voice_text) sdsfree(voice_text);
         }
         save_offset(off_path, offset);
         cJSON_Delete(rootj);
