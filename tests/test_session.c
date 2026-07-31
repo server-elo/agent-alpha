@@ -413,6 +413,36 @@ static int valid_utf8(const char *s, size_t n) {
     return 1;
 }
 
+/* Tool output is not guaranteed to be UTF-8 at all: a binary blob, or a test
+ * printing raw control bytes, produced a session file that would not parse and
+ * cost the whole conversation. Truncating on a boundary does not help when the
+ * input was never valid. */
+static void test_notes_sanitize_invalid_utf8(void) {
+    TEST_BEGIN("notes_append: invalid input bytes never reach the session");
+    const char *cases[] = {
+        "before\xcc after",                 /* lone continuation byte */
+        "\xff\xfe binary junk",
+        "trunc\xe2\x82",                    /* sequence cut short */
+        "\xed\xa0\x80 surrogate",
+        NULL
+    };
+    for (int i = 0; cases[i]; i++) {
+        sds notes = sdsempty();
+        notes_append(&notes, "execute_bash", cases[i]);
+        CHECK(valid_utf8(notes, sdslen(notes)), "note is valid UTF-8");
+        sdsfree(notes);
+    }
+    /* and the same for output large enough to hit the truncating branch */
+    sds big = sdsempty();
+    while (sdslen(big) < (size_t)ALPHA_NOTE_PER_TOOL * 3)
+        big = sdscat(big, "ok\xcc\xff");
+    sds notes = sdsempty();
+    notes_append(&notes, "execute_bash", big);
+    CHECK(valid_utf8(notes, sdslen(notes)), "large invalid output is sanitised too");
+    sdsfree(notes);
+    sdsfree(big);
+}
+
 static void test_notes_never_split_utf8(void) {
     TEST_BEGIN("notes_append: truncation never splits a multi-byte character");
     /* Multi-byte fillers at every width, so head and tail cuts land mid-char. */
@@ -436,6 +466,7 @@ static void test_notes_never_split_utf8(void) {
 int main(void) {
     test_wiring();
     test_notes_never_split_utf8();
+    test_notes_sanitize_invalid_utf8();
     test_corrupt_history_is_preserved();
     test_atomic_save();
     test_observation_pruning();

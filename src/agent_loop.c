@@ -168,6 +168,36 @@ void agent_session_clear(const char *session_path) {
 #define ALPHA_NOTE_PER_TOOL   4000
 #define ALPHA_NOTE_TOTAL    200000
 
+/* Replace invalid UTF-8 with U+FFFD in place.
+ *
+ * Truncating on a character boundary is not enough: a tool can emit bytes that
+ * were never valid UTF-8 at all (a binary blob, a test printing raw control
+ * bytes). Those went verbatim into the session file, which then failed to parse
+ * and cost the whole conversation. Sanitise at the point of storage, since that
+ * is the only place every tool result passes through. */
+static sds sanitize_utf8(const char *s, size_t n) {
+    sds out = sdsempty();
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = (unsigned char)s[i];
+        int seq = c < 0x80 ? 1
+                : (c & 0xE0) == 0xC0 ? 2
+                : (c & 0xF0) == 0xE0 ? 3
+                : (c & 0xF8) == 0xF0 ? 4 : -1;
+        int ok = (seq > 0 && i + (size_t)seq <= n);
+        for (int k = 1; ok && k < seq; k++)
+            if (((unsigned char)s[i + k] & 0xC0) != 0x80) ok = 0;
+        if (!ok) {
+            out = sdscatlen(out, "\xef\xbf\xbd", 3);   /* U+FFFD */
+            i++;
+            continue;
+        }
+        out = sdscatlen(out, s + i, (size_t)seq);
+        i += (size_t)seq;
+    }
+    return out;
+}
+
 static void notes_append(sds *notes, const char *name, const char *result) {
     if (!notes || !*notes) return;
     /* Budget exhausted. Say so once, otherwise a long run silently stops
@@ -179,7 +209,10 @@ static void notes_append(sds *notes, const char *name, const char *result) {
                 "retained. Re-run a tool rather than recalling it from memory.\n");
         return;
     }
-    size_t full = result ? strlen(result) : 0;
+    /* Work on a sanitised copy so neither branch below can store bad bytes. */
+    sds clean = sanitize_utf8(result ? result : "", result ? strlen(result) : 0);
+    result = clean;
+    size_t full = sdslen(clean);
     size_t n = full;
     if (n > ALPHA_NOTE_PER_TOOL) n = ALPHA_NOTE_PER_TOOL;
     if (full > ALPHA_NOTE_PER_TOOL) {
@@ -205,6 +238,7 @@ static void notes_append(sds *notes, const char *name, const char *result) {
         *notes = sdscatprintf(*notes, "[%s] %.*s\n",
                               name ? name : "tool", (int)n, result ? result : "");
     }
+    sdsfree(clean);
 }
 
 /* The in-flight message array is resent in full on every LLM call, so its size
