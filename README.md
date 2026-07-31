@@ -42,6 +42,22 @@ ALPHA_MODEL=claude-opus-5
 
 Log: `/tmp/agent-alpha-telegram.log`
 
+### Voice notes
+
+Hold the mic in Telegram and talk; the note is transcribed locally by Whisper
+(`scripts/alpha-transcribe.py`) and becomes the turn's text. No API key, no
+network, audio never leaves the machine.
+
+The `medium` model runs on CPU, so expect roughly half a minute per note.
+`ALPHA_VOICE_MODEL=small` is about 3x faster and noticeably worse on jargon.
+
+Transcription is biased with a list of project terms, since Whisper otherwise
+spells them as ordinary English -- "Goldcrit" for buildcrit, "fan out" for
+fanout, "Cargo Clippy" for cargo clippy. Override with `ALPHA_VOICE_PROMPT`,
+or set it empty to disable. `ALPHA_VOICE_LANG` sets the language (default
+`en`); auto-detect is deliberately not used, as it misfires badly on short
+phone audio.
+
 ## Warning
 
 Security is intentionally **off**. Do not expose this bot publicly. Allowlist chat ids.
