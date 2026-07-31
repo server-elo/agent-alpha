@@ -25,6 +25,14 @@
 #define ALPHA_EDIT_MAX_BYTES 2000000
 /* Hard wall-clock cap for one user request (seconds). */
 #define ALPHA_REQUEST_MAX_SECONDS 10800
+
+/* LLM replies are streamed, so there is no cap on how long a reply may take --
+ * only on how long it may produce NOTHING. A fixed total timeout used to kill
+ * long answers outright (a 16384-token reply measured 262s against a 300s cap)
+ * and threw away every token already received. */
+#ifndef ALPHA_LLM_STALL_SECONDS
+#define ALPHA_LLM_STALL_SECONDS 120
+#endif
 /* Cap on one voice transcription. It runs on the Telegram poll thread, so an
  * unbounded one stops every chat. Generous: the medium model takes ~11s for a
  * 15s note, and a first run may download the model. */

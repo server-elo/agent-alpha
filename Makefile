@@ -24,7 +24,7 @@ deps/%.o: deps/%.c
 # Without it make considers a test up to date after the module changed, and
 # silently re-runs a stale binary (observed: a deliberately broken source
 # still reported all checks passing).
-TEST_SRC = tests/test_tools.c tests/test_session.c tests/test_telegram.c
+TEST_SRC = tests/test_tools.c tests/test_session.c tests/test_telegram.c tests/test_llm.c
 TEST_BIN = $(TEST_SRC:tests/%.c=tests/bin/%)
 TEST_DEPS = src/browser.o deps/cJSON.o deps/sds.o
 
@@ -38,6 +38,9 @@ tests/bin/test_session: tests/test_session.c src/agent_loop.c src/llm.o src/tool
 # long to prove a wedged transcriber gets killed, so it is compiled short.
 tests/bin/test_telegram: tests/test_telegram.c src/telegram.c src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) | tests/bin
 	$(CC) $(CFLAGS) -DALPHA_VOICE_TIMEOUT_MS=3000 -o $@ $< src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) $(LDFLAGS)
+
+tests/bin/test_llm: tests/test_llm.c src/llm.c src/tools.o $(TEST_DEPS) | tests/bin
+	$(CC) $(CFLAGS) -o $@ $< src/tools.o $(TEST_DEPS) $(LDFLAGS)
 
 tests/bin:
 	mkdir -p tests/bin
