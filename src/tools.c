@@ -151,7 +151,14 @@ static void pt_sample(proctrack_t *t, pid_t root) {
  * This also sidesteps pid reuse: the check is "does this live process hold
  * our file right now", not "was this number ours a minute ago".
  *
- * Escapes only if a child closes its inherited fds outright. */
+ * Known hole: a child that both calls setsid() and closes its inherited fds —
+ * the textbook daemonization sequence — sheds every marker we have and is not
+ * killed. Measured: it survives with PPID 1 and its own PGID. None of the
+ * three strategies here can reach it. kill(-pgid) misses it by definition (it
+ * left the group), ancestry sampling misses it (it reparented to launchd), and
+ * this scan misses it (no fd left to match). Closing it needs a per-command
+ * uid or a sandbox; that is out of scope for a tool whose README already
+ * declares security off. */
 static void pt_sample_fd(proctrack_t *t, uint64_t ino, pid_t self) {
     int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
     size_t len = 0;
@@ -272,11 +279,12 @@ static sds shell_run(const char *cmd, const char *cwd) {
 
     if (timed_out) {
         proctrack_t track = { .n = 0 };
-        /* Group first: reaps everything that stayed in the session. */
+        /* Group first: reaps everything that stayed in our process group. */
         kill(-pid, SIGKILL);
         kill(pid, SIGKILL);
-        /* Then the ones that left it. Sampling by ancestry misses these, so
-         * find them by the output file they still hold open. */
+        /* Then the ones that left it, by ancestry and by the output file they
+         * still hold open. A descendant that did both — setsid() and closed
+         * its fds — survives all three; see pt_sample_fd. */
         pt_sample(&track, pid);
         pt_sample_fd(&track, out_ino, getpid());
         pt_kill_all(&track);
@@ -291,7 +299,10 @@ static sds shell_run(const char *cmd, const char *cwd) {
         out = sdsnew("(no output)");
     }
     if (timed_out)
-        out = sdscat(out, "\nERROR: command exceeded 60s timeout — killed (process group).");
+        out = sdscat(out, "\nERROR: command exceeded 60s timeout — killed (process group, "
+                          "plus descendants still holding this command's output file). "
+                          "A process that called setsid() and closed its inherited fds "
+                          "may still be running.");
     return out;
 }
 

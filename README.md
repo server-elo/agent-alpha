@@ -45,3 +45,17 @@ Log: `/tmp/agent-alpha-telegram.log`
 ## Warning
 
 Security is intentionally **off**. Do not expose this bot publicly. Allowlist chat ids.
+
+### Known limitation: the 60s shell timeout does not catch full daemons
+
+When a command hits the 60s cap, `shell_run` kills the process group, then
+scans for descendants that left it — by parent chain, and by the output file
+they still hold open. That covers processes that call `setsid()` (fds survive
+setsid) and processes that close fds without detaching (still reachable by
+ancestry).
+
+A process that does **both** — `setsid()` *and* `close()` on its inherited
+fds, i.e. the textbook daemonization sequence — sheds every marker and keeps
+running. The timeout message says so when it fires. Fixing it properly needs a
+per-command uid or a sandbox, which is more machinery than this tool warrants;
+a process that deliberately daemonizes has asked to outlive the shell.
