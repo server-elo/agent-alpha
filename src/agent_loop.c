@@ -216,14 +216,32 @@ static void notes_append(sds *notes, const char *name, const char *result) {
  * The system prompt (index 0) and the most recent exchanges are never dropped. */
 #define ALPHA_LIVE_MAX_BYTES 400000
 
+/* Size of one message as it will appear on the wire. "content" is not the only
+ * field that carries bulk: an assistant turn that calls write_file puts the
+ * entire file body in tool_calls[].function.arguments and leaves content null.
+ * Counting content alone reported 433 bytes for a 4 MB request, so the trim
+ * below never fired and the call eventually exceeded the 300s curl cap. */
+static size_t message_bytes(cJSON *m) {
+    size_t t = 32;                          /* role/braces envelope */
+    const char *c = cJSON_GetStringValue(cJSON_GetObjectItem(m, "content"));
+    if (c) t += strlen(c);
+    cJSON *tcs = cJSON_GetObjectItem(m, "tool_calls");
+    if (cJSON_IsArray(tcs)) {
+        cJSON *tc = NULL;
+        cJSON_ArrayForEach(tc, tcs) {
+            cJSON *fn = cJSON_GetObjectItem(tc, "function");
+            const char *a = cJSON_GetStringValue(cJSON_GetObjectItem(fn, "arguments"));
+            if (a) t += strlen(a);
+            t += 64;
+        }
+    }
+    return t;
+}
+
 static size_t messages_bytes(cJSON *messages) {
     size_t t = 0;
     int n = cJSON_GetArraySize(messages);
-    for (int i = 0; i < n; i++) {
-        const char *c = cJSON_GetStringValue(
-            cJSON_GetObjectItem(cJSON_GetArrayItem(messages, i), "content"));
-        if (c) t += strlen(c);
-    }
+    for (int i = 0; i < n; i++) t += message_bytes(cJSON_GetArrayItem(messages, i));
     return t;
 }
 
@@ -239,16 +257,33 @@ static void trim_live_messages(cJSON *messages) {
         int is_tool = (strcmp(role, "tool") == 0);
         int is_asst = (strcmp(role, "assistant") == 0);
         if (!is_tool && !is_asst) continue;
-        cJSON *c = cJSON_GetObjectItem(m, "content");
-        const char *s = cJSON_GetStringValue(c);
-        if (!s || strlen(s) < 2000) continue;
+        if (message_bytes(m) < 2000) continue;
+
         /* An assistant turn carrying tool_calls must keep its structure; only
          * its prose is replaced, never the message itself. */
-        cJSON_ReplaceItemInObject(m, "content", cJSON_CreateString(
-            is_tool
-              ? "[earlier tool output dropped to stay within the context budget — "
-                "re-run the tool if you need it again]"
-              : "[earlier reply abridged to stay within the context budget]"));
+        const char *s = cJSON_GetStringValue(cJSON_GetObjectItem(m, "content"));
+        if (s && strlen(s) >= 2000)
+            cJSON_ReplaceItemInObject(m, "content", cJSON_CreateString(
+                is_tool
+                  ? "[earlier tool output dropped to stay within the context budget — "
+                    "re-run the tool if you need it again]"
+                  : "[earlier reply abridged to stay within the context budget]"));
+
+        /* The arguments of an already-executed call are dead weight: its result
+         * is right below it. Stub them out, but keep parseable JSON so anything
+         * that re-reads the history does not choke. */
+        cJSON *tcs = cJSON_GetObjectItem(m, "tool_calls");
+        if (cJSON_IsArray(tcs)) {
+            cJSON *tc = NULL;
+            cJSON_ArrayForEach(tc, tcs) {
+                cJSON *fn = cJSON_GetObjectItem(tc, "function");
+                if (!fn) continue;
+                const char *a = cJSON_GetStringValue(cJSON_GetObjectItem(fn, "arguments"));
+                if (!a || strlen(a) < 2000) continue;
+                cJSON_ReplaceItemInObject(fn, "arguments", cJSON_CreateString(
+                    "{\"note\":\"arguments dropped to stay within the context budget\"}"));
+            }
+        }
     }
 }
 

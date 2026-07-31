@@ -175,6 +175,110 @@ static void test_live_context_is_bounded(void) {
     cJSON_Delete(m);
 }
 
+/* --- the budget must track what is actually sent, not just "content" -------
+ * A write_file call carries the whole file body in
+ * tool_calls[].function.arguments and leaves content null. Counting content
+ * alone reported 433 bytes for a 4 MB request, so the trim never fired and the
+ * call died on the 300s curl cap.
+ *
+ * Ground truth here is cJSON_PrintUnformatted -- the same serialization llm.c
+ * puts on the wire -- so this cannot pass by agreeing with a broken counter. */
+static size_t wire_bytes(cJSON *m) {
+    char *s = cJSON_PrintUnformatted(m);
+    size_t n = s ? strlen(s) : 0;
+    free(s);
+    return n;
+}
+
+static void test_trim_counts_tool_call_arguments(void) {
+    TEST_BEGIN("trim_live_messages: bulk hidden in tool_call arguments is counted and trimmed");
+    cJSON *m = cJSON_CreateArray();
+    messages_add_text(m, "system", "sys");
+    /* Each payload must exceed the budget on its own. With smaller ones the
+     * walk runs out of work before it reaches the newest message, and the
+     * "most recent call is spared" check below would pass for an accidental
+     * reason rather than because the tail is protected. */
+    sds big = repeat('x', ALPHA_LIVE_MAX_BYTES + 100000);
+
+    for (int i = 0; i < 20; i++) {
+        char id[32];
+        snprintf(id, sizeof(id), "call_%d", i);
+        cJSON *a = cJSON_CreateObject();
+        cJSON_AddStringToObject(a, "role", "assistant");
+        cJSON_AddNullToObject(a, "content");     /* as claude sends a pure tool call */
+        cJSON *tcs = cJSON_CreateArray();
+        cJSON *tc = cJSON_CreateObject();
+        cJSON_AddStringToObject(tc, "id", id);
+        cJSON *fn = cJSON_CreateObject();
+        cJSON_AddStringToObject(fn, "name", "write_file");
+        sds args = sdscatprintf(sdsempty(), "{\"path\":\"/tmp/f\",\"content\":\"%s\"}", big);
+        cJSON_AddStringToObject(fn, "arguments", args);
+        sdsfree(args);
+        cJSON_AddItemToObject(tc, "function", fn);
+        cJSON_AddItemToArray(tcs, tc);
+        cJSON_AddItemToObject(a, "tool_calls", tcs);
+        cJSON_AddItemToArray(m, a);
+
+        cJSON *tr = cJSON_CreateObject();
+        cJSON_AddStringToObject(tr, "role", "tool");
+        cJSON_AddStringToObject(tr, "tool_call_id", id);
+        cJSON_AddStringToObject(tr, "content", "OK wrote 200000 bytes");
+        cJSON_AddItemToArray(m, tr);
+    }
+
+    size_t wire_before = wire_bytes(m);
+    CHECK(wire_before > 3000000, "fixture really is oversized on the wire");
+    CHECK(strlen(big) > (size_t)ALPHA_LIVE_MAX_BYTES,
+          "one payload alone exceeds the budget, so the walk cannot stop early");
+    /* The estimate must be close to the truth -- not merely nonzero. */
+    size_t est = messages_bytes(m);
+    CHECK(est > wire_before - wire_before / 10,
+          "estimate accounts for argument payloads, not just content");
+
+    trim_live_messages(m);
+    size_t wire_after = wire_bytes(m);
+    /* The floor is the protected tail, not the budget: the newest few messages
+     * are never abridged, so with payloads this large the steady state sits
+     * above ALPHA_LIVE_MAX_BYTES by roughly that tail. What must hold is that
+     * the bulk is gone. */
+    CHECK(wire_after < wire_before / 3, "oversized arguments are actually dropped");
+    CHECK(wire_after < 3000000, "what remains is bounded by the protected tail");
+
+    /* Pairing and JSON validity must survive. */
+    int calls = 0, results = 0, n = cJSON_GetArraySize(m);
+    for (int i = 0; i < n; i++) {
+        cJSON *x = cJSON_GetArrayItem(m, i);
+        cJSON *tcs = cJSON_GetObjectItem(x, "tool_calls");
+        if (cJSON_IsArray(tcs)) {
+            calls++;
+            cJSON *tc = cJSON_GetArrayItem(tcs, 0);
+            cJSON *fn = cJSON_GetObjectItem(tc, "function");
+            CHECK(cJSON_GetStringValue(cJSON_GetObjectItem(fn, "name")) != NULL,
+                  "tool name is preserved for pairing");
+            const char *a = cJSON_GetStringValue(cJSON_GetObjectItem(fn, "arguments"));
+            CHECK(a != NULL, "arguments field still exists");
+            cJSON *parsed = cJSON_Parse(a);
+            CHECK(parsed != NULL, "stubbed arguments are still valid JSON");
+            cJSON_Delete(parsed);
+        }
+        if (cJSON_GetObjectItem(x, "tool_call_id")) results++;
+    }
+    CHECK_EQ_INT(calls, 20, "all tool_calls still present");
+    CHECK_EQ_INT(calls, results, "pairing is intact");
+
+    /* The newest call must not be abridged -- it is the one in flight. */
+    cJSON *newest = cJSON_GetArrayItem(m, cJSON_GetArraySize(m) - 2);
+    cJSON *ntcs = cJSON_GetObjectItem(newest, "tool_calls");
+    if (cJSON_IsArray(ntcs)) {
+        const char *a = cJSON_GetStringValue(cJSON_GetObjectItem(
+            cJSON_GetObjectItem(cJSON_GetArrayItem(ntcs, 0), "function"), "arguments"));
+        CHECK(a && strlen(a) > 100000, "the most recent call keeps its arguments");
+    }
+
+    sdsfree(big);
+    cJSON_Delete(m);
+}
+
 /* --- trimming must never orphan a tool_call_id ----------------------------
  * Anthropic-backed models reject a request where a tool_use has no matching
  * tool_result, so messages are abridged in place and never removed. */
@@ -336,6 +440,7 @@ int main(void) {
     test_atomic_save();
     test_observation_pruning();
     test_live_context_is_bounded();
+    test_trim_counts_tool_call_arguments();
     test_trim_keeps_tool_pairing();
     test_note_budget();
     test_history_byte_cap();
