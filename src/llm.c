@@ -31,23 +31,27 @@ typedef struct {
 typedef struct {
     sds pending;        /* bytes not yet forming a complete line */
     sds content;        /* accumulated assistant text */
+    sds reasoning;      /* accumulated chain-of-thought, where a model emits it */
     sds finish_reason;
     stream_tc_t tcs[ALPHA_STREAM_MAX_TOOLCALLS];
     int ntc;
     int done;           /* saw [DONE] */
     int overflow;       /* more tool calls than we can hold */
+    const alpha_events_t *ev;   /* optional live callbacks */
 } stream_state_t;
 
 static void stream_state_init(stream_state_t *st) {
     memset(st, 0, sizeof(*st));
     st->pending = sdsempty();
     st->content = sdsempty();
+    st->reasoning = sdsempty();
     st->finish_reason = sdsempty();
 }
 
 static void stream_state_free(stream_state_t *st) {
     sdsfree(st->pending);
     sdsfree(st->content);
+    sdsfree(st->reasoning);
     sdsfree(st->finish_reason);
     for (int i = 0; i < st->ntc; i++) {
         sdsfree(st->tcs[i].id);
@@ -88,10 +92,26 @@ static void stream_handle_payload(stream_state_t *st, const char *payload) {
             sdsfree(st->finish_reason);
             st->finish_reason = sdsnew(fr);
         }
+        /* "delta" for a stream, "message" for a single JSON response: the same
+         * accumulator serves both, so the non-streaming path (needed by servers
+         * that cannot stream tool calls) is not a second parser to keep in
+         * step with this one. */
         cJSON *delta = cJSON_GetObjectItem(c0, "delta");
+        if (!delta) delta = cJSON_GetObjectItem(c0, "message");
         if (delta) {
             const char *c = cJSON_GetStringValue(cJSON_GetObjectItem(delta, "content"));
-            if (c) st->content = sdscat(st->content, c);
+            if (c) {
+                st->content = sdscat(st->content, c);
+                if (st->ev && st->ev->on_text) st->ev->on_text(st->ev->ud, c);
+            }
+            /* Reasoning models put their scratchpad in a separate field, under
+             * two different names depending on the provider. */
+            const char *r = cJSON_GetStringValue(cJSON_GetObjectItem(delta, "reasoning_content"));
+            if (!r) r = cJSON_GetStringValue(cJSON_GetObjectItem(delta, "reasoning"));
+            if (r) {
+                st->reasoning = sdscat(st->reasoning, r);
+                if (st->ev && st->ev->on_reasoning) st->ev->on_reasoning(st->ev->ud, r);
+            }
 
             cJSON *tcs = cJSON_GetObjectItem(delta, "tool_calls");
             if (cJSON_IsArray(tcs)) {
@@ -146,6 +166,22 @@ static size_t stream_write_cb(char *ptr, size_t size, size_t nmemb, void *ud) {
     return size * nmemb;
 }
 
+/* Non-streaming responses arrive as one JSON object rather than SSE lines, so
+ * they are buffered whole and handed to the same payload parser. */
+static size_t plain_write_cb(char *ptr, size_t size, size_t nmemb, void *ud) {
+    stream_state_t *st = ud;
+    st->pending = sdscatlen(st->pending, ptr, size * nmemb);
+    return size * nmemb;
+}
+
+/* Ctrl-C during a long generation must abort the HTTP request, not wait for
+ * the stall timeout. Returning non-zero from the progress callback does that. */
+static int llm_progress_cb(void *ud, curl_off_t dt, curl_off_t dn,
+                           curl_off_t ut, curl_off_t un) {
+    (void)ud; (void)dt; (void)dn; (void)ut; (void)un;
+    return alpha_cancel ? 1 : 0;
+}
+
 /* Rebuild the non-streaming `message` object the rest of the agent expects, so
  * streaming stays entirely inside this file. */
 static cJSON *stream_build_message(stream_state_t *st) {
@@ -178,40 +214,81 @@ static cJSON *stream_build_message(stream_state_t *st) {
     return msg;
 }
 
+/* Build the endpoint URL.
+ *
+ * Tolerates a trailing slash: ".../v1/" + "/chat/completions" is a 404 on every
+ * server, and a trailing slash is the natural way to paste a URL. */
+static sds build_url(const alpha_cfg_t *cfg) {
+    const char *base = (cfg->base_url && cfg->base_url[0])
+                     ? cfg->base_url : "http://localhost:11434/v1";
+    size_t blen = strlen(base);
+    while (blen > 0 && base[blen - 1] == '/') blen--;
+    return sdscatprintf(sdsempty(), "%.*s/chat/completions", (int)blen, base);
+}
+
+/* Build the request body. Separate from the transport so the suite can assert
+ * what is actually sent for a given config -- the previous test grepped this
+ * file for a literal `"stream":true`, which proved only that the string existed
+ * somewhere, and went stale the moment the flag became configurable. */
+static sds build_request_body(const alpha_cfg_t *cfg, cJSON *messages, int with_tools) {
+    char *msgs_s = cJSON_PrintUnformatted(messages);
+    const char *model = (cfg->model && cfg->model[0]) ? cfg->model : "local";
+    int max_tokens = cfg->max_tokens > 0 ? cfg->max_tokens : 8192;
+    double temp = cfg->temperature > 0.0 ? cfg->temperature : 0.2;
+    int stream = cfg->stream;
+    sds body;
+    if (with_tools) {
+        cJSON *tools = tools_schema();
+        char *tools_s = cJSON_PrintUnformatted(tools);
+        cJSON_Delete(tools);
+        /* parallel_tool_calls is rejected outright by some OpenAI-compatible
+         * servers, so it is only sent when actually wanted. */
+        body = sdscatprintf(sdsempty(),
+            "{\"model\":\"%s\",\"messages\":%s,\"tools\":%s,"
+            "\"tool_choice\":\"auto\",%s"
+            "\"stream\":%s,"
+            "\"temperature\":%.2f,\"max_tokens\":%d}",
+            model,
+            msgs_s ? msgs_s : "[]",
+            tools_s ? tools_s : "[]",
+            cfg->parallel_tools ? "\"parallel_tool_calls\":true," : "",
+            stream ? "true" : "false",
+            temp, max_tokens);
+        free(tools_s);
+    } else {
+        /* No-tools path: used for the [TURN LIMIT] summary, which is exactly
+         * when the model has the most findings to report, so it gets the same
+         * token budget rather than a token afterthought. */
+        body = sdscatprintf(sdsempty(),
+            "{\"model\":\"%s\",\"messages\":%s,\"stream\":%s,"
+            "\"temperature\":%.2f,\"max_tokens\":%d}",
+            model, msgs_s ? msgs_s : "[]", stream ? "true" : "false",
+            temp + 0.2, max_tokens);
+    }
+    free(msgs_s);
+    return body;
+}
+
+/* The Authorization header, or empty when there is no key.
+ *
+ * Local servers take no key at all, and several reject a placeholder outright,
+ * so "none" and "" must both mean "send no header" rather than being passed
+ * through as a literal credential. */
+static sds build_auth_header(const alpha_cfg_t *cfg) {
+    const char *k = cfg->api_key;
+    if (!k || !k[0] || strcmp(k, "none") == 0) return sdsempty();
+    return sdscatprintf(sdsempty(), "Authorization: Bearer %s", k);
+}
+
 sds llm_chat_ex(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message,
                 int with_tools, int *out_failed) {
     if (out_message) *out_message = NULL;
     if (out_failed) *out_failed = 0;
     if (!cfg || !messages) { if (out_failed) *out_failed = 1; return sdsnew("ERROR: bad llm args"); }
 
-    char *msgs_s = cJSON_PrintUnformatted(messages);
-    sds url = sdscatprintf(sdsempty(), "%s/chat/completions",
-                           cfg->base_url ? cfg->base_url : "http://127.0.0.1:8317/v1");
-    sds body;
-    if (with_tools) {
-        cJSON *tools = tools_schema();
-        char *tools_s = cJSON_PrintUnformatted(tools);
-        cJSON_Delete(tools);
-        body = sdscatprintf(sdsempty(),
-            "{\"model\":\"%s\",\"messages\":%s,\"tools\":%s,"
-            "\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,"
-            "\"stream\":true,"
-            "\"temperature\":0.2,\"max_tokens\":16384}",
-            cfg->model ? cfg->model : "claude-opus-5",
-            msgs_s ? msgs_s : "[]",
-            tools_s ? tools_s : "[]");
-        free(tools_s);
-    } else {
-        /* No-tools path: only used for the [TURN LIMIT] summary, which is
-         * exactly when the model has the most findings to report. 400 tokens
-         * cut those answers off mid-sentence. */
-        body = sdscatprintf(sdsempty(),
-            "{\"model\":\"%s\",\"messages\":%s,\"stream\":true,"
-            "\"temperature\":0.4,\"max_tokens\":8192}",
-            cfg->model ? cfg->model : "claude-opus-5",
-            msgs_s ? msgs_s : "[]");
-    }
-    free(msgs_s);
+    sds url = build_url(cfg);
+    sds body = build_request_body(cfg, messages, with_tools);
+    int stream = cfg->stream;
 
     CURL *curl = curl_easy_init();
     if (!curl) {
@@ -222,51 +299,112 @@ sds llm_chat_ex(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message,
     }
     stream_state_t st;
     stream_state_init(&st);
+    st.ev = cfg->events;
     struct curl_slist *hdrs = NULL;
     hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-    sds auth = sdscatprintf(sdsempty(), "Authorization: Bearer %s",
-                            (cfg->api_key && cfg->api_key[0]) ? cfg->api_key : "none");
-    hdrs = curl_slist_append(hdrs, auth);
+    sds auth = build_auth_header(cfg);
+    if (sdslen(auth)) {
+        hdrs = curl_slist_append(hdrs, auth);
+        /* Anthropic's own endpoint uses a different header; sending both is
+         * harmless everywhere else and saves a provider special case here. */
+        sds xk = sdscatprintf(sdsempty(), "x-api-key: %s", cfg->api_key);
+        hdrs = curl_slist_append(hdrs, xk);
+        sdsfree(xk);
+        hdrs = curl_slist_append(hdrs, "anthropic-version: 2023-06-01");
+    }
     sdsfree(auth);
 
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stream_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+                     stream ? stream_write_cb : plain_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &st);
-    /* No CURLOPT_TIMEOUT: with streaming, a long reply is not a failure. What
-     * must be caught is a connection that has STOPPED producing, so bound the
-     * silence instead -- under ALPHA_LLM_STALL_SECONDS of throughput below one
-     * byte/s aborts. A healthy generation always beats that. */
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, (long)ALPHA_LLM_STALL_SECONDS);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, llm_progress_cb);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    if (stream) {
+        /* No CURLOPT_TIMEOUT: with streaming, a long reply is not a failure.
+         * What must be caught is a connection that has STOPPED producing, so
+         * bound the silence instead -- under ALPHA_LLM_STALL_SECONDS of
+         * throughput below one byte/s aborts. A healthy generation beats that. */
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, (long)ALPHA_LLM_STALL_SECONDS);
+    } else {
+        /* Without streaming there is nothing on the wire until generation
+         * finishes, so a stall timeout would abort every healthy request. Only
+         * a total cap is possible here -- one reason streaming is the default. */
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)ALPHA_LLM_NOSTREAM_SECONDS);
+    }
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
     /* shell_run spawns threads; libcurl's default alarm/longjmp DNS timeout is
      * not safe in a threaded process. */
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
     CURLcode rc = curl_easy_perform(curl);
+    if (!stream && rc == CURLE_OK) stream_handle_payload(&st, st.pending);
     long http = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http);
     curl_slist_free_all(hdrs);
     curl_easy_cleanup(curl);
-    sdsfree(url);
     sdsfree(body);
 
+    /* A transport failure leaves http == 0. Reporting that as "HTTP 0" hid the
+     * single most common first-run problem -- nothing listening at the URL --
+     * behind a status code that does not exist, so transport is judged first. */
+    if (rc != CURLE_OK && http == 0) {
+        const char *hint = "";
+        if (rc == CURLE_COULDNT_CONNECT)
+            hint = "\nNothing is listening there. Start the local server, or set "
+                   "--url / ALPHA_BASE_URL to a reachable endpoint.";
+        else if (rc == CURLE_COULDNT_RESOLVE_HOST)
+            hint = "\nThat hostname does not resolve. Check --url / ALPHA_BASE_URL.";
+        sds err = sdscatprintf(sdsempty(), "ERROR: cannot reach %s: %s%s",
+                               url, curl_easy_strerror(rc), hint);
+        stream_state_free(&st);
+        sdsfree(url);
+        if (out_failed) *out_failed = 1;
+        return err;
+    }
+    sdsfree(url);
+
     if (http < 200 || http >= 300) {
-        /* An error body is not SSE, so it lands in `pending` unparsed. */
-        sds err = sdscatprintf(sdsempty(), "ERROR HTTP %ld: %.500s", http, st.pending);
+        /* An error body is not SSE, so it lands in `pending` unparsed. Say what
+         * it usually means: at this point the user has just typed a base URL
+         * and a model name, and those are the two things that go wrong. */
+        const char *hint = "";
+        if (http == 401 || http == 403)
+            hint = "\nThe API key was rejected. Check ALPHA_API_KEY, or the "
+                   "provider's own key variable.";
+        else if (http == 404)
+            hint = "\nEndpoint or model not found. Check ALPHA_BASE_URL (it must "
+                   "end in /v1 for most servers) and ALPHA_MODEL.";
+        else if (http == 429)
+            hint = "\nRate limited by the provider. Wait, or use a local model.";
+        sds err = sdscatprintf(sdsempty(), "ERROR HTTP %ld: %.500s%s", http, st.pending, hint);
         stream_state_free(&st);
         if (out_failed) *out_failed = 1;
         return err;
     }
 
     int partial = 0;
-    if (rc != CURLE_OK) {
+    if (rc == CURLE_ABORTED_BY_CALLBACK) {
+        /* User interrupt, not a failure: keep whatever arrived. */
+        if (sdslen(st.content) == 0 && st.ntc == 0) {
+            stream_state_free(&st);
+            if (out_failed) *out_failed = 1;
+            return sdsnew("ERROR: interrupted");
+        }
+        partial = 1;
+    } else if (rc != CURLE_OK) {
         /* Whatever arrived before the break is still real work. Discarding it
          * is what made a timeout cost the entire turn; keep it and label it. */
         if (sdslen(st.content) == 0 && st.ntc == 0) {
-            sds err = sdscatprintf(sdsempty(), "ERROR curl: %s", curl_easy_strerror(rc));
+            const char *hint = "";
+            if (rc == CURLE_COULDNT_CONNECT)
+                hint = "\nNothing is listening at that address. Start the local "
+                       "server, or set ALPHA_BASE_URL to a reachable one.";
+            sds err = sdscatprintf(sdsempty(), "ERROR curl: %s%s",
+                                   curl_easy_strerror(rc), hint);
             stream_state_free(&st);
             if (out_failed) *out_failed = 1;
             return err;
@@ -302,9 +440,11 @@ sds llm_chat_ex(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message,
             "mid-thought. It is incomplete \u2014 ask me to continue.]");
     }
     if (partial)
-        out = sdscat(out,
-            "\n\n[INCOMPLETE: the connection to the model dropped mid-reply. "
-            "This is what arrived before it stopped \u2014 ask me to continue.]");
+        out = sdscat(out, alpha_cancel
+            ? "\n\n[INTERRUPTED: stopped at your request \u2014 this is what had "
+              "arrived so far.]"
+            : "\n\n[INCOMPLETE: the connection to the model dropped mid-reply. "
+              "This is what arrived before it stopped \u2014 ask me to continue.]");
     stream_state_free(&st);
     return out;
 }

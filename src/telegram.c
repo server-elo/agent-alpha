@@ -823,10 +823,10 @@ int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv) {
 
             if (strcmp(text, "/start") == 0 || strcmp(text, "/help") == 0) {
                 tg_send(token, chat_id,
-                    "Agent Alpha — OpenClaw-style coding chat on Telegram.\n"
-                    "Continuous memory in this chat. Open tools (no pin).\n"
-                    "Model: claude-opus-5\n\n"
-                    "Talk normally. For code, just say what to change/test.\n"
+                    "Agent Alpha — coding agent on Telegram.\n"
+                    "Continuous memory in this chat. Tools run unsandboxed.\n\n"
+                    "Talk normally, or send a voice note. For code, say what to\n"
+                    "change or test.\n"
                     "/status · /cwd <path> · /new (reset memory)\n");
                 { if (voice_text) sdsfree(voice_text); continue; }
             }
@@ -855,7 +855,7 @@ int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv) {
                 if (!chat_cwd_get_copy(chat_id, st_cwd, sizeof(st_cwd)))
                     snprintf(st_cwd, sizeof(st_cwd), "%s", cfg->cwd ? cfg->cwd : ".");
                 sds m = sdscatprintf(sdsempty(),
-                    "Agent Alpha (OpenClaw-style session)\n"
+                    "Agent Alpha\n"
                     "model: %s\nbase: %s\ncwd: %s\n"
                     "security: OFF (open tools)\nmemory: %s",
                     cfg->model ? cfg->model : "?",
@@ -867,9 +867,8 @@ int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv) {
                 { if (voice_text) sdsfree(voice_text); continue; }
             }
 
-            /* light instant hellos still OK — also store into memory via agent path for continuity? 
-             * Prefer LLM/memory path for "like OpenClaw" except pure /commands.
-             * Keep only true ping instant. */
+            /* Everything except pure /commands goes through the model so it
+             * lands in memory; only a bare ping answers instantly. */
             {
                 char low[64];
                 size_t ln = 0;

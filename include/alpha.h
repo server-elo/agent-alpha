@@ -14,6 +14,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <pthread.h>
+#include <signal.h>
 
 #include "../deps/sds.h"
 #include "../deps/cJSON.h"
@@ -33,6 +34,12 @@
 #ifndef ALPHA_LLM_STALL_SECONDS
 #define ALPHA_LLM_STALL_SECONDS 120
 #endif
+/* Total cap for the non-streaming path only. Nothing arrives there until
+ * generation has finished, so a stall timeout cannot distinguish a healthy
+ * long reply from a dead connection and only a total cap is possible. */
+#ifndef ALPHA_LLM_NOSTREAM_SECONDS
+#define ALPHA_LLM_NOSTREAM_SECONDS 900
+#endif
 /* Cap on one voice transcription. It runs on the Telegram poll thread, so an
  * unbounded one stops every chat. Generous: the medium model takes ~11s for a
  * 15s note, and a first run may download the model. */
@@ -43,14 +50,58 @@
  * 20 MB; anything near that is minutes of transcription on the poll thread. */
 #define ALPHA_VOICE_MAX_BYTES (8 * 1024 * 1024)
 
+/* --- providers -------------------------------------------------------------
+ *
+ * Anything speaking the OpenAI /chat/completions shape works: hosted APIs and
+ * local servers alike (Ollama, llama.cpp, LM Studio, vLLM, ...). A preset is
+ * only a convenient way to fill in base_url, the key's env var and a default
+ * model -- ALPHA_BASE_URL always wins, so an unlisted endpoint needs no code. */
 typedef struct {
-    const char *base_url;   /* e.g. http://127.0.0.1:8317/v1 */
-    const char *api_key;    /* optional; "none" ok for local proxy */
-    const char *model;      /* e.g. grok-4.5 */
+    const char *name;
+    const char *base_url;
+    const char *key_env;        /* env var holding the key, NULL if none */
+    const char *default_model;
+    int local;                  /* runs on this machine: no key required */
+} alpha_provider_t;
+
+const alpha_provider_t *alpha_provider_by_name(const char *name);
+/* Best-effort match of a base URL back to a preset, so an explicit
+ * ALPHA_BASE_URL still picks up that provider's key env var and default model. */
+const alpha_provider_t *alpha_provider_by_url(const char *base_url);
+const alpha_provider_t *alpha_provider_at(int i);   /* NULL past the end */
+
+/* Streaming/tool progress, so a front end can render a reply as it arrives
+ * instead of after it finishes. All fields optional. */
+typedef struct {
+    void (*on_text)(void *ud, const char *chunk);
+    void (*on_reasoning)(void *ud, const char *chunk);
+    void (*on_tool_start)(void *ud, const char *name, const char *args_json);
+    void (*on_tool_end)(void *ud, const char *name, const char *result, double secs);
+    void (*on_turn)(void *ud, int turn, int max_turns);
+    void (*on_notice)(void *ud, const char *text);
+    void *ud;
+} alpha_events_t;
+
+typedef struct {
+    const char *base_url;   /* e.g. http://localhost:11434/v1 */
+    const char *api_key;    /* optional; empty/"none" for local servers */
+    const char *model;
     const char *cwd;        /* working directory for tools */
     int max_turns;
     int quiet;
+    int stream;             /* 1 = SSE (default), 0 = single JSON response */
+    int parallel_tools;     /* 1 = allow several tool calls per turn */
+    int max_tokens;         /* 0 = provider default */
+    double temperature;
+    const alpha_events_t *events;
 } alpha_cfg_t;
+
+/* Defaults for fields a caller has left zeroed. */
+void alpha_cfg_defaults(alpha_cfg_t *cfg);
+
+/* Set from a signal handler to abort the in-flight request and any running
+ * shell command. Cleared by the agent loop when it starts a new request. */
+extern volatile sig_atomic_t alpha_cancel;
 
 /* messages: cJSON array of chat messages (owned by caller).
  * with_tools=0 → plain chat completion (fast, no tool schema). */
@@ -63,7 +114,7 @@ sds llm_chat(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message, int w
 /* Tool dispatch: name + args JSON object → result text (caller frees with sdsfree). */
 sds tools_run(const char *name, cJSON *args, const char *cwd);
 
-/* Pure-C browser tool (OpenClaw-style CDP + macOS open fallback). */
+/* Pure-C browser tool (CDP, with a macOS open fallback). */
 sds browser_tool_run(cJSON *args);
 
 /* OpenAI-style tools array for request. Caller frees. */
@@ -72,7 +123,7 @@ cJSON *tools_schema(void);
 /* One-shot (no memory). */
 sds agent_run(alpha_cfg_t *cfg, const char *user_text);
 
-/* OpenClaw-style continuous chat. session_path = JSON history file (may be NULL). */
+/* Continuous chat. session_path = JSON history file (may be NULL). */
 sds agent_run_session(alpha_cfg_t *cfg, const char *session_path, const char *user_text);
 
 /* Clear session history file. */

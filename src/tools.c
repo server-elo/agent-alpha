@@ -269,10 +269,16 @@ static sds shell_run(const char *cmd, const char *cwd) {
     close(ofd);
 
     int status = 0;
+    int cancelled = 0;
     for (int waited = 0; waited < 600; waited++) {   /* 600 * 100ms = 60s */
         pid_t r = waitpid(pid, &status, WNOHANG);
         if (r == pid) { timed_out = 0; break; }
         if (r < 0) break;
+        /* Ctrl-C must reach the command, not just the agent: without this a
+         * 60s sleep still had to run to completion before the interrupt was
+         * noticed. Same teardown as a timeout, since the child may have left
+         * the process group. */
+        if (alpha_cancel) { cancelled = 1; timed_out = 1; break; }
         usleep(100000);
         if (waited == 599) timed_out = 1;
     }
@@ -298,7 +304,9 @@ static sds shell_run(const char *cmd, const char *cwd) {
         if (out) sdsfree(out);
         out = sdsnew("(no output)");
     }
-    if (timed_out)
+    if (cancelled)
+        out = sdscat(out, "\nERROR: command interrupted by the user.");
+    else if (timed_out)
         out = sdscat(out, "\nERROR: command exceeded 60s timeout — killed (process group, "
                           "plus descendants still holding this command's output file). "
                           "A process that called setsid() and closed its inherited fds "
@@ -356,9 +364,9 @@ static sds list_dir(const char *path) {
     const char *p = (path && path[0]) ? path : ".";
     if (path_is_hang_prone(p)) {
         return sdscatprintf(sdsempty(),
-            "ERROR: path hangs on this host (Desktop/iCloud File Provider): %s\n"
-            "Use /Users/lorenc/projects or /Users/lorenc/agent-desktop instead.\n",
-            p);
+            "ERROR: path is served by the macOS File Provider (Desktop/iCloud Drive) "
+            "and can block indefinitely: %s\n"
+            "Copy what you need to a local directory first.\n", p);
     }
 
     int pipefd[2];
@@ -444,8 +452,9 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         if (cmd && (strstr(cmd, "/Desktop") || strstr(cmd, " ~/Desktop") ||
                     strstr(cmd, "Desktop/") || strstr(cmd, "ls Desktop"))) {
             return sdsnew(
-                "ERROR: command touches Desktop which hangs on this host.\n"
-                "Use /Users/lorenc/projects or /Users/lorenc/agent-desktop instead.\n");
+                "ERROR: command touches Desktop, which is served by the macOS File "
+                "Provider and can block indefinitely.\n"
+                "Copy what you need to a local directory first.\n");
         }
         return shell_run(cmd, cwd);
     }
@@ -570,7 +579,7 @@ cJSON *tools_schema(void) {
         "{\"type\":\"function\",\"function\":{\"name\":\"list_dir\","
         "\"description\":\"List directory entries (any path).\",\"parameters\":{\"type\":\"object\",\"properties\":{"
         "\"path\":{\"type\":\"string\"}}}}},"
-        "{\"type\":\"function\",\"function\":{\"name\":\"browser\",\"description\":\"OpenClaw-style pure-C browser. ONE sticky CDP tab. Loop: status/tabs -> open/navigate -> snapshot -> click/type/press/eval. close_others cleans junk. NEVER bash for click. Login/OAuth: snapshot+one click then stop. PROOF required.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\"},\"url\":{\"type\":\"string\"},\"selector\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"expression\":{\"type\":\"string\"},\"tab_id\":{\"type\":\"string\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"}},\"required\":[]}}}"
+        "{\"type\":\"function\",\"function\":{\"name\":\"browser\",\"description\":\"Pure-C browser. ONE sticky CDP tab. Loop: status/tabs -> open/navigate -> snapshot -> click/type/press/eval. close_others cleans junk. NEVER bash for click. Login/OAuth: snapshot+one click then stop. PROOF required.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\"},\"url\":{\"type\":\"string\"},\"selector\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"expression\":{\"type\":\"string\"},\"tab_id\":{\"type\":\"string\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"}},\"required\":[]}}}"
         "]";
     return cJSON_Parse(json);
 }

@@ -9,11 +9,12 @@ auto-detect guessed Latvian and then Lithuanian for clearly English speech
 and produced pure gibberish, while the same model with an explicit language
 transcribed it correctly. ALPHA_VOICE_LANG overrides (e.g. "de").
 
-An initial_prompt of project jargon is passed as well. Whisper conditions on
-it as if it were preceding transcript, so words it would otherwise spell as
-ordinary English come out right: "Goldcrit" -> "buildcrit", "fan out" ->
-"fanout", "Cargo Clippy" -> "cargo clippy". It biases, it does not constrain,
-so ordinary speech is unaffected. ALPHA_VOICE_PROMPT overrides.
+An initial_prompt of programming jargon is passed as well. Whisper conditions
+on it as if it were preceding transcript, so words it would otherwise spell as
+ordinary English come out right: "fan out" -> "fanout", "Cargo Clippy" ->
+"cargo clippy". It biases, it does not constrain, so ordinary speech is
+unaffected. Set ALPHA_VOICE_PROMPT to your own project's terms, or empty to
+disable.
 """
 import os
 import sys
@@ -21,9 +22,9 @@ import sys
 MODEL = os.environ.get("ALPHA_VOICE_MODEL", "medium")
 LANG = os.environ.get("ALPHA_VOICE_LANG", "en")
 DEFAULT_PROMPT = (
-    "Working on buildcrit, agent-alpha, ninja, bazel, cargo, JSON, DAG, "
-    "fanout, makespan, critical path, CI, MSRV, clippy, rustfmt, GitHub, "
-    "README, repo, commit, push, stdout, stderr, fd, setsid, whisper."
+    "Working on code: git, commit, push, rebase, repo, README, CI, build, "
+    "make, cargo, npm, Docker, JSON, YAML, API, stdout, stderr, stack trace, "
+    "refactor, regression, linter, endpoint, config."
 )
 PROMPT = os.environ.get("ALPHA_VOICE_PROMPT", DEFAULT_PROMPT)
 

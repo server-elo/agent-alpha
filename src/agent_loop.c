@@ -1,36 +1,35 @@
 #include "alpha.h"
 
-/* OpenClaw-like: continuous session + tools always available (model chooses). */
+/* Continuous session + tools always available (the model chooses). */
 static const char *SYSTEM_PROMPT =
-    "You are Agent Alpha - personal AI coding + browser assistant on the user's Mac (Telegram).\n"
-    "OpenClaw-style: continuous memory, direct, no filler, real tools only.\n"
+    "You are Agent Alpha, a coding assistant running on the user's own machine with\n"
+    "direct shell, filesystem and browser access. Be direct, no filler, real tools only.\n"
     "\n"
     "TOOLS: execute_bash, read_file, write_file, edit_file, list_dir, browser.\n"
-    "Call a tool before claiming disk or browser work.\n"
+    "Call a tool before claiming any disk or browser work. Never report a result you\n"
+    "did not observe. If a tool fails, say so and quote the error.\n"
     "You may call several tools at once; each gets its own result.\n"
     "Browser steps must still be one at a time (snapshot before click).\n"
     "\n"
-    "BROWSER = OpenClaw loop on ONE sticky CDP tab (never spam new tabs):\n"
+    "BROWSER: one sticky CDP tab, never spam new tabs.\n"
     "1) browser action=status or tabs if unsure\n"
-    "2) browser action=open url=... (reuses sticky tab)\n"
-    "3) browser action=snapshot (read buttons/inputs BEFORE click)\n"
+    "2) browser action=open url=... (reuses the sticky tab)\n"
+    "3) browser action=snapshot (read buttons/inputs BEFORE clicking)\n"
     "4) browser action=click text=... OR selector=... OR x/y\n"
     "5) browser action=type / fill / press / eval as needed\n"
-    "6) browser action=close_others to kill junk tabs\n"
-    "Click by text only matches short button/link labels (not email body text).\n"
-    "NEVER use execute_bash for click/login/type in browser.\n"
-    "LOGIN / OAuth / captcha / 2FA / Google account chooser: do open+snapshot+one click max,\n"
-    "then STOP and tell user the exact manual step. Do not thrash 10+ browser turns.\n"
-    "Never invent PROOF. Quote TAB_ID / RESULT / AFTER_URL from tool output.\n"
-    "NEVER ask for or store passwords. If user pastes a password, refuse to use it and warn to rotate.\n"
+    "6) browser action=close_others to clean up\n"
+    "Click by text only matches short button/link labels, not body text.\n"
+    "Never use execute_bash to click or type in the browser.\n"
+    "Login / OAuth / captcha / 2FA: do open+snapshot+one click at most, then STOP and\n"
+    "tell the user the exact manual step. Do not thrash ten browser turns.\n"
+    "Quote TAB_ID / RESULT / AFTER_URL from tool output as proof; never invent it.\n"
+    "NEVER ask for or store passwords. If the user pastes one, refuse to use it and\n"
+    "tell them to rotate it.\n"
     "\n"
-    "PATHS: NEVER list or ls ~/Desktop (hangs). Use ~/projects or ~/agent-desktop.\n"
-    "NO INVENT-SUCCESS: if a path/project is missing and user did not ask to create it,\n"
-    "report missing and stop. Do NOT create hello-world just to claim green compile.\n"
-    "Remember/codeword chat: answer from session text, no tools needed.\n"
-    "Social chat: brief text. Coding: inspect -> edit -> short proof.\n"
-    "German or English ok. You are @Agent3333c_bot, not Eloole/OpenClaw/Pi.\n"
-    "Default workspace often /Users/lorenc/projects.\n";
+    "If a path or project does not exist and the user did not ask you to create it,\n"
+    "report it missing and stop. Do not scaffold something just to claim success.\n"
+    "Answer recall questions from the session text; no tools needed.\n"
+    "Small talk: brief. Coding: inspect, edit, then show short proof.\n";
 static void messages_add_text(cJSON *messages, const char *role, const char *text) {
     cJSON *m = cJSON_CreateObject();
     cJSON_AddStringToObject(m, "role", role);
@@ -333,7 +332,11 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
     int browser_turns = 0;
     int transport_fails = 0;
 
+    const alpha_events_t *ev = cfg->events;
+
     for (int turn = 0; turn < max_turns; turn++) {
+        if (alpha_cancel) break;
+        if (ev && ev->on_turn) ev->on_turn(ev->ud, turn, max_turns);
         if (time(NULL) >= deadline) {
             messages_add_text(messages, "user",
                 "[TIME LIMIT] This request has run too long. Stop calling tools and "
@@ -364,7 +367,7 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
         sdsfree(content);
 
         /* Every tool_call MUST get its own tool result message, in order.
-         * Anthropic-backed models (claude-opus-5 via vibeproxy) hard-reject
+         * Anthropic-backed models hard-reject
          * a request where a tool_use id has no matching tool_result. */
         int curl_dead = 0;
         for (int ti = 0; ti < ntools; ti++) {
@@ -376,13 +379,22 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
             cJSON *args = args_s ? cJSON_Parse(args_s) : cJSON_CreateObject();
             if (!args) args = cJSON_CreateObject();
 
-            if (!cfg->quiet) {
+            if (ev && ev->on_tool_start)
+                ev->on_tool_start(ev->ud, name ? name : "?", args_s);
+            else if (!cfg->quiet) {
                 fprintf(stderr, "[alpha] tool %s (turn %d, %d/%d)\n",
                         name ? name : "?", turn, ti + 1, ntools);
                 fflush(stderr);
             }
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
             sds result = tools_run(name, args, cfg->cwd);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
             cJSON_Delete(args);
+            if (ev && ev->on_tool_end)
+                ev->on_tool_end(ev->ud, name ? name : "?", result,
+                                (double)(t1.tv_sec - t0.tv_sec) +
+                                (double)(t1.tv_nsec - t0.tv_nsec) / 1e9);
             notes_append(tool_notes, name, result);
 
             cJSON *tr = cJSON_CreateObject();
@@ -391,7 +403,7 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
             cJSON_AddStringToObject(tr, "content", result);
             cJSON_AddItemToArray(messages, tr);
 
-            /* OpenClaw-style: stop thrashing on browser login walls / long browser chains */
+            /* Stop thrashing on browser login walls / long browser chains */
             if (name && (strcmp(name, "browser") == 0 || strcmp(name, "web_browser") == 0)) {
                 browser_turns++;
                 int wall = result && (
@@ -422,8 +434,18 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
                 transport_fails = 0;
             }
             sdsfree(result);
+            if (alpha_cancel) break;
         }
         if (curl_dead) break;
+    }
+    /* Interrupted: return what was produced rather than asking the model for a
+     * summary, which would ignore the interrupt and start another request. */
+    if (alpha_cancel) {
+        if (!last || !last[0]) {
+            if (last) sdsfree(last);
+            return sdsnew("[interrupted]");
+        }
+        return last;
     }
     /* Turn budget exhausted while the model was still calling tools: the work
      * is done but no text was ever produced. Do NOT throw it away — ask once
@@ -460,6 +482,9 @@ sds agent_run_session(alpha_cfg_t *cfg, const char *session_path, const char *us
         else cfg->cwd = ".";
     }
 
+    alpha_cancel = 0;
+    alpha_cfg_defaults(cfg);
+
     cJSON *history = session_load(session_path);
     cJSON *messages = cJSON_CreateArray();
     sds sys = sdscatprintf(sdsempty(),
@@ -480,10 +505,6 @@ sds agent_run_session(alpha_cfg_t *cfg, const char *session_path, const char *us
     }
     messages_add_text(messages, "user", user_text);
 
-    if (!cfg->quiet) {
-        fprintf(stderr, "[alpha] session tools-on path\n");
-        fflush(stderr);
-    }
     sds tool_notes = sdsempty();
     sds reply = run_tool_loop(cfg, messages, &tool_notes);
 

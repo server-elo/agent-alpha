@@ -10,7 +10,7 @@
 #include <signal.h>
 
 /*
- * Pure-C browser (OpenClaw-inspired).
+ * Pure-C browser (CDP-based).
  * ONE sticky tab: open/navigate reuses Page.navigate.
  * Interact: click | type | snapshot | eval | press on sticky tab.
  *
@@ -534,7 +534,7 @@ static sds cdp_close_tab(const char *tab_id) {
     return res;
 }
 
-/* Close every page tab except sticky (OpenClaw-style hygiene). */
+/* Close every page tab except sticky (tab hygiene). */
 static sds cdp_close_others(void) {
     cJSON *keep = sticky_tab_obj();
     const char *keep_id = keep ? cJSON_GetStringValue(cJSON_GetObjectItem(keep, "id")) : NULL;

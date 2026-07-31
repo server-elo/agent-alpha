@@ -263,28 +263,201 @@ static void test_tool_only_turn_builds_a_valid_message(void) {
     stream_state_free(&st);
 }
 
-/* The request must actually ask for a stream -- everything above tests the
- * parser, which would pass even if the flag were never sent. */
-static void test_request_body_enables_streaming(void) {
-    TEST_BEGIN("stream: both request paths set stream:true");
+/* --- the request that is actually sent -------------------------------------
+ *
+ * Everything above tests the parser, which would pass even if the request were
+ * never sent correctly. These build the real body from a config and read it
+ * back as JSON, rather than grepping the source for a literal -- that only
+ * proved a string existed somewhere in the file, and it went stale as soon as
+ * the flag became configurable. */
+static cJSON *build_body_json(const alpha_cfg_t *cfg, int with_tools) {
+    cJSON *msgs = cJSON_CreateArray();
+    cJSON *m = cJSON_CreateObject();
+    cJSON_AddStringToObject(m, "role", "user");
+    cJSON_AddStringToObject(m, "content", "hi");
+    cJSON_AddItemToArray(msgs, m);
+    sds body = build_request_body(cfg, msgs, with_tools);
+    cJSON *parsed = cJSON_Parse(body);
+    sdsfree(body);
+    cJSON_Delete(msgs);
+    return parsed;
+}
+
+static void test_request_body_reflects_the_config(void) {
+    TEST_BEGIN("request: the body carries the configured model, limits and stream flag");
+
+    alpha_cfg_t cfg = { .model = "qwen2.5-coder:7b", .stream = 1,
+                        .max_tokens = 4096, .temperature = 0.7,
+                        .parallel_tools = 1 };
+    for (int with_tools = 0; with_tools <= 1; with_tools++) {
+        cJSON *b = build_body_json(&cfg, with_tools);
+        CHECK(b != NULL, "body is valid JSON");
+        if (!b) return;
+        const char *mdl = cJSON_GetStringValue(cJSON_GetObjectItem(b, "model"));
+        CHECK(mdl && strcmp(mdl, "qwen2.5-coder:7b") == 0, "the configured model is sent");
+        CHECK(cJSON_IsTrue(cJSON_GetObjectItem(b, "stream")),
+              "streaming is requested on both the tools and no-tools paths");
+        cJSON *mx = cJSON_GetObjectItem(b, "max_tokens");
+        CHECK(cJSON_IsNumber(mx) && mx->valueint == 4096, "max_tokens honours the config");
+        cJSON_Delete(b);
+    }
+
+    /* --no-stream must reach the wire, or the option silently does nothing. */
+    cfg.stream = 0;
+    cJSON *b = build_body_json(&cfg, 1);
+    CHECK(cJSON_IsFalse(cJSON_GetObjectItem(b, "stream")),
+          "stream:false is sent when streaming is disabled");
+    cJSON_Delete(b);
+}
+
+static void test_tools_are_only_sent_when_wanted(void) {
+    TEST_BEGIN("request: the tool schema is sent only on the tools path");
+    alpha_cfg_t cfg = { .model = "m", .stream = 1, .parallel_tools = 1 };
+
+    cJSON *with = build_body_json(&cfg, 1);
+    cJSON *tools = cJSON_GetObjectItem(with, "tools");
+    CHECK(cJSON_IsArray(tools) && cJSON_GetArraySize(tools) > 0, "tools present with_tools=1");
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItem(with, "parallel_tool_calls")),
+          "parallel_tool_calls requested when enabled");
+    cJSON_Delete(with);
+
+    cJSON *without = build_body_json(&cfg, 0);
+    CHECK(cJSON_GetObjectItem(without, "tools") == NULL,
+          "no tool schema on the summary path");
+    cJSON_Delete(without);
+
+    /* Several OpenAI-compatible servers reject unknown keys outright, so this
+     * one must be absent rather than false when it is not wanted. */
+    cfg.parallel_tools = 0;
+    cJSON *serial = build_body_json(&cfg, 1);
+    CHECK(cJSON_GetObjectItem(serial, "parallel_tool_calls") == NULL,
+          "parallel_tool_calls omitted entirely when disabled, not sent as false");
+    cJSON_Delete(serial);
+}
+
+/* A trailing slash on the base URL is the single most likely thing a user gets
+ * wrong, and it produces a 404 that looks like a wrong model name. */
+static void test_url_construction(void) {
+    TEST_BEGIN("request: the endpoint URL survives however the base is written");
+    const char *bases[] = {
+        "http://localhost:11434/v1",
+        "http://localhost:11434/v1/",
+        "http://localhost:11434/v1///",
+    };
+    for (size_t i = 0; i < sizeof(bases) / sizeof(bases[0]); i++) {
+        alpha_cfg_t cfg = { .base_url = bases[i] };
+        sds u = build_url(&cfg);
+        if (strcmp(u, "http://localhost:11434/v1/chat/completions") != 0) {
+            printf("  (base=%s -> %s)\n", bases[i], u);
+            CHECK(0, "trailing slashes do not produce a doubled path");
+            sdsfree(u);
+            return;
+        }
+        sdsfree(u);
+    }
+    CHECK(1, "trailing slashes do not produce a doubled path");
+
+    /* An empty config must still point somewhere usable rather than at a
+     * malformed URL. */
+    alpha_cfg_t empty = { 0 };
+    sds u = build_url(&empty);
+    CHECK(strstr(u, "/chat/completions") != NULL, "a default endpoint is still well formed");
+    sdsfree(u);
+}
+
+/* Streaming removed the fixed total timeout; reintroducing one would restore
+ * the cliff where a long reply was destroyed at the cap. */
+static void test_no_total_timeout_on_the_streaming_path(void) {
+    TEST_BEGIN("request: streaming uses a stall timeout, not a total one");
     FILE *f = fopen("src/llm.c", "rb");
+    if (!f) f = fopen("../src/llm.c", "rb");
     CHECK(f != NULL, "llm.c readable");
     if (!f) return;
     char buf[65536];
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
     buf[n] = 0;
-    /* Count rather than locate: with only "is there one after the first?" a
-     * missing flag on the tools path was reported as the no-tools path
-     * failing, which would send the next reader to the wrong branch. */
-    int flags = 0;
-    for (const char *p = buf; (p = strstr(p, "\\\"stream\\\":true")) != NULL; p++) flags++;
-    CHECK_EQ_INT(flags, 2, "both request bodies (tools and no-tools) ask for streaming");
-    /* A leftover total timeout would reintroduce the cliff streaming removes. */
-    CHECK(strstr(buf, "CURLOPT_TIMEOUT,") == NULL,
-          "no fixed total timeout remains on the LLM request");
     CHECK(strstr(buf, "CURLOPT_LOW_SPEED_TIME") != NULL,
-          "a stall timeout is used instead");
+          "a stall timeout bounds the streaming path");
+    /* A total cap is legitimate ONLY on the non-streaming path, where nothing
+     * arrives until generation finishes and a stall timeout cannot work. */
+    const char *t = strstr(buf, "CURLOPT_TIMEOUT,");
+    CHECK(t == NULL || strstr(buf, "ALPHA_LLM_NOSTREAM_SECONDS") != NULL,
+          "any total timeout is the non-streaming one");
+}
+
+/* Reasoning models emit their scratchpad in a separate field; it must not be
+ * concatenated into the answer, which would put raw chain-of-thought in front
+ * of the user and into the saved session. */
+static void test_reasoning_is_kept_out_of_the_answer(void) {
+    TEST_BEGIN("stream: reasoning_content is captured separately from content");
+    const char *sse =
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"let me think\"}}]}\n"
+        "data: {\"choices\":[{\"delta\":{\"content\":\"the answer\"}}]}\n"
+        "data: [DONE]\n";
+    stream_state_t st;
+    stream_state_init(&st);
+    feed_in_chunks(&st, sse, 5);
+    CHECK(strcmp(st.content, "the answer") == 0, "the answer contains only the answer");
+    CHECK(strcmp(st.reasoning, "let me think") == 0, "reasoning is available separately");
+    cJSON *msg = stream_build_message(&st);
+    const char *c = cJSON_GetStringValue(cJSON_GetObjectItem(msg, "content"));
+    CHECK(c && strcmp(c, "the answer") == 0, "and never leaks into the saved message");
+    cJSON_Delete(msg);
+    stream_state_free(&st);
+}
+
+/* A non-streaming response is one JSON object with "message" where a stream has
+ * "delta". Both go through the same accumulator, so this proves the shared path
+ * really handles the other shape. */
+static void test_non_streaming_response_is_parsed(void) {
+    TEST_BEGIN("request: a non-streaming response body is parsed by the same code");
+    const char *json =
+        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hello\","
+        "\"tool_calls\":[{\"index\":0,\"id\":\"t1\",\"function\":"
+        "{\"name\":\"list_dir\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}";
+    stream_state_t st;
+    stream_state_init(&st);
+    stream_handle_payload(&st, json);
+    CHECK(strcmp(st.content, "hello") == 0, "content read from message, not delta");
+    CHECK_EQ_INT(st.ntc, 1, "tool calls read from a non-streamed message");
+    /* Guarded: with the fallback removed, ntc is 0 and tcs[0].name is NULL, so
+     * an unguarded strcmp segfaults. A sabotage must FAIL the suite, not crash
+     * it -- a crash reports no diagnosis and no other check gets to run. */
+    CHECK(st.ntc == 1 && st.tcs[0].name && strcmp(st.tcs[0].name, "list_dir") == 0,
+          "with the right tool name");
+    CHECK(strcmp(st.finish_reason, "tool_calls") == 0, "finish_reason observed");
+    stream_state_free(&st);
+}
+
+/* Local servers take no key, and several reject a placeholder credential
+ * outright. The header must be absent, not a literal "none".
+ *
+ * The first version of this test grepped llm.c for the string ": none" and
+ * passed only because it matched a COMMENT -- a check that would have stayed
+ * green with the bug present. It builds the header now. */
+static void test_auth_header_is_conditional(void) {
+    TEST_BEGIN("request: no Authorization header without a real key");
+
+    const char *no_key[] = { NULL, "", "none" };
+    for (size_t i = 0; i < sizeof(no_key) / sizeof(no_key[0]); i++) {
+        alpha_cfg_t cfg = { .api_key = no_key[i] };
+        sds h = build_auth_header(&cfg);
+        if (sdslen(h) != 0) {
+            printf("  (key=%s produced '%s')\n", no_key[i] ? no_key[i] : "NULL", h);
+            CHECK(0, "an absent or placeholder key sends no header");
+            sdsfree(h);
+            return;
+        }
+        sdsfree(h);
+    }
+    CHECK(1, "an absent or placeholder key sends no header");
+
+    alpha_cfg_t real = { .api_key = "sk-test123" };
+    sds h = build_auth_header(&real);
+    CHECK(strcmp(h, "Authorization: Bearer sk-test123") == 0,
+          "a real key is sent as a bearer token");
+    sdsfree(h);
 }
 
 int main(void) {
@@ -298,6 +471,12 @@ int main(void) {
     test_crlf_and_no_space_after_data();
     test_tool_call_overflow_is_flagged();
     test_tool_only_turn_builds_a_valid_message();
-    test_request_body_enables_streaming();
+    test_request_body_reflects_the_config();
+    test_tools_are_only_sent_when_wanted();
+    test_url_construction();
+    test_no_total_timeout_on_the_streaming_path();
+    test_reasoning_is_kept_out_of_the_answer();
+    test_non_streaming_response_is_parsed();
+    test_auth_header_is_conditional();
     return test_report("llm");
 }

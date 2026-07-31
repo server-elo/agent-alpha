@@ -190,8 +190,8 @@ static void test_queue_overflow(void) {
 /* --- allowlist ------------------------------------------------------------- */
 static void test_allowlist(void) {
     TEST_BEGIN("allowed: only permitted chats are served");
-    CHECK(allowed("5433551381", 5433551381LL), "listed chat is allowed");
-    CHECK(!allowed("5433551381", 999LL), "unlisted chat is rejected");
+    CHECK(allowed("123456789", 123456789LL), "listed chat is allowed");
+    CHECK(!allowed("123456789", 999LL), "unlisted chat is rejected");
     CHECK(allowed("*", 999LL), "wildcard allows any chat");
     CHECK(allowed("1,2,3", 2LL), "comma-separated list works");
     CHECK(!allowed("1,2,3", 4LL), "absent id in a list is rejected");

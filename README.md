@@ -1,81 +1,156 @@
 # Agent Alpha
 
-Open AI coding shell in C. **No path pin / sandbox locks** — tools can read, write, and exec anywhere the process can.
+A coding agent in C. It reads and writes files, runs shell commands and drives
+a browser, on your own machine, against **any OpenAI-compatible API** — hosted
+or fully local.
 
-## Features
+```
+$ alpha
+Agent Alpha
+  model      qwen2.5-coder:7b
+  endpoint   http://localhost:11434/v1
+  cwd        /home/you/project
 
-- CLI one-shot, REPL, or Telegram long-poll
-- Tools: `execute_bash`, `read_file`, `write_file`, `edit_file`, `list_dir`
-- LLM: **vibeproxy `claude-opus-5`** (`http://127.0.0.1:8317/v1`)
-- One tool per turn (`parallel_tool_calls: false`)
+› why does the build fail?
+  • execute_bash {"command":"make 2>&1 | tail -30"}
+    ✓ 1843 bytes in 2.4s
+  • read_file {"path":"src/parser.c"}
+    ✓ 8120 bytes in 0.0s
+src/parser.c:212 passes a `size_t` where the callback expects `int`…
+```
 
 ## Build
 
+Needs a C compiler and libcurl. No other dependencies.
+
 ```bash
-cd ~/projects/agent-alpha
 make -j4
 ```
 
-## CLI
+## Use
 
 ```bash
-./alpha "list files in /Users/lorenc/projects and summarize"
-./alpha --repl
+alpha                          # interactive session
+alpha "fix the failing test"   # one task, then exit
+alpha --providers              # what is configured
 ```
+
+By default it talks to **Ollama on localhost** — nothing leaves your machine
+and no API key is involved:
+
+```bash
+ollama serve && ollama pull qwen2.5-coder:7b
+alpha
+```
+
+### Any other backend
+
+Presets fill in the endpoint, key variable and a default model:
+
+```bash
+alpha -p openai -m gpt-4o "..."      # uses $OPENAI_API_KEY
+alpha -p groq "..."                  # uses $GROQ_API_KEY
+alpha -p lmstudio "..."              # local, no key
+```
+
+A preset is only a shortcut. Anything that speaks `/chat/completions` works
+without one:
+
+```bash
+alpha --url http://192.168.1.50:8000/v1 --model my-model "..."
+```
+
+| flag | meaning |
+|---|---|
+| `-p, --provider` | preset name (`--providers` lists them) |
+| `-m, --model` | model id |
+| `-u, --url` | OpenAI-compatible base URL |
+| `-k, --key` | API key (prefer the env var) |
+| `-C, --cwd` | working directory for tools |
+| `--turns N` | max tool-calling turns per request |
+| `--no-stream` | wait for the whole reply instead of streaming |
+| `-q, --quiet` | no progress output |
+
+Equivalent environment variables: `ALPHA_PROVIDER`, `ALPHA_BASE_URL`,
+`ALPHA_API_KEY`, `ALPHA_MODEL`, `ALPHA_CWD`, `ALPHA_MAX_TURNS`, `ALPHA_STREAM`.
+Provider key variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …) are picked up
+automatically. A `.env` file in the working directory is loaded if present.
+
+In the session: `/help`, `/new`, `/cwd DIR`, `/model M`, `/status`, `/exit`.
+Ctrl-C interrupts the current request — including a running shell command —
+without ending the session. Ctrl-D exits.
+
+Colour and the spinner are disabled automatically when output is not a
+terminal, and when `NO_COLOR` is set.
+
+## Tools
+
+`execute_bash`, `read_file`, `write_file`, `edit_file`, `list_dir`, `browser`.
+
+The browser tool drives an existing Chrome over the DevTools protocol: one
+sticky tab, `snapshot` before `click`. Start Chrome with
+`--remote-debugging-port=9222`.
 
 ## Telegram
 
-Put token in `.env`:
+Optional. Run the agent as a Telegram bot with a continuous per-chat session.
 
 ```bash
-ALPHA_TELEGRAM_BOT_TOKEN=...
-ALPHA_TELEGRAM_ALLOW=5433551381
-ALPHA_BASE_URL=http://127.0.0.1:8317/v1
-ALPHA_MODEL=claude-opus-5
+ALPHA_TELEGRAM_BOT_TOKEN=...      # from @BotFather
+ALPHA_TELEGRAM_ALLOW=123456789    # your chat id; "*" allows everyone
+alpha --telegram
 ```
 
-```bash
-./scripts/alpha-telegram.sh start
-./scripts/alpha-telegram.sh status
-./scripts/alpha-telegram.sh stop
-```
+It **refuses to start without an allowlist**. A bot token is a public endpoint
+and the tools are unsandboxed, so anyone who found the bot would get a shell.
 
-Log: `/tmp/agent-alpha-telegram.log`
+`scripts/alpha-telegram.sh start|stop|status` runs it in the background. Only
+one poller can run at a time — a second is refused, because Telegram hands each
+update to whichever poller asks first and messages would vanish at random.
 
 ### Voice notes
 
-Hold the mic in Telegram and talk; the note is transcribed locally by Whisper
-(`scripts/alpha-transcribe.py`) and becomes the turn's text. No API key, no
-network, audio never leaves the machine.
+Send a voice note and it is transcribed locally by Whisper
+(`scripts/alpha-transcribe.py`) and used as the message. No API key, no
+network: the audio never leaves the machine.
 
-The `medium` model runs on CPU: measured 7s for a 3s note and 11s for a 15s
-one. Polling pauses for that time, which Telegram tolerates.
-`ALPHA_VOICE_MODEL=small` is about 3x faster and noticeably worse on jargon.
+Requires `pip install openai-whisper` and `ffmpeg`. The `medium` model takes
+about 11s for a 15s note on CPU; `ALPHA_VOICE_MODEL=small` is roughly 3× faster
+and noticeably worse on technical words. `ALPHA_VOICE_LANG` sets the language
+(default `en`) — auto-detect is deliberately not used, as it misfires badly on
+short phone audio. `ALPHA_VOICE_PROMPT` biases transcription toward your own
+jargon.
 
-If a note comes back "could not transcribe", the reason is in the log --
-usually a missing `ffmpeg`, which Whisper shells out to for decoding.
+## Security
 
-Transcription is biased with a list of project terms, since Whisper otherwise
-spells them as ordinary English -- "Goldcrit" for buildcrit, "fan out" for
-fanout, "Cargo Clippy" for cargo clippy. Override with `ALPHA_VOICE_PROMPT`,
-or set it empty to disable. `ALPHA_VOICE_LANG` sets the language (default
-`en`); auto-detect is deliberately not used, as it misfires badly on short
-phone audio.
+**Tools run unsandboxed with your full permissions.** There is no path
+restriction: the agent can read, modify and delete anything your user can, and
+`execute_bash` runs arbitrary commands. Run it on code you can afford to lose,
+under a user account you are comfortable handing to a language model.
 
-## Warning
+Two limits worth knowing:
 
-Security is intentionally **off**. Do not expose this bot publicly. Allowlist chat ids.
+- Shell commands are killed after 60s. A process that both calls `setsid()` and
+  closes its inherited descriptors — the textbook daemonization sequence —
+  survives that. It sheds every marker used to find it; closing the hole needs a
+  per-command uid or a real sandbox.
+- On macOS, paths served by the File Provider (Desktop, iCloud Drive) are
+  refused rather than opened, because `opendir` on them can block forever.
 
-### Known limitation: the 60s shell timeout does not catch full daemons
+## Tests
 
-When a command hits the 60s cap, `shell_run` kills the process group, then
-scans for descendants that left it — by parent chain, and by the output file
-they still hold open. That covers processes that call `setsid()` (fds survive
-setsid) and processes that close fds without detaching (still reachable by
-ancestry).
+```bash
+make test
+```
 
-A process that does **both** — `setsid()` *and* `close()` on its inherited
-fds, i.e. the textbook daemonization sequence — sheds every marker and keeps
-running. The timeout message says so when it fires. Fixing it properly needs a
-per-command uid or a sandbox, which is more machinery than this tool warrants;
-a process that deliberately daemonizes has asked to outlive the shell.
+346 checks over the tool layer, session handling, the SSE parser, provider
+resolution and the Telegram loop. The suite discards its binaries before every
+run: macOS `make` compares mtimes by whole seconds, and a source edited less
+than a second after the previous build was silently re-tested as the old
+binary — which is how three deliberately broken sources once reported all
+checks passing.
+
+## Licence
+
+MIT. Vendored: [cJSON](https://github.com/DaveGamble/cJSON) (MIT),
+[sds](https://github.com/antirez/sds) (BSD-2-Clause).

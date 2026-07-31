@@ -2,7 +2,8 @@ CC = clang
 CFLAGS = -std=c11 -Wall -Wextra -Werror=return-type -O2 -Iinclude -Ideps -pthread
 LDFLAGS = -lcurl -pthread
 
-SRC = src/main.c src/agent_loop.c src/llm.c src/tools.c src/browser.c src/telegram.c deps/cJSON.c deps/sds.c
+SRC = src/main.c src/agent_loop.c src/llm.c src/tools.c src/browser.c src/telegram.c \
+      src/provider.c src/ui.c deps/cJSON.c deps/sds.c
 OBJ = $(SRC:.c=.o)
 TARGET = alpha
 
@@ -13,7 +14,7 @@ all: $(TARGET)
 $(TARGET): $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-src/%.o: src/%.c include/alpha.h
+src/%.o: src/%.c include/alpha.h src/ui.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 deps/%.o: deps/%.c
@@ -24,9 +25,10 @@ deps/%.o: deps/%.c
 # Without it make considers a test up to date after the module changed, and
 # silently re-runs a stale binary (observed: a deliberately broken source
 # still reported all checks passing).
-TEST_SRC = tests/test_tools.c tests/test_session.c tests/test_telegram.c tests/test_llm.c
+TEST_SRC = tests/test_tools.c tests/test_session.c tests/test_telegram.c tests/test_llm.c \
+           tests/test_provider.c
 TEST_BIN = $(TEST_SRC:tests/%.c=tests/bin/%)
-TEST_DEPS = src/browser.o deps/cJSON.o deps/sds.o
+TEST_DEPS = src/browser.o src/provider.o deps/cJSON.o deps/sds.o
 # tests/test_util.h holds the assertion macros: a change there alters what every
 # CHECK means, yet nothing listed it as a prerequisite, so make reported the
 # suite "up to date" and re-ran binaries built against the old definitions.
@@ -45,6 +47,10 @@ tests/bin/test_telegram: tests/test_telegram.c src/telegram.c src/agent_loop.o s
 
 tests/bin/test_llm: tests/test_llm.c src/llm.c src/tools.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< src/tools.o $(TEST_DEPS) $(LDFLAGS)
+
+# Includes provider.c and ui.c directly, so it must not also link them.
+tests/bin/test_provider: tests/test_provider.c src/provider.c src/ui.c src/ui.h $(TEST_HDRS) | tests/bin
+	$(CC) $(CFLAGS) -o $@ $< deps/cJSON.o deps/sds.o $(LDFLAGS)
 
 tests/bin:
 	mkdir -p tests/bin
