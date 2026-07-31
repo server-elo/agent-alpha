@@ -2,6 +2,7 @@
 #include <curl/curl.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/file.h>
 #include <signal.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -432,6 +433,48 @@ static int session_dir_ensure(void) {
     return 0;
 }
 
+/* Refuse to start when another poller is already running.
+ *
+ * Two instances long-polling one bot token is not an error either of them can
+ * see: Telegram hands each update to whichever asked first, so messages
+ * disappear at random and the bot merely looks like it ignored you. The shell
+ * wrapper guarded this with a pidfile, which (a) does not cover `./alpha
+ * --telegram` run directly and (b) was observed holding a pid that had been
+ * dead for hours. An flock is held by the kernel and released on exit however
+ * the process dies, so it cannot go stale.
+ *
+ * The lock sits beside tg_offset because that -- with the session files -- is
+ * the state two pollers would corrupt. Returns the held fd, or -1. */
+static int telegram_lock_acquire(void) {
+    char path[PATH_MAX], dir[PATH_MAX];
+    session_dir(dir, sizeof(dir));
+    snprintf(path, sizeof(path), "%s/telegram.lock", dir);
+
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "[alpha-tg] cannot open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        char who[64] = "";
+        ssize_t n = pread(fd, who, sizeof(who) - 1, 0);
+        if (n > 0) who[n] = 0;
+        fprintf(stderr,
+                "[alpha-tg] another poller already holds %s%s%s — refusing to "
+                "start a second one\n",
+                path, who[0] ? " " : "", who);
+        close(fd);
+        return -1;
+    }
+    /* Record who holds it. Advisory only: the flock is the actual guarantee. */
+    if (ftruncate(fd, 0) == 0) {
+        char line[64];
+        int len = snprintf(line, sizeof(line), "pid=%ld", (long)getpid());
+        if (pwrite(fd, line, (size_t)len, 0) < 0) { /* diagnostics only */ }
+    }
+    return fd;
+}
+
 static void session_path_for_chat(char *out, size_t outsz, long long chat_id) {
     char dir[PATH_MAX];
     session_dir(dir, sizeof(dir));
@@ -611,6 +654,7 @@ int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv) {
         return 1;
     }
     if (session_dir_ensure() != 0) return 1;
+    if (telegram_lock_acquire() < 0) return 1;   /* held until the process exits */
     char sess_dir[PATH_MAX], off_path[PATH_MAX];
     session_dir(sess_dir, sizeof(sess_dir));
     snprintf(off_path, sizeof(off_path), "%s/tg_offset", sess_dir);

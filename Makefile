@@ -27,25 +27,42 @@ deps/%.o: deps/%.c
 TEST_SRC = tests/test_tools.c tests/test_session.c tests/test_telegram.c tests/test_llm.c
 TEST_BIN = $(TEST_SRC:tests/%.c=tests/bin/%)
 TEST_DEPS = src/browser.o deps/cJSON.o deps/sds.o
+# tests/test_util.h holds the assertion macros: a change there alters what every
+# CHECK means, yet nothing listed it as a prerequisite, so make reported the
+# suite "up to date" and re-ran binaries built against the old definitions.
+TEST_HDRS = tests/test_util.h include/alpha.h
 
-tests/bin/test_tools: tests/test_tools.c src/tools.c $(TEST_DEPS) | tests/bin
+tests/bin/test_tools: tests/test_tools.c src/tools.c $(TEST_DEPS) $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< $(TEST_DEPS) $(LDFLAGS)
 
-tests/bin/test_session: tests/test_session.c src/agent_loop.c src/llm.o src/tools.o $(TEST_DEPS) | tests/bin
+tests/bin/test_session: tests/test_session.c src/agent_loop.c src/llm.o src/tools.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< src/llm.o src/tools.o $(TEST_DEPS) $(LDFLAGS)
 
 # The voice timeout is 3 minutes in production; the suite must not wait that
 # long to prove a wedged transcriber gets killed, so it is compiled short.
-tests/bin/test_telegram: tests/test_telegram.c src/telegram.c src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) | tests/bin
+tests/bin/test_telegram: tests/test_telegram.c src/telegram.c src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -DALPHA_VOICE_TIMEOUT_MS=3000 -o $@ $< src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) $(LDFLAGS)
 
-tests/bin/test_llm: tests/test_llm.c src/llm.c src/tools.o $(TEST_DEPS) | tests/bin
+tests/bin/test_llm: tests/test_llm.c src/llm.c src/tools.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< src/tools.o $(TEST_DEPS) $(LDFLAGS)
 
 tests/bin:
 	mkdir -p tests/bin
 
-test: $(TEST_BIN)
+# GNU make 3.81 (the macOS system make) compares mtimes truncated to whole
+# seconds: a source edited 0.3s after the previous build is reported "up to
+# date" and the STALE binary runs. Measured directly -- a prerequisite 0.3s
+# newer does not rebuild, 1.5s newer does. That is the normal edit-then-test
+# rhythm, and it is how three deliberately broken sources were observed
+# reporting all checks passing. A suite that certifies every other fix must not
+# be able to lie about which code it ran, so the binaries are always discarded
+# first. Costs ~2s.
+test:
+	@rm -rf tests/bin
+	@$(MAKE) --no-print-directory run-tests
+
+.PHONY: run-tests
+run-tests: $(TEST_BIN)
 	@fail=0; for t in $(TEST_BIN); do \
 		echo "=== $$t ==="; ./$$t || fail=1; \
 	done; \

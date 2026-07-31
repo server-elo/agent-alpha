@@ -443,6 +443,71 @@ static void test_main_does_not_pin_root_to_cwd(void) {
     sdsfree(body);
 }
 
+/* Two pollers on one bot token silently lose messages: Telegram gives each
+ * update to whoever asked first. The guard must live in the binary, since
+ * `./alpha --telegram` bypasses the launcher's pidfile entirely. */
+static void test_only_one_poller_may_hold_the_lock(void) {
+    TEST_BEGIN("telegram: a second poller cannot acquire the lock");
+
+    CHECK(session_dir_ensure() == 0, "session dir available");
+
+    int first = telegram_lock_acquire();
+    CHECK(first >= 0, "first poller acquires the lock");
+
+    /* flock is per open-file-description, so a fresh open() contends exactly
+     * as a separate process would -- verified against the kernel, not assumed. */
+    int second = telegram_lock_acquire();
+    CHECK_EQ_INT(second, -1, "second poller is refused while the first holds it");
+    if (second >= 0) close(second);
+
+    /* The lock file must be beside the state two pollers would corrupt. */
+    char dir[PATH_MAX], lockpath[PATH_MAX];
+    session_dir(dir, sizeof(dir));
+    snprintf(lockpath, sizeof(lockpath), "%s/telegram.lock", dir);
+    struct stat st;
+    CHECK(stat(lockpath, &st) == 0, "lock file lives in the session dir");
+
+    /* It records the holder, so a refusal says who is in the way. */
+    char buf[64] = "";
+    FILE *lf = fopen(lockpath, "rb");
+    if (lf) { size_t n = fread(buf, 1, sizeof(buf) - 1, lf); buf[n] = 0; fclose(lf); }
+    char want[64];
+    snprintf(want, sizeof(want), "pid=%ld", (long)getpid());
+    CHECK(strcmp(buf, want) == 0, "lock records the holding pid");
+
+    /* Releasing must let the next poller in -- a lock that never frees would
+     * brick every restart, which is worse than the bug it prevents. */
+    close(first);
+    int third = telegram_lock_acquire();
+    CHECK(third >= 0, "lock is reacquirable once the holder exits");
+    if (third >= 0) close(third);
+    unlink(lockpath);
+
+    /* A correct lock nobody calls is not a guard. telegram_run cannot be
+     * invoked here (it polls forever), so assert the wiring in the source --
+     * otherwise deleting the call site leaves this whole test green. */
+    FILE *src = fopen("src/telegram.c", "rb");
+    if (!src) src = fopen("../src/telegram.c", "rb");
+    if (!src) src = fopen("../../src/telegram.c", "rb");
+    CHECK(src != NULL, "telegram.c is readable");
+    if (!src) return;
+    sds body = sdsempty();
+    char rb[4096];
+    size_t rn;
+    while ((rn = fread(rb, 1, sizeof(rb), src)) > 0) body = sdscatlen(body, rb, rn);
+    fclose(src);
+    const char *run = strstr(body, "int telegram_run(");
+    CHECK(run != NULL, "telegram_run found");
+    if (run) {
+        const char *loop = strstr(run, "for (;;)");
+        CHECK(loop != NULL, "its poll loop found");
+        const char *call = strstr(run, "telegram_lock_acquire()");
+        CHECK(call != NULL && loop != NULL && call < loop,
+              "telegram_run acquires the lock before it starts polling");
+    }
+    sdsfree(body);
+}
+
 /* Concurrent voice notes must not collide on one temp path. */
 static void test_voice_downloads_do_not_share_a_path(void) {
     TEST_BEGIN("voice: concurrent downloads get distinct temp files");
@@ -478,6 +543,7 @@ int main(int argc, char **argv) {
     test_voice_download_size_cap();
     test_session_dir_matches_session_path();
     test_main_does_not_pin_root_to_cwd();
+    test_only_one_poller_may_hold_the_lock();
     test_voice_downloads_do_not_share_a_path();
 
     /* The sandbox must have absorbed the writes, and the real install must be
