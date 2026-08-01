@@ -612,7 +612,11 @@ static int q_push(queue_t *q, long long chat_id, const char *text) {
     else q->head = j;
     q->tail = j;
     q->count++;
-    pthread_cond_signal(&q->cv);
+    /* Broadcast, not signal: the workers are not interchangeable. The reserved
+     * fast-lane worker refuses any job job_is_quick() rejects, so a signal that
+     * happens to wake it leaves the job queued with nobody else woken -- the
+     * request simply never runs (measured: 3-4 of 25 long jobs lost). */
+    pthread_cond_broadcast(&q->cv);
     pthread_mutex_unlock(&q->lock);
     return 1;
 }

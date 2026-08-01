@@ -12,9 +12,24 @@ static sds test_record_send(const char *token, const char *body);
 
 #include "../src/telegram.c"
 
+/* The wakeup test watches for the reply to one specific chat. Matching on the
+ * chat_id rather than counting sends means a late reply to the preceding quick
+ * job cannot be mistaken for the long job's, which would turn a lost wakeup
+ * into a passing test. */
+static pthread_mutex_t wake_lock = PTHREAD_MUTEX_INITIALIZER;
+static long long wake_want;
+static int wake_hit;
+
 static sds test_record_send(const char *token, const char *body) {
     (void)token;
     if (sent_count < 64) sent_bodies[sent_count++] = strdup(body);
+    pthread_mutex_lock(&wake_lock);
+    if (wake_want) {
+        char needle[64];
+        snprintf(needle, sizeof(needle), "{\"chat_id\":%lld,", wake_want);
+        if (strncmp(body, needle, strlen(needle)) == 0) wake_hit = 1;
+    }
+    pthread_mutex_unlock(&wake_lock);
     return sdsnew("{\"ok\":true}");
 }
 #include "test_util.h"
@@ -207,6 +222,97 @@ static void test_queue_semantics(void) {
     job_t *fast = q_take_ready(&r, 1);
     CHECK(fast && strcmp(fast->text, "ping") == 0,
           "fast lane picks ping and skips Go");
+}
+
+/* --- a queued job must always reach a worker -------------------------------
+ * q_push woke one waiter with pthread_cond_signal, but the workers are not
+ * interchangeable: the reserved fast-lane worker rejects anything
+ * job_is_quick() refuses. When the signal reached that worker it re-parked and
+ * nobody else was woken, so the request sat in the queue forever and the user
+ * got no reply at all (measured: 3-4 of every 25 long jobs lost).
+ *
+ * The real worker_main threads run here. The endpoint is a closed port, so
+ * agent_run_session fails immediately at connect and no model is contacted --
+ * what matters is that the job is picked up and answered, not what it says. */
+/* Waiter bookkeeping for the test below. */
+static pthread_mutex_t wake_cnt_lock = PTHREAD_MUTEX_INITIALIZER;
+static int wake_parked, wake_woken, wake_stop;
+
+static int wake_parked_count(void) {
+    pthread_mutex_lock(&wake_cnt_lock);
+    int v = wake_parked;
+    pthread_mutex_unlock(&wake_cnt_lock);
+    return v;
+}
+static int wake_woken_count(void) {
+    pthread_mutex_lock(&wake_cnt_lock);
+    int v = wake_woken;
+    pthread_mutex_unlock(&wake_cnt_lock);
+    return v;
+}
+
+/* Parks on the queue's condition variable exactly as worker_main does, and
+ * records the wakeup instead of taking the job -- so the count reflects how
+ * many waiters q_push released, which is the property under test. */
+static void *wake_waiter(void *arg) {
+    queue_t *q = arg;
+    pthread_mutex_lock(&q->lock);
+    pthread_mutex_lock(&wake_cnt_lock);
+    wake_parked++;
+    pthread_mutex_unlock(&wake_cnt_lock);
+    pthread_cond_wait(&q->cv, &q->lock);
+    pthread_mutex_lock(&wake_cnt_lock);
+    wake_woken++;
+    pthread_mutex_unlock(&wake_cnt_lock);
+    while (!wake_stop) pthread_cond_wait(&q->cv, &q->lock);
+    pthread_mutex_unlock(&q->lock);
+    return NULL;
+}
+
+static void test_queue_wakeup(void) {
+    TEST_BEGIN("work queue: a push wakes every waiter, not just one");
+
+    static queue_t q;
+    memset(&q, 0, sizeof(q));
+    pthread_mutex_init(&q.lock, NULL);
+    pthread_cond_init(&q.cv, NULL);
+
+    /* Park two waiters on the condition variable and count how many a single
+     * q_push releases. This is the contract q_push must honour: because the
+     * reserved fast-lane worker refuses non-quick jobs, waking only one waiter
+     * can wake the one that will not take the job, and it re-parks with the
+     * job still queued.
+     *
+     * Counting wakeups is deterministic -- it does not depend on which thread
+     * the scheduler happens to pick, which is why an earlier version of this
+     * test passed against the bug. */
+    pthread_mutex_lock(&q.lock);
+    for (int i = 0; i < 2; i++) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, wake_waiter, &q) == 0) pthread_detach(th);
+    }
+    /* Release the lock and give both threads time to reach pthread_cond_wait.
+     * They increment wake_parked before waiting, so the count confirms it. */
+    pthread_mutex_unlock(&q.lock);
+    for (int w = 0; w < 200 && wake_parked_count() < 2; w++) usleep(10000);
+    CHECK_EQ_INT(wake_parked_count(), 2, "both waiters are parked");
+
+    q_push(&q, 4242, "please rebuild the whole project");
+
+    int woke = 0;
+    for (int w = 0; w < 200; w++) {
+        woke = wake_woken_count();
+        if (woke >= 2) break;
+        usleep(10000);
+    }
+    CHECK_EQ_INT(woke, 2, "one push wakes both waiters");
+
+    /* Let the waiters exit. */
+    pthread_mutex_lock(&q.lock);
+    wake_stop = 1;
+    pthread_cond_broadcast(&q.cv);
+    pthread_mutex_unlock(&q.lock);
+    usleep(100000);
 }
 
 static void test_queue_overflow(void) {
@@ -671,6 +777,7 @@ int main(int argc, char **argv) {
     test_fast_lane_routing();
     test_chat_cwd_thread_safety();
     test_queue_semantics();
+    test_queue_wakeup();
     test_queue_overflow();
     test_allowlist();
     test_transcriber_path_is_independent_of_cwd();
