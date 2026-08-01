@@ -4,20 +4,13 @@ A coding agent in C. It reads and writes files, runs shell commands and drives
 a browser, on your own machine, against **any OpenAI-compatible API** — hosted
 or fully local.
 
-```
-$ alpha
-Agent Alpha
-  model      qwen3:8b
-  endpoint   http://localhost:11434/v1
-  cwd        /home/you/project
+![demo](assets/demo.gif)
 
-› why does the build fail?
-  • execute_bash {"command":"make 2>&1 | tail -30"}
-    ✓ 1843 bytes in 2.4s
-  • read_file {"path":"src/parser.c"}
-    ✓ 8120 bytes in 0.0s
-src/parser.c:212 passes a `size_t` where the callback expects `int`…
-```
+Recorded unedited against a local `qwen3:8b`, no API key involved
+(`vhs assets/demo.tape`). Small local models are weaker at tool discipline
+than hosted ones — in the recording the model drifts into *describing* the
+tools it would call rather than calling them. Point Alpha at a larger model
+for real work; the local default is there so the first run needs nothing.
 
 ## Build
 

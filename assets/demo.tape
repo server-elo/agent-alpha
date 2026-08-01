@@ -18,17 +18,20 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 45ms
 
 Hide
-Type "cd /tmp/demo-proj && clear" Enter
+Type "cd /tmp/demo-proj" Enter
+Type "export ALPHA_ENV_FILE=/dev/null PS1='$ '" Enter
+Type "unset ALPHA_CWD ALPHA_BASE_URL ALPHA_MODEL ALPHA_API_KEY" Enter
+Type "clear" Enter
 Sleep 1s
 Show
 
 Type "alpha --provider ollama" Enter
 Sleep 6s
 
-Type "why does the build fail?"
+Type "run make and explain the failure"
 Sleep 700ms
 Enter
-Sleep 75s
+Sleep 80s
 
 Type "/exit" Enter
 Sleep 2s
