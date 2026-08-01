@@ -170,6 +170,71 @@ static void test_edit_size_guard(void) {
     unlink(path);
 }
 
+/* --- a truncated read must disclose the size of the gap --------------------
+ * read_file caps at 250000 bytes and appended a bare "… truncated". Nothing
+ * said how much was missing, so a 4 MB log and a 260 KB one looked identical
+ * and the model answered about the whole file from the first 6% of it.
+ * Measured through tools_run, on a file whose tail is uniquely identifiable. */
+static void test_read_truncation_is_quantified(void) {
+    TEST_BEGIN("read_file: truncation states how many bytes were not read");
+
+    mkdir_p("/tmp/alpha_t");
+    const char *path = "/tmp/alpha_t/big.txt";
+    const size_t cap = 250000;          /* read_file's cap */
+    const size_t extra = 130000;
+
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL, "fixture created");
+    if (!f) return;
+    char buf[8192];
+    memset(buf, 'A', sizeof(buf));
+    size_t written = 0;
+    while (written < cap + extra) {
+        fwrite(buf, 1, sizeof(buf), f);
+        written += sizeof(buf);
+    }
+    fputs("UNIQUE_TAIL_MARKER", f);
+    fclose(f);
+
+    struct stat st;
+    stat(path, &st);
+    long long total = (long long)st.st_size;
+
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", path);
+    sds r = tools_run("read_file", a, "/tmp");
+    cJSON_Delete(a);
+
+    /* The tail is genuinely absent -- otherwise there is nothing to disclose. */
+    CHECK(strstr(r, "UNIQUE_TAIL_MARKER") == NULL, "the tail really is missing");
+    CHECK(strstr(r, "TRUNCATED") != NULL, "the result says it was truncated");
+
+    /* The exact number of unread bytes must appear, not merely the word.
+     * Building the expected string here (rather than trusting a substring
+     * like "bytes") is what makes a silently wrong count fail. */
+    char want_missing[64], want_total[64];
+    snprintf(want_missing, sizeof(want_missing), "%lld NOT read", total - (long long)cap);
+    snprintf(want_total, sizeof(want_total), "%zu of %lld bytes shown", cap, total);
+    CHECK(strstr(r, want_missing) != NULL, "the count of unread bytes is exact");
+    CHECK(strstr(r, want_total) != NULL, "the shown/total figures are exact");
+    sdsfree(r);
+
+    /* A file under the cap must not be labelled truncated. */
+    const char *small = "/tmp/alpha_t/small.txt";
+    f = fopen(small, "wb");
+    if (f) { fputs("short file\n", f); fclose(f); }
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", small);
+    r = tools_run("read_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strstr(r, "TRUNCATED") == NULL, "a small file is not labelled truncated");
+    CHECK(strcmp(r, "short file\n") == 0, "and is returned verbatim");
+    sdsfree(r);
+
+    unlink(path);
+    unlink(small);
+}
+
 /* --- a NUL byte must not silently swallow the rest of the data --------------
  * Tool results are serialised with cJSON_CreateString, which stops at the
  * first NUL. read_file returned a 31-byte sds of which the model saw 6, and
@@ -287,6 +352,7 @@ int main(void) {
     test_timeout_kills_descendants();
     test_timeout_reports();
     test_edit_size_guard();
+    test_read_truncation_is_quantified();
     test_nul_bytes();
     test_bad_input();
     test_hang_prone_paths();

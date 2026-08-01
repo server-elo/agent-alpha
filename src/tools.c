@@ -30,7 +30,20 @@ static sds read_file_all(const char *path, size_t max_bytes) {
     while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
         if (total + n > max_bytes) {
             out = sdscatlen(out, buf, max_bytes - total);
-            out = sdscat(out, "\n… truncated");
+            /* "… truncated" alone does not say how much is missing, so the
+             * model cannot tell 5% of a file from 95% of one and answers from
+             * the fragment as if it were whole. State the size of the gap. */
+            long long size = -1;
+            if (fseek(f, 0, SEEK_END) == 0) size = ftell(f);
+            if (size > (long long)max_bytes)
+                out = sdscatprintf(out,
+                    "\n…[TRUNCATED: %zu of %lld bytes shown, %lld NOT read — "
+                    "use execute_bash with sed/tail to see the rest]",
+                    max_bytes, size, size - (long long)max_bytes);
+            else
+                out = sdscatprintf(out,
+                    "\n…[TRUNCATED at %zu bytes; the rest was NOT read — "
+                    "use execute_bash with sed/tail to see it]", max_bytes);
             break;
         }
         out = sdscatlen(out, buf, n);
