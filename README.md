@@ -144,7 +144,7 @@ Two limits worth knowing:
 make test
 ```
 
-453 checks over the tool layer, session handling, the SSE parser, provider
+463 checks over the tool layer, session handling, the SSE parser, provider
 resolution, config loading, the CDP WebSocket client and the Telegram loop.
 Both the macOS and Linux process-tracking paths are exercised on either host.
 The suite discards its binaries before every

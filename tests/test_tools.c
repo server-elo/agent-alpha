@@ -170,6 +170,81 @@ static void test_edit_size_guard(void) {
     unlink(path);
 }
 
+/* --- a NUL byte must not silently swallow the rest of the data --------------
+ * Tool results are serialised with cJSON_CreateString, which stops at the
+ * first NUL. read_file returned a 31-byte sds of which the model saw 6, and
+ * edit_file rebuilt the file with strstr/strlen and rewrote those 31 bytes as
+ * 3 -- reporting "OK wrote". Both measured against the real tools, not a
+ * re-implementation. */
+static void test_nul_bytes(void) {
+    TEST_BEGIN("binary content is refused, not silently truncated");
+
+    mkdir_p("/tmp/alpha_t");
+    const char *path = "/tmp/alpha_t/bin.dat";
+    /* 31 bytes: text, two NULs, then a tail that must survive. */
+    const char payload[] = "HEADER\0\0BINARYTAIL_KEEPME_1234\n";
+    const size_t plen = sizeof(payload) - 1;
+
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL, "fixture created");
+    if (!f) return;
+    fwrite(payload, 1, plen, f);
+    fclose(f);
+
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", path);
+    sds r = tools_run("read_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "read_file refuses a binary file");
+    CHECK(strstr(r, "binary") != NULL, "the reason names the cause");
+    /* The point of the refusal is what the MODEL ends up seeing: an sds can
+     * hold NULs, the JSON string it becomes cannot. */
+    cJSON *s = cJSON_CreateString(r);
+    CHECK_EQ_INT((int)strlen(cJSON_GetStringValue(s)), (int)sdslen(r),
+                 "nothing is lost when the result is serialised");
+    cJSON_Delete(s);
+    sdsfree(r);
+
+    struct stat before;
+    stat(path, &before);
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", path);
+    cJSON_AddStringToObject(a, "old_str", "HEADER");
+    cJSON_AddStringToObject(a, "new_str", "HDR");
+    r = tools_run("edit_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "edit_file refuses it too");
+    sdsfree(r);
+
+    struct stat after;
+    stat(path, &after);
+    CHECK_EQ_INT((int)after.st_size, (int)before.st_size,
+                 "the file is NOT rewritten short");
+    /* Size alone would pass if the bytes were shuffled. */
+    f = fopen(path, "rb");
+    char back[64] = { 0 };
+    size_t got = f ? fread(back, 1, sizeof(back), f) : 0;
+    if (f) fclose(f);
+    CHECK_EQ_INT((int)got, (int)plen, "every byte is still there");
+    CHECK(got == plen && memcmp(back, payload, plen) == 0, "byte-for-byte identical");
+
+    /* A command may legitimately emit binary: that is substituted, not
+     * refused, but the tail must still reach the model. */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "command", "printf 'A\\000B_TAIL_VISIBLE\\n'");
+    r = tools_run("execute_bash", a, "/tmp");
+    cJSON_Delete(a);
+    s = cJSON_CreateString(r);
+    const char *seen = cJSON_GetStringValue(s);
+    CHECK(strstr(seen, "B_TAIL_VISIBLE") != NULL,
+          "output after a NUL still reaches the model");
+    CHECK(strstr(seen, "NUL byte") != NULL, "the substitution is disclosed");
+    cJSON_Delete(s);
+    sdsfree(r);
+
+    unlink(path);
+}
+
 /* --- malformed tool input must not crash ---------------------------------- */
 static void test_bad_input(void) {
     TEST_BEGIN("tools_run: malformed arguments are rejected cleanly");
@@ -212,6 +287,7 @@ int main(void) {
     test_timeout_kills_descendants();
     test_timeout_reports();
     test_edit_size_guard();
+    test_nul_bytes();
     test_bad_input();
     test_hang_prone_paths();
     system("rm -rf /tmp/alpha_t");

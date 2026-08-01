@@ -40,6 +40,17 @@ static sds read_file_all(const char *path, size_t max_bytes) {
     return out;
 }
 
+/* A NUL byte anywhere means the text cannot survive the round trip.
+ *
+ * The tool result is handed to cJSON_CreateString, which stops at the first
+ * NUL: read_file returned 31 bytes of which the model saw 6. edit_file was
+ * worse -- it rebuilt the file with strstr/strlen, so everything past the NUL
+ * was dropped and a 31-byte file was rewritten as 3 bytes, reported "OK".
+ * Refuse instead: these are text tools, and shell_run can handle binaries. */
+static int has_nul(const char *p, size_t len) {
+    return memchr(p, 0, len) != NULL;
+}
+
 /* mkdir -p without a shell. Never pass a path through system(): a path like
  * /tmp/x$(touch /tmp/PWNED)y would execute the substitution. */
 static int mkdir_p(const char *dir) {
@@ -605,7 +616,18 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
                 "Copy what you need to a local directory first.\n");
         }
 #endif
-        return shell_run(cmd, cwd);
+        sds out = shell_run(cmd, cwd);
+        /* A command may legitimately emit binary, so this one is not refused --
+         * but the NULs still truncate the result at the first one when it is
+         * serialised, hiding the rest of the output. Substitute them and say
+         * how many, so what follows is still readable. */
+        size_t nuls = 0;
+        for (size_t i = 0; i < sdslen(out); i++)
+            if (out[i] == 0) { out[i] = '.'; nuls++; }
+        if (nuls)
+            out = sdscatprintf(out, "\n[%zu NUL byte%s replaced with '.']",
+                               nuls, nuls == 1 ? "" : "s");
+        return out;
     }
     if (strcmp(name, "read_file") == 0) {
         const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(args, "path"));
@@ -615,7 +637,14 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
             snprintf(full, sizeof(full), "%s", path);
         else
             snprintf(full, sizeof(full), "%s/%s", cwd, path);
-        return read_file_all(full, 250000);
+        sds body = read_file_all(full, 250000);
+        if (has_nul(body, sdslen(body))) {
+            sdsfree(body);
+            return sdscatprintf(sdsempty(),
+                "ERROR: %s is binary (contains NUL bytes) and cannot be read as text. "
+                "Use execute_bash with xxd, strings or file instead.", full);
+        }
+        return body;
     }
     if (strcmp(name, "write_file") == 0) {
         const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(args, "path"));
@@ -654,6 +683,12 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
                 full, (long long)est.st_size, (size_t)ALPHA_EDIT_MAX_BYTES);
         sds body = read_file_all(full, ALPHA_EDIT_MAX_BYTES);
         if (strncmp(body, "ERROR", 5) == 0) return body;
+        if (has_nul(body, sdslen(body))) {
+            sdsfree(body);
+            return sdscatprintf(sdsempty(),
+                "ERROR: %s is binary (contains NUL bytes). Editing it as text "
+                "would discard everything after the first NUL.", full);
+        }
         char *pos = strstr(body, old_s);
         if (!pos) {
             sdsfree(body);
