@@ -249,10 +249,21 @@ static sds cdp_ws_call_id(const char *ws_url, const char *json_msg, int expect_i
     if (send(fd, frame, flen, 0) < 0) { free(frame); close(fd); return sdsnew("ERROR: ws send"); }
     free(frame);
 
+    /* Reassembly, because a CDP reply is not always one frame.
+     *
+     * Two ways this loop used to return corrupt JSON as if it were a result:
+     * a fragmented message (FIN=0 followed by continuation frames) had only its
+     * first fragment returned, and a payload cut short by the recv timeout was
+     * returned truncated. Both parse as garbage downstream -- the caller sees a
+     * half snapshot, not an error. So: join fragments until FIN, and treat a
+     * short read as a failure rather than a result. */
     sds best = NULL;
+    sds msg_buf = NULL;      /* fragments of the message being assembled */
+    const char *fail = NULL;
     for (int attempt = 0; attempt < 12; attempt++) {
         unsigned char rh[2];
         if (recv(fd, rh, 2, MSG_WAITALL) != 2) break;
+        int fin = (rh[0] & 0x80) != 0;
         int opcode = rh[0] & 0x0f;
         int masked = (rh[1] & 0x80) != 0;
         uint64_t rlen = rh[1] & 0x7f;
@@ -267,34 +278,61 @@ static sds cdp_ws_call_id(const char *ws_url, const char *json_msg, int expect_i
         }
         unsigned char rmask[4] = {0};
         if (masked && recv(fd, rmask, 4, MSG_WAITALL) != 4) break;
-        if (rlen > 500000) break;
+        if (rlen > ALPHA_WS_MAX_FRAME) { fail = "ERROR: ws frame too large"; break; }
         char *payload = malloc((size_t)rlen + 1);
-        if (!payload) break;
+        if (!payload) { fail = "ERROR: oom"; break; }
         size_t got = 0;
+        int short_read = 0;
         while (got < rlen) {
             ssize_t n = recv(fd, payload + got, (size_t)rlen - got, 0);
-            if (n <= 0) break;
+            if (n <= 0) { short_read = 1; break; }
             got += (size_t)n;
         }
+        if (short_read) { free(payload); fail = "ERROR: ws message truncated"; break; }
         payload[got] = 0;
         if (masked) for (size_t i = 0; i < got; i++) payload[i] ^= rmask[i % 4];
-        if (opcode == 0x1 || opcode == 0x0) {
-            cJSON *j = cJSON_Parse(payload);
-            if (j) {
-                cJSON *id = cJSON_GetObjectItem(j, "id");
-                int match = (expect_id <= 0) || (cJSON_IsNumber(id) && id->valueint == expect_id);
-                if (match) {
-                    if (best) sdsfree(best);
-                    best = sdsnewlen(payload, got);
-                    cJSON_Delete(j); free(payload); break;
-                }
-                cJSON_Delete(j);
-            }
-            if (!best) best = sdsnewlen(payload, got);
+
+        if (opcode == 0x8) { free(payload); break; }            /* close */
+        if (opcode == 0x9 || opcode == 0xa) { free(payload); continue; }  /* ping/pong */
+        if (opcode != 0x0 && opcode != 0x1 && opcode != 0x2) { free(payload); continue; }
+
+        if (opcode != 0x0) {                                    /* first frame */
+            if (msg_buf) sdsfree(msg_buf);
+            msg_buf = sdsempty();
+        } else if (!msg_buf) {                                  /* stray continuation */
+            free(payload);
+            continue;
         }
+        if (sdslen(msg_buf) + got > ALPHA_WS_MAX_MESSAGE) {
+            free(payload);
+            fail = "ERROR: ws message too large";
+            break;
+        }
+        msg_buf = sdscatlen(msg_buf, payload, got);
         free(payload);
+        if (!fin) continue;                                     /* more to come */
+
+        cJSON *j = cJSON_Parse(msg_buf);
+        if (j) {
+            cJSON *id = cJSON_GetObjectItem(j, "id");
+            int match = (expect_id <= 0) || (cJSON_IsNumber(id) && id->valueint == expect_id);
+            cJSON_Delete(j);
+            if (match) {
+                if (best) sdsfree(best);
+                best = msg_buf; msg_buf = NULL;
+                break;
+            }
+        }
+        /* Not the reply we asked for (an unsolicited CDP event, say): keep the
+         * first one only as a last resort. */
+        if (!best) best = sdsdup(msg_buf);
     }
+    if (msg_buf) sdsfree(msg_buf);
     close(fd);
+    /* A failure wins over a partial or unrelated message: reporting the error
+     * is the whole point, and returning stale data instead would put the caller
+     * back where it was -- acting on something that is not the reply. */
+    if (fail) { if (best) sdsfree(best); return sdsnew(fail); }
     return best ? best : sdsnew("ERROR: ws no response");
 }
 

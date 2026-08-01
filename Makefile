@@ -26,7 +26,8 @@ deps/%.o: deps/%.c
 # silently re-runs a stale binary (observed: a deliberately broken source
 # still reported all checks passing).
 TEST_SRC = tests/test_tools.c tests/test_session.c tests/test_telegram.c tests/test_llm.c \
-           tests/test_provider.c tests/test_portable.c tests/test_config.c
+           tests/test_provider.c tests/test_portable.c tests/test_config.c \
+           tests/test_browser.c
 TEST_BIN = $(TEST_SRC:tests/%.c=tests/bin/%)
 TEST_DEPS = src/browser.o src/provider.o deps/cJSON.o deps/sds.o
 # tests/test_util.h holds the assertion macros: a change there alters what every
@@ -62,6 +63,11 @@ tests/bin/test_portable: tests/test_portable.c src/tools.c $(TEST_DEPS) $(TEST_H
 # while the shipped code was broken).
 tests/bin/test_config: tests/test_config.c src/main.c src/ui.o src/provider.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -DALPHA_NO_MAIN -o $@ $< src/ui.o src/provider.o deps/cJSON.o deps/sds.o $(LDFLAGS)
+
+# Includes browser.c directly to reach the static WebSocket client, so it must
+# not also link src/browser.o.
+tests/bin/test_browser: tests/test_browser.c src/browser.c $(TEST_HDRS) | tests/bin
+	$(CC) $(CFLAGS) -o $@ $< src/provider.o deps/cJSON.o deps/sds.o $(LDFLAGS)
 
 tests/bin:
 	mkdir -p tests/bin

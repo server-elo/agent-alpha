@@ -118,6 +118,16 @@ sds llm_chat(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message, int w
 /* Tool dispatch: name + args JSON object → result text (caller frees with sdsfree). */
 sds tools_run(const char *name, cJSON *args, const char *cwd);
 
+/* Caps on one CDP WebSocket reply. A snapshot of a large page is legitimately
+ * hundreds of KB, and the old single-frame 500 KB limit silently dropped the
+ * reply; these bound memory without rejecting real pages. */
+#ifndef ALPHA_WS_MAX_FRAME
+#define ALPHA_WS_MAX_FRAME   (8u * 1024 * 1024)
+#endif
+#ifndef ALPHA_WS_MAX_MESSAGE
+#define ALPHA_WS_MAX_MESSAGE (16u * 1024 * 1024)
+#endif
+
 /* Pure-C browser tool (CDP, with a macOS open fallback). */
 sds browser_tool_run(cJSON *args);
 
