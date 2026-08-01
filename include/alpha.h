@@ -56,6 +56,10 @@
  * local servers alike (Ollama, llama.cpp, LM Studio, vLLM, ...). A preset is
  * only a convenient way to fill in base_url, the key's env var and a default
  * model -- ALPHA_BASE_URL always wins, so an unlisted endpoint needs no code. */
+/* Used when nothing at all is configured. Named once so the fallback endpoint
+ * and the fallback model cannot drift apart. */
+#define ALPHA_DEFAULT_PROVIDER "ollama"
+
 typedef struct {
     const char *name;
     const char *base_url;

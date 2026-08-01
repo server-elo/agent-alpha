@@ -382,9 +382,35 @@ static sds js_escape(const char *s) {
     return o;
 }
 
-static sds open_macos_chrome(const char *url) {
+/* `open -a App URL` is macOS-only; elsewhere the equivalent is xdg-open, which
+ * takes no app argument and picks the desktop's default handler. Returning the
+ * argv here keeps the fork/exec below identical on both. */
+static int opener_argv(const char *app, const char *url, const char *argv[5]) {
+#if defined(__APPLE__) && !defined(ALPHA_FORCE_XDG_OPEN)
+    argv[0] = "/usr/bin/open"; argv[1] = "open"; argv[2] = "-a";
+    argv[3] = app; argv[4] = url;
+    return 5;
+#else
+    (void)app;
+    static const char *candidates[] = { "/usr/bin/xdg-open", "/bin/xdg-open" };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (access(candidates[i], X_OK) != 0) continue;
+        argv[0] = candidates[i]; argv[1] = "xdg-open"; argv[2] = url;
+        return 3;
+    }
+    return 0;
+#endif
+}
+
+static sds open_in_browser_app(const char *url) {
     if (!url || !url[0]) return sdsnew("ERROR: url required");
     const char *app = browser_app();
+
+    const char *av[5] = { 0 };
+    int an = opener_argv(app, url, av);
+    if (an == 0)
+        return sdsnew("ERROR: no xdg-open on this system; set ALPHA_CDP_URL and "
+                      "drive the browser over CDP instead.");
 
     /* exec `open` directly: no shell, no temp script, so the app name and URL
      * can never be interpreted as shell syntax. Own process group + real kill
@@ -402,7 +428,8 @@ static sds open_macos_chrome(const char *url) {
         close(ofd);
         int devnull = open("/dev/null", O_RDONLY);
         if (devnull >= 0) { dup2(devnull, STDIN_FILENO); close(devnull); }
-        execl("/usr/bin/open", "open", "-a", app, url, (char *)NULL);
+        if (an == 3) execl(av[0], av[1], av[2], (char *)NULL);
+        else         execl(av[0], av[1], av[2], av[3], av[4], (char *)NULL);
         _exit(127);
     }
     if (pid < 0) {
@@ -431,8 +458,8 @@ reaped:
     unlink(outf);
     int ec = (!timed_out && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
     sds res = sdscatprintf(sdsempty(),
-                           "ACTION=open_macos\nAPP=%s\nURL=%s\n__OPEN_EXIT:%d%s\nPROOF:\n%s\n",
-                           app, url, ec,
+                           "ACTION=open_app\nAPP=%s\nURL=%s\n__OPEN_EXIT:%d%s\nPROOF:\n%s\n",
+                           an == 3 ? "(system default)" : app, url, ec,
                            timed_out ? " (TIMEOUT after 15s — process group killed)" : "",
                            out && out[0] ? out : "(no output)");
     sdsfree(out);
@@ -481,7 +508,7 @@ static sds cdp_goto_one_tab(const char *url, int force_new) {
             mode, cdp_base(), id ? id : "?", url);
         cJSON_Delete(tab);
         if (want_visible_open()) {
-            sds vis = open_macos_chrome(url);
+            sds vis = open_in_browser_app(url);
             res = sdscat(res, "\n"); res = sdscat(res, vis); sdsfree(vis);
         }
         return res;
@@ -503,7 +530,7 @@ static sds cdp_goto_one_tab(const char *url, int force_new) {
     if (now) cJSON_Delete(now);
     cJSON_Delete(tab);
     if (want_visible_open()) {
-        sds vis = open_macos_chrome(url);
+        sds vis = open_in_browser_app(url);
         res = sdscat(res, "\n"); res = sdscat(res, vis); sdsfree(vis);
     }
     return res;
@@ -844,20 +871,20 @@ static sds browser_tool_run_locked(cJSON *args) {
         if (!url || !url[0]) return sdsnew("ERROR: url required for open/navigate");
         char urlbuf[PATH_MAX]; url = normalize_url(url, urlbuf, sizeof(urlbuf));
         if (cdp_alive()) return cdp_goto_one_tab(url, 0);
-        return open_macos_chrome(url);
+        return open_in_browser_app(url);
     }
     if (strcmp(action, "new_tab") == 0) {
         if (!url || !url[0]) return sdsnew("ERROR: url required for new_tab");
         char urlbuf[PATH_MAX]; url = normalize_url(url, urlbuf, sizeof(urlbuf));
         if (cdp_alive()) return cdp_goto_one_tab(url, 1);
-        return open_macos_chrome(url);
+        return open_in_browser_app(url);
     }
     if (strcmp(action, "open_visible") == 0 || strcmp(action, "open_user") == 0) {
         if (!url || !url[0]) return sdsnew("ERROR: url required");
         char urlbuf[PATH_MAX]; url = normalize_url(url, urlbuf, sizeof(urlbuf));
         sds out = sdsempty();
         if (cdp_alive()) { sds nav = cdp_goto_one_tab(url, 0); out = sdscat(out, nav); sdsfree(nav); out = sdscat(out, "\n"); }
-        sds vis = open_macos_chrome(url); out = sdscat(out, vis); sdsfree(vis);
+        sds vis = open_in_browser_app(url); out = sdscat(out, vis); sdsfree(vis);
         return out;
     }
     if (strcmp(action, "reset_sticky") == 0) {

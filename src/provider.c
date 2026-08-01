@@ -12,10 +12,16 @@ volatile sig_atomic_t alpha_cancel = 0;
  *
  * `local` marks servers that run on this machine. They are the reason
  * api_key must stay optional: llama.cpp and Ollama reject nothing, and
- * demanding a key would make the offline path impossible. */
+ * demanding a key would make the offline path impossible.
+ *
+ * The local default must be a model that emits real tool_calls. Ollama lists
+ * qwen2.5-coder:7b as tools-capable, but it in fact returns the call as JSON
+ * text in `content` with tool_calls null (measured), so an agent driving it
+ * never runs anything and prints the JSON at the user. qwen3:8b returns
+ * proper tool_calls on the same request. */
 static const alpha_provider_t PROVIDERS[] = {
     /* name         base_url                                  key_env             default_model              local */
-    { "ollama",     "http://localhost:11434/v1",              NULL,               "qwen2.5-coder:7b",        1 },
+    { "ollama",     "http://localhost:11434/v1",              NULL,               "qwen3:8b",                1 },
     { "llamacpp",   "http://localhost:8080/v1",               NULL,               "local",                   1 },
     { "lmstudio",   "http://localhost:1234/v1",               NULL,               "local-model",             1 },
     { "vllm",       "http://localhost:8000/v1",               NULL,               "local",                   1 },

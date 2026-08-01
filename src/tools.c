@@ -3,9 +3,20 @@
 #include <sys/types.h>
 #include <signal.h>
 #include <stdint.h>
+
+/* Descendant tracking needs the kernel process table, and there is no portable
+ * way to read it. macOS has no /proc, so it goes through sysctl + libproc;
+ * Linux has no libproc, so it reads /proc. ALPHA_FORCE_PT_PROC selects the
+ * /proc implementation on any host, which is how the Linux branch is compiled
+ * and exercised from a macOS build. */
+#if defined(__APPLE__) && !defined(ALPHA_FORCE_PT_PROC)
+#define ALPHA_PT_DARWIN 1
 #include <sys/sysctl.h>
 #include <libproc.h>
 #include <sys/proc_info.h>
+#else
+#define ALPHA_PT_PROC 1
+#endif
 
 /* NO security: any path, any shell. User asked open coding shell. */
 
@@ -95,6 +106,8 @@ static void pt_add(proctrack_t *t, pid_t p) {
     t->seen[p >> 5] |= 1u << (p & 31);
     t->pids[t->n++] = p;
 }
+
+#ifdef ALPHA_PT_DARWIN
 
 /* Scratch buffer reused across samples: the old code malloc'd and freed a full
  * ~430 KB process-table snapshot on every pass (~2 GB/s of churn). */
@@ -196,8 +209,134 @@ static void pt_sample_fd(proctrack_t *t, uint64_t ino, pid_t self) {
     free(procs);
 }
 
+#else  /* ALPHA_PT_PROC — Linux and anything else with a /proc filesystem */
+
+/* Same two questions as the Darwin code, asked of /proc instead of sysctl:
+ * which live pids belong to our tree, and which hold this command's output
+ * file open. The answers come from /proc/<pid>/stat (ppid and pgid) and from
+ * /proc/<pid>/fd (symlinks the kernel resolves for us), so no equivalent of
+ * libproc is needed and no scratch buffer is worth keeping.
+ *
+ * The root is overridable so the suite can build a synthetic /proc and run
+ * this code on a host that has none -- otherwise the Linux path could only
+ * ever be compile-checked. */
+#ifndef ALPHA_PROC_ROOT
+#define ALPHA_PROC_ROOT "/proc"
+#endif
+
+static int proc_stat_ids(pid_t pid, pid_t *out_ppid, pid_t *out_pgid) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), ALPHA_PROC_ROOT "/%d/stat", (int)pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) return 0;
+    buf[n] = 0;
+    /* comm is field 2 and may contain spaces and ')', so scan from the LAST
+     * ')' rather than tokenising from the start. A process named "a) b" would
+     * otherwise shift every field and yield a wrong ppid. */
+    char *p = strrchr(buf, ')');
+    if (!p || !p[1]) return 0;
+    p++;                                    /* now at " S ppid pgid ..." */
+    int ppid = 0, pgid = 0;
+    char state = 0;
+    if (sscanf(p, " %c %d %d", &state, &ppid, &pgid) != 3) return 0;
+    if (out_ppid) *out_ppid = (pid_t)ppid;
+    if (out_pgid) *out_pgid = (pid_t)pgid;
+    return 1;
+}
+
+/* Snapshot of live pids, so the multi-pass walk below does not re-read /proc
+ * four times. */
+typedef struct {
+    pid_t *pids;
+    int n;
+} pt_scan_t;
+
+static pt_scan_t pt_scan_pids(void) {
+    pt_scan_t s = { .pids = NULL, .n = 0 };
+    DIR *d = opendir(ALPHA_PROC_ROOT);
+    if (!d) return s;
+    int cap = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] < '1' || de->d_name[0] > '9') continue;
+        char *end = NULL;
+        long v = strtol(de->d_name, &end, 10);
+        if (!end || *end || v <= 1) continue;
+        if (s.n == cap) {
+            int want = cap ? cap * 2 : 256;
+            pid_t *nb = realloc(s.pids, (size_t)want * sizeof(pid_t));
+            if (!nb) break;
+            s.pids = nb;
+            cap = want;
+        }
+        s.pids[s.n++] = (pid_t)v;
+    }
+    closedir(d);
+    return s;
+}
+
+static void pt_sample(proctrack_t *t, pid_t root) {
+    pt_scan_t s = pt_scan_pids();
+    for (int pass = 0; pass < 4; pass++) {
+        int before = t->n;
+        for (int i = 0; i < s.n; i++) {
+            pid_t pid = s.pids[i], ppid = 0, pgid = 0;
+            if (!proc_stat_ids(pid, &ppid, &pgid)) continue;
+            if (pgid == root || pid == root || pt_has(t, ppid) || pt_has(t, pgid))
+                pt_add(t, pid);
+        }
+        if (t->n == before) break;
+    }
+    free(s.pids);
+}
+
+static void pt_sample_fd(proctrack_t *t, uint64_t ino, pid_t self) {
+    pt_scan_t s = pt_scan_pids();
+    for (int i = 0; i < s.n; i++) {
+        pid_t pid = s.pids[i];
+        if (pid == self || pt_has(t, pid)) continue;
+        char dir[PATH_MAX];
+        snprintf(dir, sizeof(dir), ALPHA_PROC_ROOT "/%d/fd", (int)pid);
+        DIR *d = opendir(dir);
+        if (!d) continue;                   /* gone, or not ours to inspect */
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            char link[PATH_MAX];
+            snprintf(link, sizeof(link), "%s/%s", dir, de->d_name);
+            struct stat st;
+            /* stat() follows the symlink to the file itself, which is exactly
+             * the inode comparison the Darwin path makes. */
+            if (stat(link, &st) != 0) continue;
+            if (!S_ISREG(st.st_mode)) continue;
+            if ((uint64_t)st.st_ino == ino) { pt_add(t, pid); break; }
+        }
+        closedir(d);
+    }
+    free(s.pids);
+}
+
+#endif /* ALPHA_PT_DARWIN */
+
 static void pt_kill_all(proctrack_t *t) {
     for (int i = 0; i < t->n; i++) kill(t->pids[i], SIGKILL);
+}
+
+/* /bin/zsh is the macOS default but is frequently absent on Linux, where
+ * exec'ing it left every command failing with 127. Take ALPHA_SHELL if set,
+ * else the first shell that actually exists. /bin/sh is guaranteed by POSIX,
+ * so the list cannot come up empty. */
+static const char *shell_path(void) {
+    const char *env = getenv("ALPHA_SHELL");
+    if (env && env[0] && access(env, X_OK) == 0) return env;
+    static const char *candidates[] = { "/bin/zsh", "/bin/bash", "/bin/sh" };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++)
+        if (access(candidates[i], X_OK) == 0) return candidates[i];
+    return "/bin/sh";
 }
 
 static sds shell_run(const char *cmd, const char *cwd) {
@@ -214,7 +353,8 @@ static sds shell_run(const char *cmd, const char *cwd) {
         unlink(script);
         return sdsnew("ERROR write script");
     }
-    fprintf(sf, "#!/bin/zsh\nset +e\n");
+    const char *sh = shell_path();
+    fprintf(sf, "#!%s\nset +e\n", sh);
     if (cwd && cwd[0]) {
         fprintf(sf, "cd ");
         /* single-quote cwd */
@@ -257,7 +397,7 @@ static sds shell_run(const char *cmd, const char *cwd) {
         close(ofd);
         int devnull = open("/dev/null", O_RDONLY);
         if (devnull >= 0) { dup2(devnull, STDIN_FILENO); close(devnull); }
-        execl("/bin/zsh", "zsh", script, (char *)NULL);
+        execl(sh, sh, script, (char *)NULL);
         _exit(127);
     }
     if (pid < 0) {
@@ -314,8 +454,14 @@ static sds shell_run(const char *cmd, const char *cwd) {
     return out;
 }
 
-/* macOS Desktop/iCloud File Provider often hangs opendir forever — refuse early. */
+/* macOS Desktop/iCloud File Provider often hangs opendir forever — refuse early.
+ * Elsewhere ~/Desktop is an ordinary directory and refusing it would be a bug,
+ * so this is a macOS-only guard. */
 static int path_is_hang_prone(const char *path) {
+#ifndef ALPHA_PT_DARWIN
+    (void)path;
+    return 0;
+#else
     if (!path || !path[0]) return 0;
     if (strstr(path, "/Desktop") || strstr(path, "/Desktop/") ||
         strcmp(path, "Desktop") == 0 || strncmp(path, "Desktop/", 8) == 0 ||
@@ -323,6 +469,7 @@ static int path_is_hang_prone(const char *path) {
         strstr(path, "com~apple~CloudDocs"))
         return 1;
     return 0;
+#endif
 }
 
 static sds list_dir_sync(const char *p) {
@@ -448,7 +595,8 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
     if (strcmp(name, "execute_bash") == 0 || strcmp(name, "bash") == 0) {
         const char *cmd = cJSON_GetStringValue(cJSON_GetObjectItem(args, "command"));
         if (!cmd) cmd = cJSON_GetStringValue(cJSON_GetObjectItem(args, "cmd"));
-        /* block known hang paths before 60s shell wait */
+        /* block known hang paths before 60s shell wait (macOS only) */
+#ifdef ALPHA_PT_DARWIN
         if (cmd && (strstr(cmd, "/Desktop") || strstr(cmd, " ~/Desktop") ||
                     strstr(cmd, "Desktop/") || strstr(cmd, "ls Desktop"))) {
             return sdsnew(
@@ -456,6 +604,7 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
                 "Provider and can block indefinitely.\n"
                 "Copy what you need to a local directory first.\n");
         }
+#endif
         return shell_run(cmd, cwd);
     }
     if (strcmp(name, "read_file") == 0) {

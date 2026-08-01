@@ -26,7 +26,7 @@ deps/%.o: deps/%.c
 # silently re-runs a stale binary (observed: a deliberately broken source
 # still reported all checks passing).
 TEST_SRC = tests/test_tools.c tests/test_session.c tests/test_telegram.c tests/test_llm.c \
-           tests/test_provider.c
+           tests/test_provider.c tests/test_portable.c tests/test_config.c
 TEST_BIN = $(TEST_SRC:tests/%.c=tests/bin/%)
 TEST_DEPS = src/browser.o src/provider.o deps/cJSON.o deps/sds.o
 # tests/test_util.h holds the assertion macros: a change there alters what every
@@ -51,6 +51,17 @@ tests/bin/test_llm: tests/test_llm.c src/llm.c src/tools.o $(TEST_DEPS) $(TEST_H
 # Includes provider.c and ui.c directly, so it must not also link them.
 tests/bin/test_provider: tests/test_provider.c src/provider.c src/ui.c src/ui.h $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< deps/cJSON.o deps/sds.o $(LDFLAGS)
+
+# Compiles the /proc branch of tools.c on any host and runs it against a
+# synthetic /proc, so the Linux path is exercised rather than merely parsed.
+tests/bin/test_portable: tests/test_portable.c src/tools.c $(TEST_DEPS) $(TEST_HDRS) | tests/bin
+	$(CC) $(CFLAGS) -o $@ $< $(TEST_DEPS) $(LDFLAGS)
+
+# main.c has a main(); ALPHA_NO_MAIN suppresses it so the config helpers can be
+# reached directly instead of being retyped into the test (a copy would pass
+# while the shipped code was broken).
+tests/bin/test_config: tests/test_config.c src/main.c src/ui.o src/provider.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
+	$(CC) $(CFLAGS) -DALPHA_NO_MAIN -o $@ $< src/ui.o src/provider.o deps/cJSON.o deps/sds.o $(LDFLAGS)
 
 tests/bin:
 	mkdir -p tests/bin

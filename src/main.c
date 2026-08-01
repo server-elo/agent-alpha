@@ -56,9 +56,9 @@ static void list_providers(void) {
            ui_c(UI_DIM), ui_c(UI_RESET));
 }
 
-static void load_dotenv(const char *path) {
+static int load_dotenv(const char *path) {
     FILE *f = fopen(path, "r");
-    if (!f) return;
+    if (!f) return 0;
     char line[4096];
     while (fgets(line, sizeof(line), f)) {
         char *p = line;
@@ -71,8 +71,16 @@ static void load_dotenv(const char *path) {
         char *val = eq + 1;
         char *ke = key + strlen(key);
         while (ke > key && (ke[-1] == ' ' || ke[-1] == '\t')) *--ke = 0;
+        /* The key was trimmed but the value was not, so "ALPHA_MODEL = gpt-4o"
+         * yielded a model named " gpt-4o" and the request failed with an
+         * unhelpful "unknown model". Trim before quote handling, so a quoted
+         * value can still contain deliberate spaces. */
+        while (*val == ' ' || *val == '\t') val++;
         size_t n = strlen(val);
+        /* Newline first: with the trailing-space trim ahead of it, "V = x \n"
+         * stopped at the \n and kept the space. */
         while (n && (val[n - 1] == '\n' || val[n - 1] == '\r')) val[--n] = 0;
+        while (n && (val[n - 1] == ' ' || val[n - 1] == '\t')) val[--n] = 0;
         if (n >= 2 && ((val[0] == '"' && val[n - 1] == '"') ||
                        (val[0] == '\'' && val[n - 1] == '\''))) {
             val[n - 1] = 0;
@@ -81,6 +89,32 @@ static void load_dotenv(const char *path) {
         if (!getenv(key)) setenv(key, val, 0);
     }
     fclose(f);
+    return 1;
+}
+
+/* Configuration is read from ~/.alpha/env, not from the working directory.
+ *
+ * A .env in the cwd was loaded unconditionally, and this agent's whole purpose
+ * is being run inside a repository you have just cloned. That repository's own
+ * .env could therefore point ALPHA_BASE_URL at any host while your real
+ * OPENAI_API_KEY was still picked up from the environment and sent there --
+ * key exfiltration from an untrusted checkout, with no prompt.
+ *
+ * A project-local file is still useful, so it is honoured when ALPHA_ENV_FILE
+ * names it explicitly. That is an opt-in the repository cannot perform on your
+ * behalf. */
+static void load_config_env(void) {
+    const char *explicit_path = getenv("ALPHA_ENV_FILE");
+    if (explicit_path && explicit_path[0]) {
+        if (!load_dotenv(explicit_path))
+            fprintf(stderr, "warning: ALPHA_ENV_FILE=%s could not be read\n", explicit_path);
+        return;
+    }
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return;
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/.alpha/env", home);
+    load_dotenv(path);
 }
 
 /* --- live rendering -------------------------------------------------------- */
@@ -183,8 +217,14 @@ static void resolve_provider(alpha_cfg_t *cfg, const char *pname,
     /* An explicit URL still gets the matching preset's key var and default
      * model, so `--url http://localhost:11434/v1` alone is enough for Ollama. */
     if (!p && url && url[0]) p = alpha_provider_by_url(url);
+    /* With nothing configured at all, fall back to the default preset rather
+     * than to loose literals. Those literals had drifted apart: the URL said
+     * Ollama while the model said "local", so a first run with no arguments
+     * asked Ollama for a model named "local" and died with HTTP 404 -- the
+     * exact path the README advertises as working out of the box. */
+    if (!p && (!url || !url[0])) p = alpha_provider_by_name(ALPHA_DEFAULT_PROVIDER);
 
-    cfg->base_url = (url && url[0]) ? url : (p ? p->base_url : "http://localhost:11434/v1");
+    cfg->base_url = (url && url[0]) ? url : p->base_url;
     cfg->model = (model && model[0]) ? model : (p ? p->default_model : "local");
 
     if (key && key[0]) {
@@ -197,10 +237,16 @@ static void resolve_provider(alpha_cfg_t *cfg, const char *pname,
     }
 }
 
+#ifdef ALPHA_NO_MAIN
+/* tests/test_config.c includes this file to reach the static config helpers,
+ * and cannot have two main()s. Testing a retyped copy of load_config_env would
+ * prove nothing about the binary that ships. */
+int alpha_main_disabled(void);
+int alpha_main_disabled(void) { return 0; }
+#else
 int main(int argc, char **argv) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
-    load_dotenv(".env");
-    load_dotenv(".env.local");
+    load_config_env();
 
     const char *pname = getenv("ALPHA_PROVIDER");
     const char *url   = getenv("ALPHA_BASE_URL");
@@ -226,7 +272,16 @@ int main(int argc, char **argv) {
         else if ((!strcmp(a, "-p") || !strcmp(a, "--provider")) && has_next) pname = argv[++i];
         else if ((!strcmp(a, "-m") || !strcmp(a, "--model")) && has_next) model = argv[++i];
         else if ((!strcmp(a, "-u") || !strcmp(a, "--url")) && has_next) url = argv[++i];
-        else if ((!strcmp(a, "-k") || !strcmp(a, "--key")) && has_next) key = argv[++i];
+        else if ((!strcmp(a, "-k") || !strcmp(a, "--key")) && has_next) {
+            /* argv is world-readable through ps(1) on both macOS and Linux, so
+             * a key passed on the command line is visible to every other user
+             * on the machine for as long as the agent runs. Copy it out and
+             * overwrite the original in place -- ps reads the live process
+             * memory, so this actually removes it (verified). The length still
+             * leaks; the env var remains the right way to pass a key. */
+            key = strdup(argv[++i]);            /* freed by process exit */
+            memset(argv[i], 'x', strlen(argv[i]));
+        }
         else if ((!strcmp(a, "-C") || !strcmp(a, "--cwd")) && has_next) cwd = argv[++i];
         else if (!strcmp(a, "--turns") && has_next) max_turns = atoi(argv[++i]);
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
@@ -423,3 +478,4 @@ int main(int argc, char **argv) {
     curl_global_cleanup();
     return 0;
 }
+#endif /* ALPHA_NO_MAIN */
