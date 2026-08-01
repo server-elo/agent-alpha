@@ -74,12 +74,18 @@ tests/bin:
 # reporting all checks passing. A suite that certifies every other fix must not
 # be able to lie about which code it ran, so the binaries are always discarded
 # first. Costs ~2s.
+# The agent binary is discarded too, not just the test binaries: test_config
+# execs ./alpha to check argument parsing and the argv scrub against the real
+# program, so a stale ./alpha means those checks certify code that is no longer
+# in the tree. Measured -- a sabotage of --provider precedence reported all
+# checks passing until ./alpha was rebuilt.
 test:
 	@rm -rf tests/bin
+	@rm -f $(TARGET) $(OBJ)
 	@$(MAKE) --no-print-directory run-tests
 
 .PHONY: run-tests
-run-tests: $(TEST_BIN)
+run-tests: $(TARGET) $(TEST_BIN)
 	@fail=0; for t in $(TEST_BIN); do \
 		echo "=== $$t ==="; ./$$t || fail=1; \
 	done; \

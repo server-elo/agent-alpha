@@ -254,6 +254,7 @@ int main(int argc, char **argv) {
     const char *key   = getenv("ALPHA_API_KEY");
     const char *cwd   = getenv("ALPHA_CWD");
     int telegram = 0, quiet = 0, stream = 1, providers = 0;
+    int url_from_flag = 0, model_from_flag = 0;
     int max_turns = 0;
     const char *goal = NULL;
 
@@ -269,9 +270,25 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--providers")) providers = 1;
         else if (!strcmp(a, "--no-stream")) stream = 0;
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) quiet = 1;
-        else if ((!strcmp(a, "-p") || !strcmp(a, "--provider")) && has_next) pname = argv[++i];
-        else if ((!strcmp(a, "-m") || !strcmp(a, "--model")) && has_next) model = argv[++i];
-        else if ((!strcmp(a, "-u") || !strcmp(a, "--url")) && has_next) url = argv[++i];
+        else if ((!strcmp(a, "-p") || !strcmp(a, "--provider")) && has_next) {
+            pname = argv[++i];
+            /* An explicit --provider selects a whole endpoint. Leaving the
+             * environment's ALPHA_BASE_URL/ALPHA_MODEL in place silently sent
+             * the request somewhere else while the banner still named the
+             * preset: `--provider ollama` with ALPHA_BASE_URL exported went to
+             * the remote host. A flag must beat the environment; --url and
+             * --model below are flags too, so they still win. */
+            if (!url_from_flag) url = NULL;
+            if (!model_from_flag) model = NULL;
+        }
+        else if ((!strcmp(a, "-m") || !strcmp(a, "--model")) && has_next) {
+            model = argv[++i];
+            model_from_flag = 1;
+        }
+        else if ((!strcmp(a, "-u") || !strcmp(a, "--url")) && has_next) {
+            url = argv[++i];
+            url_from_flag = 1;
+        }
         else if ((!strcmp(a, "-k") || !strcmp(a, "--key")) && has_next) {
             /* argv is world-readable through ps(1) on both macOS and Linux, so
              * a key passed on the command line is visible to every other user

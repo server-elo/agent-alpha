@@ -280,6 +280,59 @@ static void test_default_config_is_coherent(void) {
     CHECK(c3.model != NULL && c3.model[0] != 0, "an unlisted endpoint still gets some model");
 }
 
+/* --- an explicit --provider must beat an exported endpoint -----------------
+ * ALPHA_BASE_URL was read into the same variable the flag writes, so
+ * `--provider ollama` with ALPHA_BASE_URL exported printed the preset in the
+ * banner while sending the request to the exported host. Observed live: a run
+ * meant to be local opened a connection to a remote address.
+ *
+ * Checked against the real binary: the bug is in argument parsing, so only
+ * running ./alpha proves the order. */
+static sds run_banner(const char *envline, const char *a1, const char *a2,
+                      const char *a3, const char *a4) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "printf '\\n' | env ALPHA_ENV_FILE=/dev/null %s ./alpha %s %s %s %s 2>&1",
+             envline, a1 ? a1 : "", a2 ? a2 : "", a3 ? a3 : "", a4 ? a4 : "");
+    FILE *p = popen(cmd, "r");
+    sds out = sdsempty();
+    if (!p) return out;
+    char buf[512];
+    while (fgets(buf, sizeof(buf), p)) out = sdscat(out, buf);
+    pclose(p);
+    return out;
+}
+
+static void test_provider_flag_beats_environment(void) {
+    TEST_BEGIN("--provider overrides an exported endpoint, but not a flag");
+    env_reset();
+    if (access("./alpha", X_OK) != 0) { CHECK(0, "binary present"); return; }
+
+    sds b = run_banner("ALPHA_BASE_URL=http://evil.invalid/v1 ALPHA_MODEL=sneaky",
+                       "--provider", "ollama", NULL, NULL);
+    CHECK(strstr(b, "evil.invalid") == NULL, "the exported endpoint is not used");
+    CHECK(strstr(b, "sneaky") == NULL, "nor the exported model");
+    CHECK(strstr(b, "localhost:11434") != NULL, "the preset's endpoint is used");
+    sdsfree(b);
+
+    /* --model is a flag and must still win over the preset's default. */
+    b = run_banner("ALPHA_BASE_URL=http://evil.invalid/v1",
+                   "--provider", "ollama", "--model", "mymodel");
+    CHECK(strstr(b, "mymodel") != NULL, "an explicit --model still wins");
+    CHECK(strstr(b, "localhost:11434") != NULL, "endpoint still comes from the preset");
+    sdsfree(b);
+
+    /* Order must not matter: --url before --provider still wins. */
+    b = run_banner("", "--url", "http://myhost:9999/v1", "--provider", "ollama");
+    CHECK(strstr(b, "myhost:9999") != NULL, "--url wins even when it precedes --provider");
+    sdsfree(b);
+
+    /* Without a --provider flag the environment is still authoritative. */
+    b = run_banner("ALPHA_BASE_URL=http://envhost/v1", NULL, NULL, NULL, NULL);
+    CHECK(strstr(b, "envhost") != NULL, "with no flag, the environment still applies");
+    sdsfree(b);
+}
+
 int main(void) {
     test_cwd_dotenv_is_ignored();
     test_home_config_is_loaded();
@@ -288,6 +341,7 @@ int main(void) {
     test_dotenv_parsing();
     test_default_config_is_coherent();
     test_argv_key_is_scrubbed();
+    test_provider_flag_beats_environment();
     system("rm -rf " SANDBOX);
     return test_report("config");
 }
