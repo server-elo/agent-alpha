@@ -80,6 +80,9 @@ static void tg_send(const char *token, long long chat_id, const char *text) {
                 esc = sdscatlen(esc, &c, 1);
             } else if (c == '\n') esc = sdscat(esc, "\\n");
             else if (c == '\r') esc = sdscat(esc, "\\r");
+            /* Tab is a control char but carries meaning: dropping it turns a
+             * Makefile into "missing separator" and flattens indented code. */
+            else if (c == '\t') esc = sdscat(esc, "\\t");
             else if ((unsigned char)c < 0x20) continue;
             else esc = sdscatlen(esc, &c, 1);
         }

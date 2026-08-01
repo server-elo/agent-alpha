@@ -333,7 +333,46 @@ static void test_provider_flag_beats_environment(void) {
     sdsfree(b);
 }
 
+/* --- one paste is one request ---------------------------------------------
+ * The REPL read with fgets() into char[8192], so a longer paste was cut at
+ * 8191 bytes and the remainder was read as the NEXT prompt: half a stack trace
+ * was answered, then the tail fired as a second request, with no notice.
+ *
+ * Observable without a model: point the endpoint at a closed port so each
+ * prompt the REPL accepts produces exactly one transport error. Counting the
+ * errors counts the requests. */
+static void test_long_paste_is_one_request(void) {
+    TEST_BEGIN("repl: a paste longer than the old buffer is a single request");
+    env_reset();
+    if (access("./alpha", X_OK) != 0) { CHECK(0, "binary present"); return; }
+
+    char paste[PATH_MAX];
+    snprintf(paste, sizeof(paste), SANDBOX "/paste.txt");
+    FILE *f = fopen(paste, "w");
+    if (!f) { CHECK(0, "fixture"); return; }
+    for (int i = 0; i < 9000; i++) fputc('x', f);   /* > 8191, no newline until */
+    fputc('\n', f);
+    fclose(f);
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "env ALPHA_ENV_FILE=/dev/null ./alpha --url http://127.0.0.1:9/v1 "
+             "--model m < '%s' 2>&1", paste);
+    FILE *p = popen(cmd, "r");
+    if (!p) { CHECK(0, "popen"); return; }
+    sds out = sdsempty();
+    char buf[512];
+    while (fgets(buf, sizeof(buf), p)) out = sdscat(out, buf);
+    pclose(p);
+
+    int errors = 0;
+    for (const char *q = out; (q = strstr(q, "ERROR")); q++) errors++;
+    CHECK_EQ_INT(errors, 1, "the paste produced exactly one request");
+    sdsfree(out);
+}
+
 int main(void) {
+    test_long_paste_is_one_request();
     test_cwd_dotenv_is_ignored();
     test_home_config_is_loaded();
     test_explicit_env_file();

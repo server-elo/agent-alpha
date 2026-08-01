@@ -74,6 +74,40 @@ static void test_utf8_chunking(void) {
     check_split("mixed german + em-dash text splits", "Gr\xc3\xbc\xc3\x9f" "e \xe2\x80\x94 ");
 }
 
+/* --- control characters that carry meaning must survive -------------------
+ * Every byte below 0x20 except \n and \r was dropped, so a tab vanished from
+ * the wire. A Makefile arrived as "missing separator" and indented code lost
+ * its structure, with no error anywhere to explain it. */
+static const char *body_text(const char *body) {
+    const char *p = strstr(body, "\"text\":\"");
+    return p ? p + 8 : NULL;
+}
+
+static void test_tab_is_preserved(void) {
+    TEST_BEGIN("tg_send: tabs are escaped, not silently dropped");
+    for (int i = 0; i < sent_count; i++) free(sent_bodies[i]);
+    sent_count = 0;
+
+    tg_send("test-token", 1, "all:\n\tgcc -o x x.c\n");
+    CHECK_EQ_INT(sent_count, 1, "one message sent");
+    if (sent_count != 1) return;
+
+    const char *t = body_text(sent_bodies[0]);
+    CHECK(t != NULL, "body has a text field");
+    if (!t) return;
+    CHECK(strstr(t, "\\t") != NULL, "the tab is transmitted as \\t");
+    CHECK(strstr(t, "\\n\\tgcc") != NULL, "it stays attached to the recipe line");
+    /* A raw tab byte would make the JSON invalid, so it must be the escape. */
+    CHECK(strchr(t, '\t') == NULL, "no raw tab byte in the JSON string");
+
+    /* The genuinely unprintable ones are still removed. */
+    for (int i = 0; i < sent_count; i++) free(sent_bodies[i]);
+    sent_count = 0;
+    tg_send("test-token", 1, "a\x01\x02\x1f" "b");
+    const char *u = sent_count ? body_text(sent_bodies[0]) : NULL;
+    CHECK(u != NULL && strstr(u, "ab") != NULL, "other control bytes are still stripped");
+}
+
 /* --- the reserved lane must not be taken by long jobs ---------------------
  * Classifying by message length routed "Go" -- which can start an hour-long
  * build -- into the lane meant to keep the bot responsive. */
@@ -633,6 +667,7 @@ int main(int argc, char **argv) {
     setenv("ALPHA_ROOT", sandbox, 1);
 
     test_utf8_chunking();
+    test_tab_is_preserved();
     test_fast_lane_routing();
     test_chat_cwd_thread_safety();
     test_queue_semantics();

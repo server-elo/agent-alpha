@@ -405,11 +405,15 @@ int main(int argc, char **argv) {
     printf("\n%s/help for commands · Ctrl-C interrupts · Ctrl-D exits%s\n\n",
            ui_c(UI_DIM), ui_c(UI_RESET));
 
-    char line[8192];
+    /* getline, not a fixed buffer: fgets() into char[8192] split a longer
+     * paste at 8191 bytes and ran the remainder as the next prompt, so half a
+     * stack trace was answered and the tail fired as a second request. */
+    char *line = NULL;
+    size_t linecap = 0;
     for (;;) {
         printf("%s%s\u203a%s ", ui_c(UI_BOLD), ui_c(UI_CYAN), ui_c(UI_RESET));
         fflush(stdout);
-        if (!fgets(line, sizeof(line), stdin)) {
+        if (getline(&line, &linecap, stdin) < 0) {
             /* fgets also returns NULL when a signal interrupted it; that is not
              * end of input, and treating it as such quit the session on Ctrl-C. */
             if (ferror(stdin) && errno == EINTR) {
@@ -491,6 +495,7 @@ int main(int argc, char **argv) {
         sdsfree(ans);
     }
 
+    free(line);
     ui_spin_shutdown();
     curl_global_cleanup();
     return 0;
