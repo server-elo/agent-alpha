@@ -7,7 +7,7 @@ or fully local.
 ```
 $ alpha
 Agent Alpha
-  model      qwen2.5-coder:7b
+  model      qwen3:8b
   endpoint   http://localhost:11434/v1
   cwd        /home/you/project
 
@@ -22,6 +22,9 @@ src/parser.c:212 passes a `size_t` where the callback expects `int`…
 ## Build
 
 Needs a C compiler and libcurl. No other dependencies.
+
+macOS and Linux. Process cleanup uses the kernel process table on macOS and
+`/proc` on Linux; the shell is whichever of `zsh`/`bash`/`sh` exists.
 
 ```bash
 make -j4
@@ -39,7 +42,7 @@ By default it talks to **Ollama on localhost** — nothing leaves your machine
 and no API key is involved:
 
 ```bash
-ollama serve && ollama pull qwen2.5-coder:7b
+ollama serve && ollama pull qwen3:8b
 alpha
 ```
 
@@ -74,7 +77,12 @@ alpha --url http://192.168.1.50:8000/v1 --model my-model "..."
 Equivalent environment variables: `ALPHA_PROVIDER`, `ALPHA_BASE_URL`,
 `ALPHA_API_KEY`, `ALPHA_MODEL`, `ALPHA_CWD`, `ALPHA_MAX_TURNS`, `ALPHA_STREAM`.
 Provider key variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …) are picked up
-automatically. A `.env` file in the working directory is loaded if present.
+automatically. Config is read from `~/.alpha/env` (or `ALPHA_ENV_FILE`); a
+`.env` in the working directory is deliberately *not* loaded, so a checkout
+cannot redirect the endpoint or the key.
+
+Prefer the environment for `ALPHA_API_KEY`: `--key` is overwritten in `argv`
+at startup so it does not sit in `ps`, but its length still leaks.
 
 In the session: `/help`, `/new`, `/cwd DIR`, `/model M`, `/status`, `/exit`.
 Ctrl-C interrupts the current request — including a running shell command —
