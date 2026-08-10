@@ -8,6 +8,7 @@ LOG="${ALPHA_LOG:-/tmp/agent-alpha-telegram.log}"
 BIN="$ROOT/alpha"
 
 load_env() {
+  unset ALPHA_PROVIDER ALPHA_BASE_URL ALPHA_API_KEY ALPHA_MODEL ALPHA_CWD ALPHA_MAX_TURNS ALPHA_TELEGRAM_ALLOW ALPHA_TELEGRAM_BOT_TOKEN TELEGRAM_BOT_TOKEN
   if [[ -f "$ROOT/.env" ]]; then
     set -a
     # shellcheck disable=SC1091

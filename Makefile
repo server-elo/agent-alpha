@@ -3,7 +3,7 @@ CFLAGS = -std=c11 -Wall -Wextra -Werror=return-type -O2 -Iinclude -Ideps -pthrea
 LDFLAGS = -lcurl -pthread
 
 SRC = src/main.c src/agent_loop.c src/llm.c src/tools.c src/browser.c src/telegram.c \
-      src/provider.c src/ui.c deps/cJSON.c deps/sds.c
+      src/provider.c src/ui.c src/evolve.c deps/cJSON.c deps/sds.c
 OBJ = $(SRC:.c=.o)
 TARGET = alpha
 
@@ -27,7 +27,7 @@ deps/%.o: deps/%.c
 # still reported all checks passing).
 TEST_SRC = tests/test_tools.c tests/test_session.c tests/test_telegram.c tests/test_llm.c \
            tests/test_provider.c tests/test_portable.c tests/test_config.c \
-           tests/test_browser.c
+           tests/test_browser.c tests/test_evolve.c
 TEST_BIN = $(TEST_SRC:tests/%.c=tests/bin/%)
 TEST_DEPS = src/browser.o src/provider.o deps/cJSON.o deps/sds.o
 # tests/test_util.h holds the assertion macros: a change there alters what every
@@ -68,6 +68,12 @@ tests/bin/test_config: tests/test_config.c src/main.c src/ui.o src/provider.o $(
 # not also link src/browser.o.
 tests/bin/test_browser: tests/test_browser.c src/browser.c $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< src/provider.o deps/cJSON.o deps/sds.o $(LDFLAGS)
+
+# Includes evolve.c directly to reach the static gate/log helpers; agent_run
+# comes from the linked objects. The gate tests run a real make against a
+# throwaway fixture, never against this tree.
+tests/bin/test_evolve: tests/test_evolve.c src/evolve.c src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
+	$(CC) $(CFLAGS) -o $@ $< src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) $(LDFLAGS)
 
 tests/bin:
 	mkdir -p tests/bin

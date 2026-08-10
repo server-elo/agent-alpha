@@ -146,4 +146,10 @@ void agent_session_clear(const char *session_path);
 /* Telegram long-poll loop (blocking). */
 int telegram_run(alpha_cfg_t *cfg, const char *token, const char *allow_csv);
 
+/* Self-evolution loop: the agent edits its own source tree, then the driver
+ * re-runs the gate (build, test suite, binary smoke test) and commits the
+ * generation or reverts it with git reset --hard. reexec=1 replaces the
+ * process with the freshly built binary after a kept generation. */
+int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec);
+
 #endif

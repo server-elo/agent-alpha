@@ -12,27 +12,31 @@ static void usage(const char *argv0) {
         "  %s                       interactive session\n"
         "  %s --telegram            Telegram bot\n"
         "  %s --providers           list known providers\n"
+        "  %s --evolve \"goal\"       evolve its own source: edit, rebuild, test, keep or revert\n"
         "\n"
         "%sOptions%s\n"
         "  -p, --provider NAME      ollama, openai, anthropic, groq, ... (see --providers)\n"
         "  -m, --model NAME         model id\n"
         "  -u, --url URL            OpenAI-compatible base URL, e.g. http://localhost:11434/v1\n"
         "  -k, --key KEY            API key (prefer the env var)\n"
-        "  -C, --cwd DIR            working directory for tools\n"
+        "  -C, --cwd DIR          working directory for tools\n"
         "      --turns N            max tool-calling turns per request\n"
+        "      --generations N      evolution generations with --evolve (default 1)\n"
+        "      --no-reexec          do not re-exec into the improved binary between generations\n"
         "      --no-stream          wait for the whole reply instead of streaming\n"
         "  -q, --quiet              suppress progress output\n"
         "\n"
         "%sEnvironment%s\n"
         "  ALPHA_PROVIDER  ALPHA_BASE_URL  ALPHA_API_KEY  ALPHA_MODEL\n"
         "  ALPHA_CWD  ALPHA_MAX_TURNS  ALPHA_STREAM  NO_COLOR\n"
+        "  ALPHA_EVOLVE_GENERATIONS  ALPHA_EVOLVE_REEXEC\n"
         "  Provider key vars (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...) are picked up\n"
         "  automatically. Settings can also live in a .env file.\n"
         "\n"
         "%sWarning%s: tools run unsandboxed with your full permissions.\n",
         ui_c(UI_BOLD), ui_c(UI_RESET),
         ui_c(UI_BOLD), ui_c(UI_RESET),
-        argv0, argv0, argv0, argv0,
+        argv0, argv0, argv0, argv0, argv0,
         ui_c(UI_BOLD), ui_c(UI_RESET),
         ui_c(UI_BOLD), ui_c(UI_RESET),
         ui_c(UI_YELLOW), ui_c(UI_RESET));
@@ -86,7 +90,8 @@ static int load_dotenv(const char *path) {
             val[n - 1] = 0;
             val++;
         }
-        if (!getenv(key)) setenv(key, val, 0);
+        /* Explicit environment values must win over file-based defaults. */
+        if (!getenv(key)) setenv(key, val, 1);
     }
     fclose(f);
     return 1;
@@ -254,6 +259,7 @@ int main(int argc, char **argv) {
     const char *key   = getenv("ALPHA_API_KEY");
     const char *cwd   = getenv("ALPHA_CWD");
     int telegram = 0, quiet = 0, stream = 1, providers = 0;
+    int evolve = 0, generations = 0, reexec = 1;
     int url_from_flag = 0, model_from_flag = 0;
     int max_turns = 0;
     const char *goal = NULL;
@@ -262,12 +268,19 @@ int main(int argc, char **argv) {
     if (mt && mt[0]) max_turns = atoi(mt);
     const char *sv = getenv("ALPHA_STREAM");
     if (sv && (strcmp(sv, "0") == 0 || strcasecmp(sv, "false") == 0)) stream = 0;
+    const char *eg = getenv("ALPHA_EVOLVE_GENERATIONS");
+    if (eg && eg[0]) generations = atoi(eg);
+    const char *er = getenv("ALPHA_EVOLVE_REEXEC");
+    if (er && (strcmp(er, "0") == 0 || strcasecmp(er, "false") == 0)) reexec = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         int has_next = (i + 1 < argc);
         if (!strcmp(a, "--telegram") || !strcmp(a, "-t")) telegram = 1;
         else if (!strcmp(a, "--providers")) providers = 1;
+        else if (!strcmp(a, "--evolve")) evolve = 1;
+        else if (!strcmp(a, "--no-reexec")) reexec = 0;
+        else if (!strcmp(a, "--generations") && has_next) generations = atoi(argv[++i]);
         else if (!strcmp(a, "--no-stream")) stream = 0;
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) quiet = 1;
         else if ((!strcmp(a, "-p") || !strcmp(a, "--provider")) && has_next) {
@@ -358,6 +371,18 @@ int main(int argc, char **argv) {
     /* A pipe closed by the reader (`alpha ... | head`) must not kill the
      * process mid-write; the write error is handled where it happens. */
     signal(SIGPIPE, SIG_IGN);
+
+    if (evolve) {
+        if (generations <= 0) generations = 1;
+        /* The whole run counts as in-request so Ctrl-C cancels the current
+         * generation instead of killing the process mid-revert. */
+        g_in_request = 1;
+        int rc = evolve_run(&cfg, goal, generations, reexec);
+        g_in_request = 0;
+        ui_spin_shutdown();
+        curl_global_cleanup();
+        return rc;
+    }
 
     render_t rend = { .streamed = 0, .quiet = quiet };
     alpha_events_t events = {

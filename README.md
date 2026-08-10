@@ -29,6 +29,7 @@ make -j4
 alpha                          # interactive session
 alpha "fix the failing test"   # one task, then exit
 alpha --providers              # what is configured
+alpha --evolve "improve X"     # evolve its own source, generation by generation
 ```
 
 By default it talks to **Ollama on localhost** — nothing leaves your machine
@@ -121,6 +122,42 @@ and noticeably worse on technical words. `ALPHA_VOICE_LANG` sets the language
 (default `en`) — auto-detect is deliberately not used, as it misfires badly on
 short phone audio. `ALPHA_VOICE_PROMPT` biases transcription toward your own
 jargon.
+
+## Evolution
+
+`alpha --evolve "goal"` points the agent at **its own source tree** and runs
+one generation at a time. The model edits the code; the driver — not the
+model — then re-runs the gate: `make -j4`, the full test suite, and a smoke
+test of the freshly linked binary. Pass, and the change is committed with the
+binary archived to `evolution/gen-NNN/alpha`. Fail, and `git reset --hard`
+reverts everything the generation did.
+
+```bash
+alpha --evolve "make the tool output summaries show elapsed time" --generations 3
+scripts/alpha-evolve.sh start "goal" 5   # same thing, in the background
+```
+
+- **git is the genome.** Uncommitted work is committed as a baseline snapshot
+  first, so a revert can never take pre-existing work with it.
+- **Reward hacking is checked, not trusted away.** A generation that deletes
+  a tracked source/test file is reverted before the build is even attempted,
+  and `make test` must print `ALL TESTS PASSED` — a Makefile edited to exit 0
+  without running anything does not pass. Generations that touch `tests/` or
+  the `Makefile` are flagged in the log for audit.
+- **It becomes its improved self.** After a kept generation the process
+  re-executes into the new binary, so later generations run on the upgrade
+  (`--no-reexec` disables). Configuration crosses the exec through the
+  environment, never through argv.
+- **`evolution/log.jsonl` is the memory.** The agent reads it each generation
+  and is told not to repeat reverted mutations. `evolution/` is git-ignored,
+  which is also what protects it from the post-revert `git clean`.
+
+`ALPHA_EVOLVE=1` is set in the agent's shell so commands can detect the mode.
+Environment: `ALPHA_EVOLVE_GENERATIONS`, `ALPHA_EVOLVE_REEXEC`.
+
+A note on scope: the gate proves the code builds and the suite passes — not
+that a change is *good*. Review kept generations with `git log` like any
+other contributor's work.
 
 ## Security
 
