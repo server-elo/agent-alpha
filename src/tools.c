@@ -782,7 +782,10 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
             sdsfree(body);
             return sdsnew("ERROR: old_str not found");
         }
-        if (strstr(pos + strlen(old_s), old_s)) {
+        /* Search from pos+1, not pos+strlen(old_s): overlapping occurrences
+         * (e.g. "aba" in "ababa", or "aa" in "aaa") would otherwise be
+         * missed and the edit would silently pick the wrong one. */
+        if (strstr(pos + 1, old_s)) {
             sdsfree(body);
             return sdsnew("ERROR: old_str not unique");
         }
