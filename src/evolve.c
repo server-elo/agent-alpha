@@ -384,8 +384,8 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
         fflush(stdout);
 
         sds report = NULL;
-        int ok = !alpha_cancel && evolve_gate(root, &report);
-        if (!report) report = sdsnew(alpha_cancel ? "interrupted\n" : "");
+        int ok = !alpha_cancel && (reply && reply[0] && strcmp(reply, "ERROR: empty response from LLM") != 0) && evolve_gate(root, &report);
+        if (!report) report = sdsnew(alpha_cancel ? "interrupted\n" : (!reply || !reply[0] || strcmp(reply, "ERROR: empty response from LLM") == 0) ? "FAIL: empty LLM response\n" : "");
 
         /* Audit flag: a generation that touched the tests or the Makefile is
          * legitimate more often than not, but it is where reward hacking
