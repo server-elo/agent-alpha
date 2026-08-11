@@ -836,6 +836,208 @@ static void test_shell_long_output(void) {
     sdsfree(r);
 }
 
+/* --- network error handling: a command that fails to connect ---------------
+ * curl to a non-routable TEST-NET-1 address must fail fast and report the
+ * error, not hang until the shell timeout. The connect timeout is 2s so the
+ * test finishes well under the 60s shell cap. */
+static void test_shell_network_error(void) {
+    TEST_BEGIN("shell_run: network errors are captured, not hung");
+
+    /* 192.0.2.1 is TEST-NET-1 (RFC 5737) — guaranteed non-routable.
+     * --connect-timeout 2 ensures curl gives up fast even if the shell
+     * timeout is 60s. */
+    sds r = shell_run(
+        "curl -s --connect-timeout 2 http://192.0.2.1:9999/ 2>&1 || true",
+        "/tmp");
+    /* The command must finish (not hang), and the output must contain
+     * either curl's error message or the shell exit code. */
+    CHECK(strstr(r, "__ALPHA_EXIT") != NULL,
+          "the command completed and reported an exit code");
+    /* curl should have produced some diagnostic — connection refused,
+     * timeout, or network unreachable. */
+    int has_error = (strstr(r, "connect") != NULL || strstr(r, "timeout") != NULL ||
+                     strstr(r, "refused") != NULL || strstr(r, "unreachable") != NULL ||
+                     strstr(r, "resolve") != NULL || strstr(r, "Could not") != NULL);
+    CHECK(has_error, "curl reported a network-level error");
+    sdsfree(r);
+}
+
+/* --- shell_run: a command killed by a signal reports the signal ----------- */
+static void test_shell_signal(void) {
+    TEST_BEGIN("shell_run: a signal-killed command is reported");
+
+    /* kill -SEGV sends SIGSEGV to the shell itself. The shell exits with
+     * 128+signal, and the script wrapper captures that. */
+    sds r = shell_run("kill -SEGV $$", "/tmp");
+    /* The exit code should reflect the signal: 128 + 11 (SIGSEGV) = 139,
+     * or the shell may report it differently. Either way, it must not be 0. */
+    CHECK(strstr(r, "__ALPHA_EXIT:0") == NULL,
+          "a killed command does not report success");
+    CHECK(strstr(r, "__ALPHA_EXIT") != NULL,
+          "an exit code is still reported");
+    sdsfree(r);
+
+    /* SIGKILL: the shell cannot catch it, so the exit code comes from
+     * waitpid, not from the shell's own $?. */
+    r = shell_run("kill -KILL $$", "/tmp");
+    CHECK(strstr(r, "__ALPHA_EXIT:0") == NULL,
+          "SIGKILL does not report success");
+    sdsfree(r);
+}
+
+/* --- edit_file: nonexistent path is reported clearly ---------------------- */
+static void test_edit_nonexistent_file(void) {
+    TEST_BEGIN("edit_file: nonexistent path is reported, not a crash");
+
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", "/tmp/alpha_t/does_not_exist_xyz.txt");
+    cJSON_AddStringToObject(a, "old_str", "hello");
+    cJSON_AddStringToObject(a, "new_str", "hi");
+    sds r = tools_run("edit_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "nonexistent file is refused");
+    /* The error should come from read_file_all (which returns "ERROR open ...")
+     * and be passed through by edit_file. */
+    CHECK(strstr(r, "open") != NULL || strstr(r, "No such") != NULL ||
+          strstr(r, "not found") != NULL,
+          "the reason mentions the file could not be opened");
+    sdsfree(r);
+}
+
+/* --- edit_file: a directory path is refused ------------------------------- */
+static void test_edit_directory(void) {
+    TEST_BEGIN("edit_file: a directory path is refused cleanly");
+
+    mkdir_p("/tmp/alpha_t/edit_dir_test");
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", "/tmp/alpha_t/edit_dir_test");
+    cJSON_AddStringToObject(a, "old_str", "anything");
+    cJSON_AddStringToObject(a, "new_str", "else");
+    sds r = tools_run("edit_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "directory is refused for editing");
+    CHECK(strstr(r, "directory") != NULL, "the reason says it is a directory");
+    sdsfree(r);
+}
+
+/* --- write_file: overwriting an existing file works correctly ------------- */
+static void test_write_overwrite(void) {
+    TEST_BEGIN("write_file: overwriting an existing file replaces it entirely");
+
+    mkdir_p("/tmp/alpha_t");
+    const char *path = "/tmp/alpha_t/overwrite.txt";
+
+    /* First write */
+    FILE *f = fopen(path, "w");
+    if (f) { fputs("original content here\n", f); fclose(f); }
+
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", path);
+    cJSON_AddStringToObject(a, "content", "replacement");
+    sds r = tools_run("write_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "overwrite succeeds");
+    sdsfree(r);
+
+    /* Verify the file contains only the new content, not a mix */
+    sds body = read_file_all(path, 4096);
+    CHECK(strcmp(body, "replacement") == 0,
+          "file contains only the new content, no leftover bytes");
+    sdsfree(body);
+
+    /* Overwrite with longer content */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", path);
+    cJSON_AddStringToObject(a, "content", "longer replacement text here");
+    r = tools_run("write_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "overwrite with longer content succeeds");
+    sdsfree(r);
+
+    body = read_file_all(path, 4096);
+    CHECK(strcmp(body, "longer replacement text here") == 0,
+          "longer content is written correctly");
+    sdsfree(body);
+    unlink(path);
+}
+
+/* --- tool aliases: "bash" and "ls" work identically to the canonical names - */
+static void test_tools_aliases(void) {
+    TEST_BEGIN("tools_run: aliases 'bash' and 'ls' work");
+
+    /* "bash" alias for execute_bash */
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "command", "echo alias_test_xyz");
+    sds r = tools_run("bash", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strstr(r, "alias_test_xyz") != NULL, "'bash' alias runs the command");
+    CHECK(strstr(r, "__ALPHA_EXIT:0") != NULL, "exit code reported via alias");
+    sdsfree(r);
+
+    /* "ls" alias for list_dir */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", "/tmp");
+    r = tools_run("ls", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) != 0, "'ls' alias succeeds");
+    sdsfree(r);
+
+    /* "ls" with no path uses cwd */
+    a = cJSON_CreateObject();
+    r = tools_run("ls", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) != 0, "'ls' with no path uses cwd");
+    sdsfree(r);
+}
+
+/* --- shell_run: stderr is captured alongside stdout ------------------------
+ * Both fds are dup2'd to the same output file, so stderr must appear in the
+ * result interleaved with stdout. */
+static void test_shell_stderr(void) {
+    TEST_BEGIN("shell_run: stderr is captured in the output");
+
+    sds r = shell_run(
+        "echo stdout_line_xyz; echo stderr_line_xyz >&2",
+        "/tmp");
+    CHECK(strstr(r, "stdout_line_xyz") != NULL, "stdout is captured");
+    CHECK(strstr(r, "stderr_line_xyz") != NULL, "stderr is captured");
+    CHECK(strstr(r, "__ALPHA_EXIT:0") != NULL, "exit code is reported");
+    sdsfree(r);
+}
+
+/* --- shell_run: output near the 200 KB read cap is not truncated -----------
+ * The read_file_all inside shell_run caps at 200000 bytes. Output just under
+ * that must be complete; output just over must show the truncation marker. */
+static void test_shell_output_near_cap(void) {
+    TEST_BEGIN("shell_run: output near the 200 KB cap is handled correctly");
+
+    /* Generate ~180 KB — well under the 200 KB cap. Use printf to avoid
+     * newline overhead dominating the byte count. */
+    sds r = shell_run(
+        "i=0; while [ $i -lt 1800 ]; do printf 'line_%04d_abcdefghijklmnopqrstuvwxyz0123456789"
+        "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnop\\n' $i; i=$((i+1)); done; "
+        "echo UNIQUE_UNDER_CAP_MARKER",
+        "/tmp");
+    CHECK(strstr(r, "UNIQUE_UNDER_CAP_MARKER") != NULL,
+          "output under the cap is complete");
+    CHECK(strstr(r, "TRUNCATED") == NULL,
+          "no truncation marker when under the cap");
+    sdsfree(r);
+
+    /* Generate ~250 KB — over the 200 KB cap. The tail must be missing and
+     * the truncation marker must appear. */
+    r = shell_run(
+        "i=0; while [ $i -lt 2500 ]; do printf 'line_%04d_abcdefghijklmnopqrstuvwxyz0123456789"
+        "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnop\\n' $i; i=$((i+1)); done; "
+        "echo UNIQUE_OVER_CAP_MARKER",
+        "/tmp");
+    CHECK(strstr(r, "UNIQUE_OVER_CAP_MARKER") == NULL,
+          "output over the cap has its tail missing");
+    CHECK(strstr(r, "TRUNCATED") != NULL,
+          "truncation marker appears when over the cap");
+    sdsfree(r);
+}
+
 int main(void) {
     test_mkdir_no_shell();
     test_write_file_no_shell();
@@ -861,6 +1063,14 @@ int main(void) {
     test_write_long_content();
     test_list_many_entries();
     test_shell_long_output();
+    test_shell_network_error();
+    test_shell_signal();
+    test_edit_nonexistent_file();
+    test_edit_directory();
+    test_write_overwrite();
+    test_tools_aliases();
+    test_shell_stderr();
+    test_shell_output_near_cap();
     system("rm -rf /tmp/alpha_t");
     return test_report("tools");
 }
