@@ -345,6 +345,200 @@ static void test_hang_prone_paths(void) {
     CHECK(!path_is_hang_prone("/tmp"), "ordinary paths are allowed");
 }
 
+/* --- edge cases: read_file on a directory, nonexistent path ---------------- */
+static void test_read_file_edge_cases(void) {
+    TEST_BEGIN("read_file: edge cases are handled cleanly");
+
+    mkdir_p("/tmp/alpha_t/subdir");
+
+    /* read_file on a directory */
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", "/tmp/alpha_t/subdir");
+    sds r = tools_run("read_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "reading a directory is refused");
+    sdsfree(r);
+
+    /* read_file on a nonexistent path */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", "/tmp/alpha_t/no_such_file.txt");
+    r = tools_run("read_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "nonexistent file is refused");
+    sdsfree(r);
+
+    /* read_file with a relative path resolved against cwd */
+    FILE *f = fopen("/tmp/alpha_t/rel.txt", "w");
+    if (f) { fputs("relative works\n", f); fclose(f); }
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", "rel.txt");
+    r = tools_run("read_file", a, "/tmp/alpha_t");
+    cJSON_Delete(a);
+    CHECK(strcmp(r, "relative works\n") == 0, "relative path resolved against cwd");
+    sdsfree(r);
+}
+
+/* --- edge cases: write_file to read-only location, empty content ----------- */
+static void test_write_file_edge_cases(void) {
+    TEST_BEGIN("write_file: edge cases are handled cleanly");
+
+    /* write to a path whose parent is a file, not a directory */
+    FILE *f = fopen("/tmp/alpha_t/notadir", "w");
+    if (f) { fputs("blocker\n", f); fclose(f); }
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", "/tmp/alpha_t/notadir/sub/file.txt");
+    cJSON_AddStringToObject(a, "content", "should fail");
+    sds r = tools_run("write_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "write into a file-as-directory fails");
+    sdsfree(r);
+
+    /* write empty content */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", "/tmp/alpha_t/empty.txt");
+    cJSON_AddStringToObject(a, "content", "");
+    r = tools_run("write_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "empty file is written");
+    CHECK(strstr(r, "0 bytes") != NULL, "reports zero bytes");
+    sdsfree(r);
+
+    struct stat st;
+    CHECK(stat("/tmp/alpha_t/empty.txt", &st) == 0 && st.st_size == 0,
+          "file is genuinely empty on disk");
+}
+
+/* --- edge cases: edit_file with empty old_str, match at start/end ---------- */
+static void test_edit_file_edge_cases(void) {
+    TEST_BEGIN("edit_file: edge cases are handled cleanly");
+
+    /* edit with empty old_str */
+    const char *path = "/tmp/alpha_t/edit_edge.txt";
+    FILE *f = fopen(path, "w");
+    if (f) { fputs("hello world\n", f); fclose(f); }
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", path);
+    cJSON_AddStringToObject(a, "old_str", "");
+    cJSON_AddStringToObject(a, "new_str", "X");
+    sds r = tools_run("edit_file", a, "/tmp");
+    cJSON_Delete(a);
+    /* An empty old_str matches at position 0, but strstr(pos+1, "") also
+     * matches at position 1, so it should be rejected as non-unique. */
+    CHECK(strncmp(r, "ERROR", 5) == 0, "empty old_str is rejected");
+    sdsfree(r);
+
+    /* edit with old_str at the very start of the file */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", path);
+    cJSON_AddStringToObject(a, "old_str", "hello");
+    cJSON_AddStringToObject(a, "new_str", "hi");
+    r = tools_run("edit_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "edit at start of file succeeds");
+    sdsfree(r);
+
+    /* verify the edit */
+    sds body = read_file_all(path, 4096);
+    CHECK(strcmp(body, "hi world\n") == 0, "file content is correct after edit");
+    sdsfree(body);
+
+    /* edit with old_str at the very end of the file */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", path);
+    cJSON_AddStringToObject(a, "old_str", "world\n");
+    cJSON_AddStringToObject(a, "new_str", "earth\n");
+    r = tools_run("edit_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "edit at end of file succeeds");
+    sdsfree(r);
+
+    body = read_file_all(path, 4096);
+    CHECK(strcmp(body, "hi earth\n") == 0, "file content is correct after end-edit");
+    sdsfree(body);
+
+    /* edit with old_str not found */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", path);
+    cJSON_AddStringToObject(a, "old_str", "nonexistent");
+    cJSON_AddStringToObject(a, "new_str", "X");
+    r = tools_run("edit_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "missing old_str is reported");
+    CHECK(strstr(r, "not found") != NULL, "reason says not found");
+    sdsfree(r);
+}
+
+/* --- edge cases: list_dir on a file, nonexistent path ---------------------- */
+static void test_list_dir_edge_cases(void) {
+    TEST_BEGIN("list_dir: edge cases are handled cleanly");
+
+    /* list_dir on a file */
+    FILE *f = fopen("/tmp/alpha_t/just_a_file.txt", "w");
+    if (f) { fputs("data\n", f); fclose(f); }
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", "/tmp/alpha_t/just_a_file.txt");
+    sds r = tools_run("list_dir", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "listing a file is refused");
+    sdsfree(r);
+
+    /* list_dir on a nonexistent path */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", "/tmp/alpha_t/no_such_dir");
+    r = tools_run("list_dir", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "nonexistent directory is refused");
+    sdsfree(r);
+
+    /* list_dir with no path argument (uses cwd) */
+    a = cJSON_CreateObject();
+    r = tools_run("list_dir", a, "/tmp/alpha_t");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) != 0, "list_dir with no path succeeds");
+    sdsfree(r);
+}
+
+/* --- edge cases: shell_run with NULL cwd, failing command ------------------ */
+static void test_shell_run_edge_cases(void) {
+    TEST_BEGIN("shell_run: edge cases are handled cleanly");
+
+    /* NULL cwd — should still run */
+    sds r = shell_run("echo ok", NULL);
+    CHECK(strstr(r, "ok") != NULL, "command runs with NULL cwd");
+    sdsfree(r);
+
+    /* command that fails (non-zero exit) */
+    r = shell_run("exit 42", "/tmp");
+    CHECK(strstr(r, "__ALPHA_EXIT:42") != NULL, "exit code is reported");
+    sdsfree(r);
+
+    /* empty command */
+    r = shell_run("", "/tmp");
+    CHECK(strncmp(r, "ERROR", 5) == 0, "empty command is refused");
+    sdsfree(r);
+
+    /* NULL command */
+    r = shell_run(NULL, "/tmp");
+    CHECK(strncmp(r, "ERROR", 5) == 0, "NULL command is refused");
+    sdsfree(r);
+}
+
+/* --- fast timeout: prove the override works -------------------------------- */
+static void test_fast_timeout(void) {
+    TEST_BEGIN("shell_run: fast timeout override works");
+    /* With ALPHA_SHELL_TIMEOUT_MS=2000, this must finish in ~2s, not 60s. */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    sds r = shell_run("sleep 900", "/tmp");
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double elapsed = (double)(t1.tv_sec - t0.tv_sec) +
+                     (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+    CHECK(strstr(r, "timeout") != NULL, "result mentions the timeout");
+    CHECK(strstr(r, "2000ms") != NULL, "timeout value matches the override");
+    CHECK(elapsed < 5.0, "timeout fires quickly (under 5s, not 60s)");
+    sdsfree(r);
+}
+
 int main(void) {
     test_mkdir_no_shell();
     test_write_file_no_shell();
@@ -356,6 +550,12 @@ int main(void) {
     test_nul_bytes();
     test_bad_input();
     test_hang_prone_paths();
+    test_read_file_edge_cases();
+    test_write_file_edge_cases();
+    test_edit_file_edge_cases();
+    test_list_dir_edge_cases();
+    test_shell_run_edge_cases();
+    test_fast_timeout();
     system("rm -rf /tmp/alpha_t");
     return test_report("tools");
 }

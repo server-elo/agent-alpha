@@ -168,10 +168,11 @@ under a user account you are comfortable handing to a language model.
 
 Two limits worth knowing:
 
-- Shell commands are killed after 60s. A process that both calls `setsid()` and
-  closes its inherited descriptors — the textbook daemonization sequence —
-  survives that. It sheds every marker used to find it; closing the hole needs a
-  per-command uid or a real sandbox.
+- Shell commands are killed after 60s (overridable at compile time with
+  `ALPHA_SHELL_TIMEOUT_MS`; the test suite uses 2s). A process that both calls
+  `setsid()` and closes its inherited descriptors — the textbook daemonization
+  sequence — survives that. It sheds every marker used to find it; closing the
+  hole needs a per-command uid or a real sandbox.
 - On macOS, paths served by the File Provider (Desktop, iCloud Drive) are
   refused rather than opened, because `opendir` on them can block forever.
 
@@ -181,7 +182,7 @@ Two limits worth knowing:
 make test
 ```
 
-463 checks over the tool layer, session handling, the SSE parser, provider
+525 checks over the tool layer, session handling, the SSE parser, provider
 resolution, config loading, the CDP WebSocket client and the Telegram loop.
 Both the macOS and Linux process-tracking paths are exercised on either host.
 The suite discards its binaries before every

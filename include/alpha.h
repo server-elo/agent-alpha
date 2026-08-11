@@ -26,6 +26,11 @@
 #define ALPHA_EDIT_MAX_BYTES 2000000
 /* Hard wall-clock cap for one user request (seconds). */
 #define ALPHA_REQUEST_MAX_SECONDS 10800
+/* Hard cap for shell_run (milliseconds). Overridable so the test suite can
+ * prove timeout behaviour without waiting 60s per case. */
+#ifndef ALPHA_SHELL_TIMEOUT_MS
+#define ALPHA_SHELL_TIMEOUT_MS 60000
+#endif
 
 /* LLM replies are streamed, so there is no cap on how long a reply may take --
  * only on how long it may produce NOTHING. A fixed total timeout used to kill

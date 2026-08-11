@@ -36,7 +36,7 @@ TEST_DEPS = src/browser.o src/provider.o deps/cJSON.o deps/sds.o
 TEST_HDRS = tests/test_util.h include/alpha.h
 
 tests/bin/test_tools: tests/test_tools.c src/tools.c $(TEST_DEPS) $(TEST_HDRS) | tests/bin
-	$(CC) $(CFLAGS) -o $@ $< $(TEST_DEPS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -DALPHA_SHELL_TIMEOUT_MS=2000 -o $@ $< $(TEST_DEPS) $(LDFLAGS)
 
 tests/bin/test_session: tests/test_session.c src/agent_loop.c src/llm.o src/tools.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< src/llm.o src/tools.o $(TEST_DEPS) $(LDFLAGS)

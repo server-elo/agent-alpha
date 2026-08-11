@@ -21,6 +21,12 @@
 /* NO security: any path, any shell. User asked open coding shell. */
 
 static sds read_file_all(const char *path, size_t max_bytes) {
+    /* On macOS fopen("somedir", "rb") succeeds but fread returns 0 and sets
+     * ferror. Detect this early so the caller gets a clear error instead of
+     * an empty string that looks like a zero-byte file. */
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+        return sdscatprintf(sdsempty(), "ERROR: %s is a directory, not a file", path);
     FILE *f = fopen(path, "rb");
     if (!f) return sdscatprintf(sdsempty(), "ERROR open %s: %s", path, strerror(errno));
     sds out = sdsempty();
@@ -494,7 +500,8 @@ static sds shell_run(const char *cmd, const char *cwd) {
 
     int status = 0;
     int cancelled = 0;
-    for (int waited = 0; waited < 600; waited++) {   /* 600 * 100ms = 60s */
+    int max_waits = ALPHA_SHELL_TIMEOUT_MS / 100;   /* 100ms per tick */
+    for (int waited = 0; waited < max_waits; waited++) {
         pid_t r = waitpid(pid, &status, WNOHANG);
         if (r == pid) { timed_out = 0; break; }
         if (r < 0) break;
@@ -504,7 +511,7 @@ static sds shell_run(const char *cmd, const char *cwd) {
          * the process group. */
         if (alpha_cancel) { cancelled = 1; timed_out = 1; break; }
         usleep(100000);
-        if (waited == 599) timed_out = 1;
+        if (waited == max_waits - 1) timed_out = 1;
     }
 
     if (timed_out) {
@@ -538,10 +545,11 @@ static sds shell_run(const char *cmd, const char *cwd) {
     if (cancelled)
         out = sdscat(out, "\nERROR: command interrupted by the user.");
     else if (timed_out)
-        out = sdscat(out, "\nERROR: command exceeded 60s timeout — killed (process group, "
-                          "plus descendants still holding this command's output file). "
-                          "A process that called setsid() and closed its inherited fds "
-                          "may still be running.");
+        out = sdscatprintf(out,
+            "\nERROR: command exceeded %dms timeout — killed (process group, "
+            "plus descendants still holding this command's output file). "
+            "A process that called setsid() and closed its inherited fds "
+            "may still be running.", ALPHA_SHELL_TIMEOUT_MS);
     return out;
 }
 
