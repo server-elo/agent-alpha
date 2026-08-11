@@ -539,6 +539,303 @@ static void test_fast_timeout(void) {
     sdsfree(r);
 }
 
+/* --- overlapping occurrences: the gen-6 fix must not regress ----------------
+ * strstr(pos + strlen(old_s), old_s) used to skip past the entire first match,
+ * so overlapping occurrences like "aba" in "ababa" were missed and the edit
+ * silently picked the wrong one. The fix uses strstr(pos + 1, old_s). */
+static void test_edit_overlapping(void) {
+    TEST_BEGIN("edit_file: overlapping occurrences are detected as non-unique");
+
+    mkdir_p("/tmp/alpha_t");
+
+    /* "aba" appears twice in "ababa" with overlap: positions 0 and 2.
+     * The old code (pos + strlen) would only find position 0 and report
+     * it unique, then replace the wrong occurrence. */
+    const char *path = "/tmp/alpha_t/overlap.txt";
+    FILE *f = fopen(path, "w");
+    CHECK(f != NULL, "fixture created");
+    if (!f) return;
+    fputs("ababa\n", f);
+    fclose(f);
+
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", path);
+    cJSON_AddStringToObject(a, "old_str", "aba");
+    cJSON_AddStringToObject(a, "new_str", "X");
+    sds r = tools_run("edit_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "overlapping 'aba' in 'ababa' is rejected");
+    CHECK(strstr(r, "not unique") != NULL, "reason says not unique");
+    sdsfree(r);
+
+    /* "aa" appears twice in "aaa" with overlap: positions 0 and 1.
+     * Same class of bug, different length relationship. */
+    path = "/tmp/alpha_t/overlap2.txt";
+    f = fopen(path, "w");
+    if (f) { fputs("aaa\n", f); fclose(f); }
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", path);
+    cJSON_AddStringToObject(a, "old_str", "aa");
+    cJSON_AddStringToObject(a, "new_str", "b");
+    r = tools_run("edit_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "overlapping 'aa' in 'aaa' is rejected");
+    CHECK(strstr(r, "not unique") != NULL, "reason says not unique");
+    sdsfree(r);
+
+    /* A genuinely unique string must still succeed — the fix must not
+     * break the normal case. */
+    path = "/tmp/alpha_t/overlap3.txt";
+    f = fopen(path, "w");
+    if (f) { fputs("hello world\n", f); fclose(f); }
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", path);
+    cJSON_AddStringToObject(a, "old_str", "hello");
+    cJSON_AddStringToObject(a, "new_str", "hi");
+    r = tools_run("edit_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "unique string still works after the fix");
+    sdsfree(r);
+}
+
+/* --- edit_file: new_str contains old_str (self-replacement) -----------------
+ * Replacing "a" with "aa" must not loop or corrupt. The uniqueness check runs
+ * before any edit, so this is safe — but it must still produce the right result. */
+static void test_edit_self_containing(void) {
+    TEST_BEGIN("edit_file: new_str containing old_str works correctly");
+
+    mkdir_p("/tmp/alpha_t");
+    const char *path = "/tmp/alpha_t/selfcont.txt";
+
+    /* Replace "a" with "aa" — new_str contains old_str */
+    FILE *f = fopen(path, "w");
+    CHECK(f != NULL, "fixture created");
+    if (!f) return;
+    fputs("abc\n", f);
+    fclose(f);
+
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", path);
+    cJSON_AddStringToObject(a, "old_str", "a");
+    cJSON_AddStringToObject(a, "new_str", "aa");
+    sds r = tools_run("edit_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "self-containing replacement succeeds");
+    sdsfree(r);
+
+    sds body = read_file_all(path, 4096);
+    CHECK(strcmp(body, "aabc\n") == 0, "only the first 'a' was replaced");
+    sdsfree(body);
+
+    /* Replace "bc" with "abc" — new_str contains old_str, at end of file */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", path);
+    cJSON_AddStringToObject(a, "old_str", "bc");
+    cJSON_AddStringToObject(a, "new_str", "abc");
+    r = tools_run("edit_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "end-of-file self-containing replacement succeeds");
+    sdsfree(r);
+
+    body = read_file_all(path, 4096);
+    CHECK(strcmp(body, "aaabc\n") == 0, "replacement is correct");
+    sdsfree(body);
+}
+
+/* --- tools_run: NULL args are tolerated, not dereferenced ------------------ */
+static void test_tools_null_args(void) {
+    TEST_BEGIN("tools_run: NULL args are handled gracefully");
+
+    /* read_file with NULL args — must not crash */
+    sds r = tools_run("read_file", NULL, "/tmp");
+    CHECK(strncmp(r, "ERROR", 5) == 0, "NULL args with read_file is rejected cleanly");
+    sdsfree(r);
+
+    /* write_file with NULL args */
+    r = tools_run("write_file", NULL, "/tmp");
+    CHECK(strncmp(r, "ERROR", 5) == 0, "NULL args with write_file is rejected cleanly");
+    sdsfree(r);
+
+    /* edit_file with NULL args */
+    r = tools_run("edit_file", NULL, "/tmp");
+    CHECK(strncmp(r, "ERROR", 5) == 0, "NULL args with edit_file is rejected cleanly");
+    sdsfree(r);
+
+    /* execute_bash with NULL args */
+    r = tools_run("execute_bash", NULL, "/tmp");
+    CHECK(strncmp(r, "ERROR", 5) == 0, "NULL args with execute_bash is rejected cleanly");
+    sdsfree(r);
+
+    /* list_dir with NULL args (should use cwd) */
+    r = tools_run("list_dir", NULL, "/tmp/alpha_t");
+    CHECK(strncmp(r, "ERROR", 5) != 0, "NULL args with list_dir succeeds (uses cwd)");
+    sdsfree(r);
+}
+
+/* --- shell_run: nonexistent cwd is reported, not silently ignored ----------
+ * The cd guard runs "cd <dir> || exit 90", so when cd fails the script exits
+ * before printing __ALPHA_EXIT. The command never runs, and the exit code
+ * (captured by the shell that ran the script) is 90. */
+static void test_shell_bad_cwd(void) {
+    TEST_BEGIN("shell_run: nonexistent cwd is reported cleanly");
+
+    sds r = shell_run("echo hello", "/tmp/alpha_t/no_such_dir_xyz");
+    /* The command must not have run — "hello" must be absent */
+    CHECK(strstr(r, "hello") == NULL,
+          "command did not execute with a bad cwd");
+    /* The cd failure should be visible in the output */
+    CHECK(strstr(r, "cd") != NULL || strstr(r, "No such") != NULL ||
+          strstr(r, "not found") != NULL || strstr(r, "ERROR") != NULL,
+          "cd failure is surfaced in the output");
+    sdsfree(r);
+
+    /* A valid cwd must still work */
+    r = shell_run("echo ok", "/tmp");
+    CHECK(strstr(r, "ok") != NULL, "valid cwd still works");
+    CHECK(strstr(r, "__ALPHA_EXIT:0") != NULL, "exit 0 with valid cwd");
+    sdsfree(r);
+}
+
+/* --- read_file: symlinks are followed, not rejected ------------------------ */
+static void test_read_symlink(void) {
+    TEST_BEGIN("read_file: symlinks are followed correctly");
+
+    mkdir_p("/tmp/alpha_t");
+    const char *target = "/tmp/alpha_t/symlink_target.txt";
+    const char *link   = "/tmp/alpha_t/symlink.txt";
+
+    FILE *f = fopen(target, "w");
+    CHECK(f != NULL, "target created");
+    if (!f) return;
+    fputs("symlink content\n", f);
+    fclose(f);
+
+    unlink(link);
+    int rc = symlink(target, link);
+    CHECK(rc == 0, "symlink created");
+
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", link);
+    sds r = tools_run("read_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strcmp(r, "symlink content\n") == 0, "symlink is followed and read");
+    sdsfree(r);
+
+    /* A dangling symlink must still report a clear error */
+    unlink(target);
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", link);
+    r = tools_run("read_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "dangling symlink is reported as an error");
+    sdsfree(r);
+
+    unlink(link);
+}
+
+/* --- write_file: long content is written whole, not truncated -------------- */
+static void test_write_long_content(void) {
+    TEST_BEGIN("write_file: long content is written correctly");
+
+    mkdir_p("/tmp/alpha_t");
+    const char *path = "/tmp/alpha_t/long.txt";
+
+    /* Build a 100 KB payload with a unique tail */
+    sds payload = sdsempty();
+    for (int i = 0; i < 10000; i++)
+        payload = sdscatprintf(payload, "line %d: abcdefghijklmnopqrstuvwxyz\n", i);
+    payload = sdscat(payload, "UNIQUE_LONG_TAIL\n");
+    size_t plen = sdslen(payload);
+
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", path);
+    cJSON_AddStringToObject(a, "content", payload);
+    sds r = tools_run("write_file", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "long write succeeds");
+
+    /* Verify the reported byte count matches */
+    char want[64];
+    snprintf(want, sizeof(want), "%zu bytes", plen);
+    CHECK(strstr(r, want) != NULL, "reported byte count is correct");
+    sdsfree(r);
+
+    /* Verify the file on disk */
+    sds body = read_file_all(path, plen + 100);
+    CHECK(sdslen(body) == plen, "file on disk has the exact length");
+    CHECK(strstr(body, "UNIQUE_LONG_TAIL") != NULL, "tail is intact");
+    sdsfree(body);
+    sdsfree(payload);
+    unlink(path);
+}
+
+/* --- list_dir: many entries are all listed, sorted ------------------------- */
+static void test_list_many_entries(void) {
+    TEST_BEGIN("list_dir: many entries are listed and sorted");
+
+    mkdir_p("/tmp/alpha_t/many");
+    /* Create 100 files with unsorted names */
+    for (int i = 0; i < 100; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "/tmp/alpha_t/many/file_%03d.txt", (i * 17) % 100);
+        FILE *f = fopen(name, "w");
+        if (f) fclose(f);
+    }
+
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", "/tmp/alpha_t/many");
+    sds r = tools_run("list_dir", a, "/tmp");
+    cJSON_Delete(a);
+
+    /* Should not be an error */
+    CHECK(strncmp(r, "ERROR", 5) != 0, "listing many entries succeeds");
+
+    /* Count the file lines */
+    int count = 0;
+    for (const char *p = r; *p; p++) {
+        if (*p == '\n') count++;
+    }
+    CHECK(count >= 100, "all 100 entries are listed");
+
+    /* Verify sorting: extract names and check order */
+    const char *prev = NULL;
+    const char *line_start = r;
+    for (const char *p = r; *p; p++) {
+        if (*p != '\n') continue;
+        /* Find the name after "file " prefix */
+        const char *name = strstr(line_start, "file ");
+        if (name) {
+            name += 5; /* skip "file " */
+            if (prev && strcasecmp(prev, name) > 0) {
+                CHECK(0, "entries are not sorted");
+                break;
+            }
+            prev = name;
+        }
+        line_start = p + 1;
+    }
+    /* If we got here without failing, sorting is correct */
+    if (prev) CHECK(1, "entries are sorted");
+
+    sdsfree(r);
+    system("rm -rf /tmp/alpha_t/many");
+}
+
+/* --- shell_run: long output is captured whole ------------------------------ */
+static void test_shell_long_output(void) {
+    TEST_BEGIN("shell_run: long output is captured without truncation");
+
+    /* Generate ~50 KB of output — well under the 200 KB read cap */
+    sds r = shell_run(
+        "i=0; while [ $i -lt 2000 ]; do echo \"line $i: abcdefghijklmnop\"; i=$((i+1)); done; "
+        "echo UNIQUE_LONG_TAIL_MARKER",
+        "/tmp");
+    CHECK(strstr(r, "UNIQUE_LONG_TAIL_MARKER") != NULL,
+          "tail of long output is present");
+    CHECK(strstr(r, "__ALPHA_EXIT:0") != NULL, "exit code is reported");
+    sdsfree(r);
+}
+
 int main(void) {
     test_mkdir_no_shell();
     test_write_file_no_shell();
@@ -556,6 +853,14 @@ int main(void) {
     test_list_dir_edge_cases();
     test_shell_run_edge_cases();
     test_fast_timeout();
+    test_edit_overlapping();
+    test_edit_self_containing();
+    test_tools_null_args();
+    test_shell_bad_cwd();
+    test_read_symlink();
+    test_write_long_content();
+    test_list_many_entries();
+    test_shell_long_output();
     system("rm -rf /tmp/alpha_t");
     return test_report("tools");
 }
