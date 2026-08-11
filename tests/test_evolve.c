@@ -16,10 +16,14 @@ static void write_file(const char *path, const char *body) {
 static int fixture_make(void) {
     system("rm -rf " FIX);
     if (mkdir(FIX, 0755) != 0) return 0;
+    /* The gate now requires both "ALL TESTS PASSED" and "=== tests/bin/"
+     * so a generation cannot bypass the suite by editing the Makefile test
+     * target to just echo the magic string and exit 0. */
     write_file(FIX "/Makefile",
         "all:\n"
         "\t@echo build ok\n"
         "test:\n"
+        "\t@echo === tests/bin/test_fake ===\n"
         "\t@echo running checks\n"
         "\t@echo ALL TESTS PASSED\n");
     write_file(FIX "/alpha", "#!/bin/sh\nexit 0\n");
@@ -82,15 +86,33 @@ int main(void) {
     sdsfree(report);
 
     /* Weaken the test target: exit 0 without the magic string must fail even
-     * though make itself succeeds. */
+     * though make itself succeeds. The "=== tests/bin/" line is still present
+     * so the gate knows the recipe actually ran. */
     write_file(FIX "/Makefile",
         "all:\n"
         "\t@echo build ok\n"
         "test:\n"
+        "\t@echo === tests/bin/test_fake ===\n"
         "\t@echo nothing ran\n");
     report = NULL;
     CHECK(evolve_gate(FIX, &report) == 0, "gate fails without ALL TESTS PASSED");
     CHECK(report && strstr(report, "FAIL: test suite"), "gate report names the suite");
+    sdsfree(report);
+
+    /* A Makefile that prints "ALL TESTS PASSED" but never ran a test binary
+     * (no "=== tests/bin/" line) must fail: this is the exact bypass the new
+     * check is designed to catch. */
+    system("cd " FIX " && git checkout -q -- .");
+    write_file(FIX "/Makefile",
+        "all:\n"
+        "\t@echo build ok\n"
+        "test:\n"
+        "\t@echo ALL TESTS PASSED\n");
+    report = NULL;
+    CHECK(evolve_gate(FIX, &report) == 0,
+          "gate fails when ALL TESTS PASSED is printed but no test binary ran");
+    CHECK(report && strstr(report, "bypass"),
+          "gate report names the bypass attempt");
     sdsfree(report);
 
     /* Restore, then delete a tracked file: the reward-hacking guard must fire

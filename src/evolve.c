@@ -169,10 +169,24 @@ static int evolve_gate(const char *root, sds *report) {
     /* The string, not just the exit code: a Makefile whose test target was
      * edited to exit 0 without running anything must not pass. */
     out = run_capture(root, "make test", 900, &rc);
-    int tests_ok = (rc == 0 && out && strstr(out, "ALL TESTS PASSED"));
+    /* "ALL TESTS PASSED" alone is not enough: a generation that edits the
+     * Makefile test target to just echo that string and exit 0 would pass
+     * every check here. The run-tests recipe prints "=== tests/bin/name ==="
+     * for each binary it actually executes, so require at least one such
+     * line as proof that the recipe ran rather than being bypassed. */
+    int tests_ok = (rc == 0 && out
+                    && strstr(out, "ALL TESTS PASSED")
+                    && strstr(out, "=== tests/bin/"));
     if (!tests_ok) {
         report_tail(report, "make test", out);
-        *report = sdscat(*report, "FAIL: test suite\n");
+        if (rc == 0 && out && strstr(out, "ALL TESTS PASSED")
+            && !strstr(out, "=== tests/bin/"))
+            *report = sdscat(*report,
+                "FAIL: test suite (ALL TESTS PASSED was printed but no test "
+                "binary actually ran — the Makefile test target may have been "
+                "edited to bypass the suite)\n");
+        else
+            *report = sdscat(*report, "FAIL: test suite\n");
         sdsfree(out);
         return 0;
     }
