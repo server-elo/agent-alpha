@@ -197,40 +197,90 @@ static void pt_sample(proctrack_t *t, pid_t root) {
  * uid or a sandbox; that is out of scope for a tool whose README already
  * declares security off. */
 static void pt_sample_fd(proctrack_t *t, uint64_t ino, pid_t self) {
-    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
-    size_t len = 0;
-    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || len == 0) return;
-    struct kinfo_proc *procs = malloc(len);
-    if (!procs) return;
-    if (sysctl(mib, 4, procs, &len, NULL, 0) != 0) { free(procs); return; }
-    int count = (int)(len / sizeof(struct kinfo_proc));
+    /* proc_pidfdinfo hangs in the kernel on File Provider-backed fds (iCloud,
+     * Desktop). SIGALRM cannot interrupt an uninterruptible kernel wait, so
+     * the scan runs in a child process that is killed if it takes too long.
+     * Without this a single hung call blocks the entire timeout cleanup path,
+     * and the daemonizing-grandchild test never finishes. */
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return;
+    pid_t child = fork();
+    if (child < 0) { close(pipefd[0]); close(pipefd[1]); return; }
+    if (child == 0) {
+        close(pipefd[0]);
+        int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+        size_t len = 0;
+        if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || len == 0) _exit(0);
+        struct kinfo_proc *procs = malloc(len);
+        if (!procs) _exit(0);
+        if (sysctl(mib, 4, procs, &len, NULL, 0) != 0) { free(procs); _exit(0); }
+        int count = (int)(len / sizeof(struct kinfo_proc));
 
-    struct proc_fdinfo *fds = NULL;
-    int fds_cap = 0;
-    for (int i = 0; i < count; i++) {
-        pid_t pid = procs[i].kp_proc.p_pid;
-        if (pid <= 1 || pid == self || pt_has(t, pid)) continue;
-        int sz = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, NULL, 0);
-        if (sz <= 0) continue;                  /* gone, or not ours to inspect */
-        if (sz > fds_cap) {
-            struct proc_fdinfo *nb = realloc(fds, (size_t)sz);
-            if (!nb) break;
-            fds = nb;
-            fds_cap = sz;
+        struct proc_fdinfo *fds = NULL;
+        int fds_cap = 0;
+        for (int i = 0; i < count; i++) {
+            pid_t pid = procs[i].kp_proc.p_pid;
+            if (pid <= 1 || pid == self) continue;
+            int sz = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, NULL, 0);
+            if (sz <= 0) continue;
+            if (sz > fds_cap) {
+                struct proc_fdinfo *nb = realloc(fds, (size_t)sz);
+                if (!nb) break;
+                fds = nb;
+                fds_cap = sz;
+            }
+            sz = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds, fds_cap);
+            if (sz <= 0) continue;
+            int nfd = sz / (int)sizeof(struct proc_fdinfo);
+            for (int f = 0; f < nfd; f++) {
+                if (fds[f].proc_fdtype != PROX_FDTYPE_VNODE) continue;
+                /* PROC_PIDFDVNODEINFO, not PROC_PIDFDVNODEPATHINFO: we only
+                 * need the inode, and the path-resolving variant hangs in the
+                 * kernel on File Provider-backed fds (iCloud, Desktop). */
+                struct vnode_fdinfo v;
+                if (proc_pidfdinfo(pid, fds[f].proc_fd, PROC_PIDFDVNODEINFO,
+                                   &v, sizeof(v)) < (int)sizeof(v)) continue;
+                if (v.pvi.vi_stat.vst_ino == ino) {
+                    /* Write the found pid to the pipe, one at a time. */
+                    pid_t found = pid;
+                    if (write(pipefd[1], &found, sizeof(found)) != sizeof(found)) break;
+                }
+            }
         }
-        sz = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds, fds_cap);
-        if (sz <= 0) continue;
-        int nfd = sz / (int)sizeof(struct proc_fdinfo);
-        for (int f = 0; f < nfd; f++) {
-            if (fds[f].proc_fdtype != PROX_FDTYPE_VNODE) continue;
-            struct vnode_fdinfowithpath v;
-            if (proc_pidfdinfo(pid, fds[f].proc_fd, PROC_PIDFDVNODEPATHINFO,
-                               &v, sizeof(v)) < (int)sizeof(v)) continue;
-            if (v.pvip.vip_vi.vi_stat.vst_ino == ino) { pt_add(t, pid); break; }
-        }
+        free(fds);
+        free(procs);
+        close(pipefd[1]);
+        _exit(0);
     }
-    free(fds);
-    free(procs);
+
+    /* Parent: read results with a 5s timeout. */
+    close(pipefd[1]);
+    fcntl(pipefd[0], F_SETFL, fcntl(pipefd[0], F_GETFL) | O_NONBLOCK);
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        pid_t found = 0;
+        ssize_t r = read(pipefd[0], &found, sizeof(found));
+        if (r == sizeof(found)) pt_add(t, found);
+        int status = 0;
+        if (waitpid(child, &status, WNOHANG) == child) {
+            /* Drain any remaining pids. */
+            while (read(pipefd[0], &found, sizeof(found)) == sizeof(found))
+                pt_add(t, found);
+            break;
+        }
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double el = (double)(t1.tv_sec - t0.tv_sec) +
+                    (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+        if (el > 5.0) {
+            kill(child, SIGKILL);
+            waitpid(child, &status, 0);
+            break;
+        }
+        usleep(20000);
+    }
+    close(pipefd[0]);
 }
 
 #else  /* ALPHA_PT_PROC — Linux and anything else with a /proc filesystem */
