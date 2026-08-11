@@ -275,7 +275,17 @@ static void pt_sample_fd(proctrack_t *t, uint64_t ino, pid_t self) {
                     (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
         if (el > 5.0) {
             kill(child, SIGKILL);
-            waitpid(child, &status, 0);
+            /* SIGKILL cannot kill a process stuck in D-state (uninterruptible
+             * kernel wait — proc_pidfdinfo on a File Provider fd). A blocking
+             * waitpid would hang forever, so poll with a short grace period
+             * and give up if the child is still alive. It will be reaped by
+             * launchd when the kernel call eventually returns. */
+            int grace = 0;
+            while (grace < 20) {  /* 20 * 100ms = 2s grace */
+                if (waitpid(child, &status, WNOHANG) == child) break;
+                usleep(100000);
+                grace++;
+            }
             break;
         }
         usleep(20000);
@@ -508,7 +518,14 @@ static sds shell_run(const char *cmd, const char *cwd) {
         pt_sample(&track, pid);
         pt_sample_fd(&track, out_ino, getpid());
         pt_kill_all(&track);
-        waitpid(pid, &status, 0);
+        /* The shell itself is unlikely to be in D-state, but a blocking
+         * waitpid is still a risk: poll with a short grace period. */
+        int grace = 0;
+        while (grace < 20) {  /* 20 * 100ms = 2s grace */
+            if (waitpid(pid, &status, WNOHANG) == pid) break;
+            usleep(100000);
+            grace++;
+        }
     }
 
     sds out = read_file_all(outf, 200000);
@@ -630,7 +647,15 @@ static sds list_dir(const char *path) {
     }
     if (waited >= 90) {
         kill(pid, SIGKILL);
-        waitpid(pid, &status, 0);
+        /* SIGKILL cannot kill a process stuck in D-state (uninterruptible
+         * kernel wait — opendir on a File Provider directory). Poll with a
+         * short grace period instead of blocking forever. */
+        int grace = 0;
+        while (grace < 20) {  /* 20 * 100ms = 2s grace */
+            if (waitpid(pid, &status, WNOHANG) == pid) break;
+            usleep(100000);
+            grace++;
+        }
         close(pipefd[0]);
         return sdscatprintf(sdsempty(),
             "ERROR: list_dir timed out after 8s on %s\n"
