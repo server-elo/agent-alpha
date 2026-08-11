@@ -87,11 +87,17 @@ terminal, and when `NO_COLOR` is set.
 
 ## Tools
 
-`execute_bash`, `read_file`, `write_file`, `edit_file`, `list_dir`, `browser`.
+`execute_bash`, `read_file`, `write_file`, `edit_file`, `list_dir`, `browser`,
+`web_search`.
 
 The browser tool drives an existing Chrome over the DevTools protocol: one
 sticky tab, `snapshot` before `click`. Start Chrome with
 `--remote-debugging-port=9222`.
+
+`web_search` fetches results from DuckDuckGo's HTML endpoint (no API key, no
+JavaScript). It returns title, URL and snippet for each result. One HTTP POST,
+typically 0.5–2s. Rate-limited requests are detected and reported as a clear
+error.
 
 ## Telegram
 

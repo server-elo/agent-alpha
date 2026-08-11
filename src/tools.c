@@ -3,6 +3,7 @@
 #include <sys/types.h>
 #include <signal.h>
 #include <stdint.h>
+#include <curl/curl.h>
 
 /* Descendant tracking needs the kernel process table, and there is no portable
  * way to read it. macOS has no /proc, so it goes through sysctl + libproc;
@@ -695,6 +696,263 @@ static sds list_dir(const char *path) {
     return out;
 }
 
+/* --- web_search: DuckDuckGo HTML (no API key, no JS) ----------------------
+ *
+ * Fetches the non-JS HTML search at html.duckduckgo.com/html/ and extracts
+ * title, URL, and snippet from each result. No API key, no rate limit, no
+ * JavaScript — just a single HTTP GET and a small HTML parser.
+ *
+ * The HTML structure is stable: each result is a <div class="result"> with
+ * <h2 class="result__title"><a class="result__a" href="...">title</a></h2>
+ * and <a class="result__snippet">snippet</a>. The URL is extracted from the
+ * href on the title link, which goes through DuckDuckGo's redirector
+ * (//duckduckgo.com/l/?uddg=ENCODED_URL&rut=...). We decode the uddg
+ * parameter to get the real URL.
+ *
+ * Timeout: 8s connect, 12s total. Returns up to 20 results. */
+
+/* libcurl write callback: append to sds */
+struct ws_buf { sds data; };
+static size_t ws_write_cb(char *ptr, size_t sz, size_t nmemb, void *ud) {
+    struct ws_buf *b = ud;
+    size_t n = sz * nmemb;
+    b->data = sdscatlen(b->data, ptr, n);
+    return n;
+}
+
+/* Decode a URL-encoded string in-place. Returns the new length. */
+static size_t url_decode_inplace(char *s) {
+    char *w = s;
+    for (const char *r = s; *r; r++) {
+        if (*r == '%' && r[1] && r[2]) {
+            int hi = r[1] >= 'a' ? r[1] - 'a' + 10 : r[1] >= 'A' ? r[1] - 'A' + 10 : r[1] - '0';
+            int lo = r[2] >= 'a' ? r[2] - 'a' + 10 : r[2] >= 'A' ? r[2] - 'A' + 10 : r[2] - '0';
+            *w++ = (char)((hi << 4) | lo);
+            r += 2;
+        } else if (*r == '+') {
+            *w++ = ' ';
+        } else {
+            *w++ = *r;
+        }
+    }
+    *w = 0;
+    return (size_t)(w - s);
+}
+
+/* Extract the real URL from a DuckDuckGo redirector href like:
+ * //duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&rut=... */
+static sds ddg_decode_url(const char *href) {
+    if (!href) return sdsempty();
+    /* Find uddg= parameter */
+    const char *p = strstr(href, "uddg=");
+    if (!p) {
+        /* Not a redirector link — use as-is, stripping leading // */
+        if (href[0] == '/' && href[1] == '/') href += 2;
+        return sdsnew(href);
+    }
+    p += 5; /* skip "uddg=" */
+    /* Copy until & or end */
+    sds enc = sdsempty();
+    while (*p && *p != '&') { enc = sdscatlen(enc, p, 1); p++; }
+    url_decode_inplace(enc);
+    return enc;
+}
+
+/* Strip HTML tags from a string in-place. Also decodes common entities. */
+static void strip_html(char *s) {
+    char *w = s;
+    int in_tag = 0;
+    for (const char *r = s; *r; r++) {
+        if (*r == '<') { in_tag = 1; continue; }
+        if (*r == '>') { in_tag = 0; continue; }
+        if (in_tag) continue;
+        /* Decode common entities */
+        if (strncmp(r, "&amp;", 5) == 0) { *w++ = '&'; r += 4; continue; }
+        if (strncmp(r, "&lt;", 4) == 0)  { *w++ = '<'; r += 3; continue; }
+        if (strncmp(r, "&gt;", 4) == 0)  { *w++ = '>'; r += 3; continue; }
+        if (strncmp(r, "&quot;", 6) == 0) { *w++ = '"'; r += 5; continue; }
+        if (strncmp(r, "&#x27;", 6) == 0) { *w++ = '\''; r += 5; continue; }
+        if (strncmp(r, "&#39;", 5) == 0) { *w++ = '\''; r += 4; continue; }
+        *w++ = *r;
+    }
+    *w = 0;
+}
+
+/* Collapse whitespace: replace runs of space/tab/newline with a single space,
+ * trim leading/trailing. */
+static void collapse_ws(char *s) {
+    char *w = s;
+    int space = 0;
+    for (const char *r = s; *r; r++) {
+        if (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r') {
+            if (w > s) space = 1;
+            continue;
+        }
+        if (space) { *w++ = ' '; space = 0; }
+        *w++ = *r;
+    }
+    *w = 0;
+    /* Trim trailing space */
+    while (w > s && (w[-1] == ' ' || w[-1] == '\t')) { w--; *w = 0; }
+}
+
+static sds web_search(const char *query, int max_results) {
+    if (!query || !query[0])
+        return sdsnew("ERROR: query required for web_search");
+
+    if (max_results <= 0 || max_results > 20) max_results = 10;
+
+    /* URL-encode the query */
+    sds enc = sdsempty();
+    for (const unsigned char *p = (const unsigned char *)query; *p; p++) {
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+            (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.' ||
+            *p == '~')
+            enc = sdscatlen(enc, (const char *)p, 1);
+        else if (*p == ' ')
+            enc = sdscatlen(enc, "+", 1);
+        else
+            enc = sdscatprintf(enc, "%%%02X", *p);
+    }
+
+    /* Build POST body: q=<encoded query>. Must live until curl_easy_cleanup
+     * because CURLOPT_POSTFIELDS uses the pointer directly, not a copy. */
+    sds post_body = sdscatprintf(sdsempty(), "q=%s", enc);
+    sdsfree(enc);
+
+    CURL *curl = curl_easy_init();
+    if (!curl) { sdsfree(post_body); return sdsnew("ERROR: curl_easy_init failed"); }
+
+    struct ws_buf buf = { .data = sdsempty() };
+    curl_easy_setopt(curl, CURLOPT_URL, "https://html.duckduckgo.com/html/");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_body);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ws_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 12L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT,
+                     "Mozilla/5.0 (compatible; AgentAlpha/1.0)");
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
+
+    CURLcode rc = curl_easy_perform(curl);
+    long http_code = 0;
+    if (rc == CURLE_OK)
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_cleanup(curl);
+    /* post_body freed AFTER curl_easy_cleanup — CURLOPT_POSTFIELDS borrows it */
+    sdsfree(post_body);
+
+    if (rc != CURLE_OK) {
+        sdsfree(buf.data);
+        return sdscatprintf(sdsempty(),
+            "ERROR: web_search request failed: %s", curl_easy_strerror(rc));
+    }
+    if (http_code != 200) {
+        sdsfree(buf.data);
+        return sdscatprintf(sdsempty(),
+            "ERROR: web_search returned HTTP %ld", http_code);
+    }
+
+    /* Detect DuckDuckGo CAPTCHA / bot-detection page */
+    if (strstr(buf.data, "anomaly-modal") || strstr(buf.data, "g-recaptcha")) {
+        sdsfree(buf.data);
+        return sdsnew("ERROR: web_search was rate-limited (CAPTCHA). "
+                      "Wait a moment and try again.");
+    }
+
+    /* Parse the HTML. We look for <div class="result ..."> blocks and extract
+     * the title link and snippet from each. This is a deliberate minimal
+     * parser — no full HTML parse tree, just strstr on the known class names.
+     * DuckDuckGo's HTML output is machine-generated and stable. */
+    sds out = sdscatprintf(sdsempty(), "WEB SEARCH RESULTS for \"%s\"\n\n", query);
+    const char *html = buf.data;
+    int found = 0;
+    const char *pos = html;
+
+    while (found < max_results) {
+        /* Find next result block */
+        const char *div = strstr(pos, "class=\"result");
+        if (!div) break;
+        /* Make sure it's a result div, not some other "result*" class */
+        if (div[13] != '"' && div[13] != ' ') { pos = div + 13; continue; }
+        pos = div + 1;
+
+        /* Extract title: <h2 class="result__title"><a ...>TITLE</a></h2> */
+        const char *h2 = strstr(div, "result__title");
+        if (!h2) continue;
+        const char *a_start = strstr(h2, "<a ");
+        if (!a_start) continue;
+        const char *href_start = strstr(a_start, "href=\"");
+        if (!href_start) { /* try href=' */
+            href_start = strstr(a_start, "href='");
+            if (!href_start) continue;
+        }
+        char quote = href_start[5]; /* " or ' */
+        href_start += 6; /* skip href=" */
+        const char *href_end = strchr(href_start, quote);
+        if (!href_end) continue;
+        size_t href_len = (size_t)(href_end - href_start);
+        char href_buf[2048];
+        if (href_len >= sizeof(href_buf)) href_len = sizeof(href_buf) - 1;
+        memcpy(href_buf, href_start, href_len);
+        href_buf[href_len] = 0;
+
+        /* Decode the real URL from the DDG redirector */
+        sds real_url = ddg_decode_url(href_buf);
+
+        /* Extract title text between <a ...> and </a> */
+        const char *title_start = strchr(a_start, '>');
+        if (!title_start) { sdsfree(real_url); continue; }
+        title_start++; /* skip > */
+        const char *title_end = strstr(title_start, "</a>");
+        if (!title_end) { sdsfree(real_url); continue; }
+        size_t title_len = (size_t)(title_end - title_start);
+        char title_buf[512];
+        if (title_len >= sizeof(title_buf)) title_len = sizeof(title_buf) - 1;
+        memcpy(title_buf, title_start, title_len);
+        title_buf[title_len] = 0;
+        strip_html(title_buf);
+        collapse_ws(title_buf);
+
+        /* Extract snippet: <a class="result__snippet" ...>SNIPPET</a> */
+        const char *snip_tag = strstr(div, "result__snippet");
+        const char *snip_start = NULL;
+        const char *snip_end = NULL;
+        if (snip_tag) {
+            snip_start = strchr(snip_tag, '>');
+            if (snip_start) {
+                snip_start++;
+                snip_end = strstr(snip_start, "</a>");
+            }
+        }
+        char snip_buf[1024] = "";
+        if (snip_start && snip_end && snip_end > snip_start) {
+            size_t snip_len = (size_t)(snip_end - snip_start);
+            if (snip_len >= sizeof(snip_buf)) snip_len = sizeof(snip_buf) - 1;
+            memcpy(snip_buf, snip_start, snip_len);
+            snip_buf[snip_len] = 0;
+            strip_html(snip_buf);
+            collapse_ws(snip_buf);
+        }
+
+        found++;
+        out = sdscatprintf(out, "%d. %s\n   %s\n", found, title_buf, real_url);
+        if (snip_buf[0])
+            out = sdscatprintf(out, "   %s\n", snip_buf);
+        out = sdscat(out, "\n");
+        sdsfree(real_url);
+    }
+
+    sdsfree(buf.data);
+
+    if (found == 0)
+        out = sdscat(out, "(no results)\n");
+
+    return out;
+}
+
 sds tools_run(const char *name, cJSON *args, const char *cwd) {
     if (!name) return sdsnew("ERROR: no tool name");
     if (!args) args = cJSON_CreateObject();
@@ -838,6 +1096,15 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
     if (strcmp(name, "browser") == 0 || strcmp(name, "web_browser") == 0) {
         return browser_tool_run(args);
     }
+    if (strcmp(name, "web_search") == 0) {
+        const char *query = cJSON_GetStringValue(cJSON_GetObjectItem(args, "query"));
+        if (!query || !query[0])
+            return sdsnew("ERROR: query required for web_search");
+        int max_results = 10;
+        cJSON *mr = cJSON_GetObjectItem(args, "max_results");
+        if (cJSON_IsNumber(mr)) max_results = mr->valueint;
+        return web_search(query, max_results);
+    }
     return sdscatprintf(sdsempty(), "ERROR: unknown tool %s", name);
 }
 
@@ -862,7 +1129,8 @@ cJSON *tools_schema(void) {
         "{\"type\":\"function\",\"function\":{\"name\":\"list_dir\","
         "\"description\":\"List directory entries (any path).\",\"parameters\":{\"type\":\"object\",\"properties\":{"
         "\"path\":{\"type\":\"string\"}}}}},"
-        "{\"type\":\"function\",\"function\":{\"name\":\"browser\",\"description\":\"Pure-C browser. ONE sticky CDP tab. Loop: status/tabs -> open/navigate -> snapshot -> click/type/press/eval. close_others cleans junk. NEVER bash for click. Login/OAuth: snapshot+one click then stop. PROOF required.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\"},\"url\":{\"type\":\"string\"},\"selector\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"expression\":{\"type\":\"string\"},\"tab_id\":{\"type\":\"string\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"}},\"required\":[]}}}"
+        "{\"type\":\"function\",\"function\":{\"name\":\"browser\",\"description\":\"Pure-C browser. ONE sticky CDP tab. Loop: status/tabs -> open/navigate -> snapshot -> click/type/press/eval. close_others cleans junk. NEVER bash for click. Login/OAuth: snapshot+one click then stop. PROOF required.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\"},\"url\":{\"type\":\"string\"},\"selector\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"expression\":{\"type\":\"string\"},\"tab_id\":{\"type\":\"string\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"}},\"required\":[]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"description\":\"Search the web via DuckDuckGo HTML (no API key, no JS). Returns title, URL, and snippet for each result. Fast: one HTTP GET, ~0.5-2s.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Search query\"},\"max_results\":{\"type\":\"integer\",\"description\":\"Max results (1-20, default 10)\"}},\"required\":[\"query\"]}}}"
         "]";
     return cJSON_Parse(json);
 }
