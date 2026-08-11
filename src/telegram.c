@@ -397,12 +397,34 @@ static sds voice_transcribe(const char *audio_path) {
         fprintf(stderr, "[alpha-tg] transcriber exceeded %ds, killing pid %d\n",
                 ALPHA_VOICE_TIMEOUT_MS / 1000, (int)pid);
         kill(pid, SIGKILL);
-        waitpid(pid, &status, 0);
+        /* SIGKILL cannot kill a process stuck in D-state (uninterruptible
+         * kernel wait). A blocking waitpid would hang the poll thread forever,
+         * so poll with a short grace period and give up if the child is still
+         * alive. It will be reaped by launchd when the call returns. */
+        {
+            int grace = 0;
+            while (grace < 20) {  /* 20 * 100ms = 2s grace */
+                if (waitpid(pid, &status, WNOHANG) == pid) break;
+                usleep(100000);
+                grace++;
+            }
+        }
         sdsfree(text);
         sdsfree(err);
         return NULL;
     }
-    waitpid(pid, &status, 0);
+    /* The normal path: the child exited cleanly, so a blocking waitpid is
+     * safe — but a process that was killed by SIGKILL in the timed_out path
+     * above may still be in D-state, so use the same poll pattern here too
+     * for consistency. */
+    {
+        int grace = 0;
+        while (grace < 20) {  /* 20 * 100ms = 2s grace */
+            if (waitpid(pid, &status, WNOHANG) == pid) break;
+            usleep(100000);
+            grace++;
+        }
+    }
     sdstrim(text, " \t\r\n");
     sdstrim(err, " \t\r\n");
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || sdslen(text) == 0) {

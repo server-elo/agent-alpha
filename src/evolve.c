@@ -112,7 +112,16 @@ static sds run_capture(const char *cwd, const char *cmd, int timeout_sec, int *o
         double el = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
         if (el > (double)timeout_sec) {
             kill(-pid, SIGKILL);
-            waitpid(pid, &status, 0);
+            /* SIGKILL cannot kill a process stuck in D-state (uninterruptible
+             * kernel wait). A blocking waitpid would hang the gate forever, so
+             * poll with a short grace period and give up if the child is still
+             * alive. It will be reaped by launchd when the call returns. */
+            int grace = 0;
+            while (grace < 20) {  /* 20 * 100ms = 2s grace */
+                if (waitpid(pid, &status, WNOHANG) == pid) break;
+                usleep(100000);
+                grace++;
+            }
             out = sdscatprintf(out, "\n[evolve] killed after %ds timeout\n", timeout_sec);
             break;
         }

@@ -487,7 +487,18 @@ static sds open_in_browser_app(const char *url) {
     timed_out = 1;
     kill(-pid, SIGKILL);
     kill(pid, SIGKILL);
-    waitpid(pid, &status, 0);
+    /* SIGKILL cannot kill a process stuck in D-state (uninterruptible
+     * kernel wait). A blocking waitpid would hang the browser tool forever,
+     * so poll with a short grace period and give up if the child is still
+     * alive. It will be reaped by launchd when the call returns. */
+    {
+        int grace = 0;
+        while (grace < 20) {  /* 20 * 100ms = 2s grace */
+            if (waitpid(pid, &status, WNOHANG) == pid) break;
+            usleep(100000);
+            grace++;
+        }
+    }
 reaped:
     ;
     FILE *f = fopen(outf, "rb");
