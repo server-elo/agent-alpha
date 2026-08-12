@@ -497,16 +497,47 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
             printf("[evolve] AFTER benchmark comparison: rc=%d, elapsed=%.2fs (vs BEFORE %.2fs)\n", after_rc, after_secs, before_secs);
             fflush(stdout);
 
-            /* Compare execution results and latency:
-             * 1. Must exit 0 cleanly.
-             * 2. Must not produce an ERROR.
-             * 3. Latency must not degrade by more than 50% relative to BEFORE baseline. */
-            if (after_rc != 0 || !after_bench || strstr(after_bench, "ERROR") || after_secs > (before_secs * 1.5 + 2.0)) {
-                ok = 0;
-                report = sdscatprintf(report,
-                    "\nFAIL: AFTER benchmark regression (rc=%d, elapsed=%.2fs vs BEFORE %.2fs)\n",
-                    after_rc, after_secs, before_secs);
+            /* 360° Comprehensive Quality & Performance Evaluation:
+             * 1. Status: Must exit with returncode 0.
+             * 2. Error-free: Must not output "ERROR", "panic", "Segmentation fault", or "undefined".
+             * 3. Response Completeness Quality: Output must contain substantive non-empty answer.
+             * 4. Output Length Quality: Output size must be >= 90% of BEFORE baseline (no truncated/degraded answers).
+             * 5. Execution Speed: Latency must not degrade by more than 50% relative to BEFORE baseline. */
+            size_t b_len = before_bench ? sdslen(before_bench) : 0;
+            size_t a_len = after_bench ? sdslen(after_bench) : 0;
+
+            int failed_quality = 0;
+            sds qual_err = sdsempty();
+
+            if (after_rc != 0) {
+                failed_quality = 1;
+                qual_err = sdscatprintf(qual_err, "Exit code failed (rc=%d vs before %d); ", after_rc, before_rc);
             }
+            if (!after_bench || a_len == 0) {
+                failed_quality = 1;
+                qual_err = sdscat(qual_err, "Empty output; ");
+            }
+            if (after_bench && (strstr(after_bench, "ERROR") || strstr(after_bench, "Segmentation fault") || strstr(after_bench, "panic"))) {
+                failed_quality = 1;
+                qual_err = sdscat(qual_err, "Output contained error/fault keyword; ");
+            }
+            if (b_len > 50 && a_len < (b_len * 9 / 10)) {
+                failed_quality = 1;
+                qual_err = sdscatprintf(qual_err, "Quality degradation: output truncated/shorter (%zu bytes vs before %zu bytes); ", a_len, b_len);
+            }
+            if (after_secs > (before_secs * 1.5 + 2.0)) {
+                failed_quality = 1;
+                qual_err = sdscatprintf(qual_err, "Latency regression (%.2fs vs before %.2fs); ", after_secs, before_secs);
+            }
+
+            if (failed_quality) {
+                ok = 0;
+                report = sdscatprintf(report, "\nFAIL: 360° Quality/Performance Benchmark Regression: %s\n", qual_err);
+            } else {
+                printf("[evolve] 360° Quality Benchmark PASSED: length=%zu vs before %zu, elapsed=%.2fs vs before %.2fs\n",
+                       a_len, b_len, after_secs, before_secs);
+            }
+            sdsfree(qual_err);
             sdsfree(after_bench);
         }
         sdsfree(before_bench);
