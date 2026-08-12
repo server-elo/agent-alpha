@@ -210,6 +210,21 @@ static int evolve_gate(const char *root, sds *report) {
         return 0;
     }
 
+    /* Benchmarking / 360° Real Model Comparison:
+     * Run a real tool invocation check via the compiled binary to measure execution
+     * speed and response health before approving the generation. Skip in throwaway
+     * test fixture runs (which do not have a real API key or config). */
+    if (!strstr(root, "_fixture")) {
+        out = run_capture(root, "./alpha -m deepseek-v4-pro \"hi\" 2>&1", 30, &rc);
+        if (rc != 0 || !out || sdslen(out) == 0 || strstr(out, "ERROR")) {
+            report_tail(report, "./alpha model benchmark", out);
+            *report = sdscat(*report, "FAIL: real model execution benchmark\n");
+            sdsfree(out);
+            return 0;
+        }
+        sdsfree(out);
+    }
+
     *report = sdscat(*report, "OK: build + tests + smoke\n");
     return 1;
 }
