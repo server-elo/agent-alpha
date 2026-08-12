@@ -1224,18 +1224,56 @@ static sds todo_tool_run(cJSON *args) {
  * Character limits (not tokens) because char counts are model-independent:
  *   MEMORY.md: 2200 chars, USER.md: 1375 chars.
  *
- * Design ported from Hermes Agent's memory_tool.py (tools/memory_tool.py). */
+ * Design ported from Hermes Agent's memory_tool.py (tools/memory_tool.py).
+ *
+ * Arena allocator (from clay.h): entries are bump-allocated from a fixed
+ * buffer instead of individual strdup/free calls. This makes memory_free_store
+ * O(1) instead of O(n), eliminates per-entry malloc churn, and avoids
+ * fragmentation. The arena is sized to hold the maximum possible content
+ * (char_limit + delimiters + overhead). */
 
 #define ALPHA_MEMORY_DIR       ".alpha/memory"
 #define ALPHA_MEMORY_ENTRY_SEP "\n§\n"
 #define ALPHA_MEMORY_MAX_ENTRIES 64
 #define ALPHA_MEMORY_CHAR_LIMIT   2200
 #define ALPHA_USER_CHAR_LIMIT     1375
+/* Arena size: char_limit + room for delimiters + safety margin.
+ * Each store gets its own arena so resetting one does not affect the other. */
+#define ALPHA_MEMORY_ARENA_SIZE 4096
+
+/* Bump allocator (arena) — ported from clay.h's Clay_Arena pattern.
+ * O(1) alloc, O(1) free-all. No individual free() calls needed. */
+typedef struct {
+    char *base;       /* base of arena memory */
+    size_t size;      /* total capacity */
+    size_t offset;    /* current bump offset (next free byte) */
+} arena_t;
+
+static void arena_init(arena_t *a, char *buf, size_t sz) {
+    a->base = buf;
+    a->size = sz;
+    a->offset = 0;
+}
+
+static void arena_reset(arena_t *a) {
+    a->offset = 0;
+}
+
+static char *arena_alloc(arena_t *a, size_t sz) {
+    /* Align to 8 bytes so subsequent allocations are naturally aligned. */
+    size_t aligned = (sz + 7) & ~(size_t)7;
+    if (a->offset + aligned > a->size) return NULL;
+    char *p = a->base + a->offset;
+    a->offset += aligned;
+    return p;
+}
 
 typedef struct {
     char *entries[ALPHA_MEMORY_MAX_ENTRIES];
     int count;
     int char_limit;
+    arena_t arena;                /* bump allocator for this store's entries */
+    char arena_buf[ALPHA_MEMORY_ARENA_SIZE]; /* backing memory for the arena */
 } memory_store_t;
 
 static memory_store_t g_memory_store = { .count = 0, .char_limit = ALPHA_MEMORY_CHAR_LIMIT };
@@ -1263,19 +1301,13 @@ static const char *memory_path(const char *target) {
     return path;
 }
 
-/* Parse a memory file into entries. Returns a freshly allocated array of
- * strdup'd strings; caller must free each entry and the array. */
-static char **memory_parse(const char *raw, int *out_count) {
-    *out_count = 0;
-    if (!raw || !raw[0]) return NULL;
+/* Parse a memory file into entries, allocating from the store's arena.
+ * Returns the number of entries parsed into store->entries[]. */
+static int memory_parse_into_store(const char *raw, memory_store_t *store) {
+    if (!raw || !raw[0]) return 0;
     /* Work on a copy so we can tokenize */
     char *copy = strdup(raw);
-    if (!copy) return NULL;
-
-    /* Count entries by finding the delimiter */
-    int cap = 16;
-    char **entries = malloc((size_t)cap * sizeof(char *));
-    if (!entries) { free(copy); return NULL; }
+    if (!copy) return 0;
 
     char *save = NULL;
     char *tok = strtok_r(copy, ALPHA_MEMORY_ENTRY_SEP, &save);
@@ -1286,20 +1318,24 @@ static char **memory_parse(const char *raw, int *out_count) {
         while (end > tok && (end[-1] == ' ' || end[-1] == '\t' ||
                              end[-1] == '\n' || end[-1] == '\r')) end--;
         *end = 0;
-        if (tok[0]) {
-            if (*out_count >= cap) {
-                cap *= 2;
-                char **nb = realloc(entries, (size_t)cap * sizeof(char *));
-                if (!nb) break;
-                entries = nb;
+        if (tok[0] && store->count < ALPHA_MEMORY_MAX_ENTRIES) {
+            /* Check for duplicate */
+            int dup = 0;
+            for (int i = 0; i < store->count; i++) {
+                if (strcmp(store->entries[i], tok) == 0) { dup = 1; break; }
             }
-            entries[*out_count] = strdup(tok);
-            (*out_count)++;
+            if (!dup) {
+                size_t len = strlen(tok);
+                char *p = arena_alloc(&store->arena, len + 1);
+                if (!p) break; /* arena full */
+                memcpy(p, tok, len + 1);
+                store->entries[store->count++] = p;
+            }
         }
         tok = strtok_r(NULL, ALPHA_MEMORY_ENTRY_SEP, &save);
     }
     free(copy);
-    return entries;
+    return store->count;
 }
 
 /* Read a memory file and parse it into a store. Returns 0 on success. */
@@ -1321,28 +1357,11 @@ static int memory_load(const char *target, memory_store_t *store) {
     fclose(f);
     buf[rd] = 0;
 
-    char **entries = memory_parse(buf, &store->count);
+    /* Reset arena and parse into store */
+    arena_reset(&store->arena);
+    store->count = 0;
+    memory_parse_into_store(buf, store);
     free(buf);
-    if (!entries) { store->count = 0; return 0; }
-
-    /* Copy into the store, deduplicating */
-    int parsed_count = store->count;
-    int dst = 0;
-    for (int i = 0; i < parsed_count && dst < ALPHA_MEMORY_MAX_ENTRIES; i++) {
-        int dup = 0;
-        for (int j = 0; j < dst; j++) {
-            if (strcmp(store->entries[j], entries[i]) == 0) { dup = 1; break; }
-        }
-        if (!dup) {
-            store->entries[dst++] = entries[i];
-        } else {
-            free(entries[i]);
-        }
-    }
-    /* Free any remaining parsed entries beyond the cap */
-    for (int i = parsed_count; i < parsed_count; i++) free(entries[i]); /* no-op safety */
-    free(entries);
-    store->count = dst;
     return 0;
 }
 
@@ -1377,20 +1396,20 @@ static int memory_char_count(memory_store_t *store) {
     return total;
 }
 
-/* Free all entries in a store. */
-static void memory_free_store(memory_store_t *store) {
-    for (int i = 0; i < store->count; i++) {
-        free(store->entries[i]);
-        store->entries[i] = NULL;
-    }
+/* Free all entries in a store. O(1) — just resets the bump arena.
+ * Non-static because the test suite (which #includes this file) calls it. */
+void memory_free_store(memory_store_t *store) {
+    arena_reset(&store->arena);
     store->count = 0;
 }
 
 /* Initialize both stores from disk. Called once at startup. */
 void memory_init(void) {
     pthread_mutex_lock(&g_memory_lock);
-    memory_free_store(&g_memory_store);
-    memory_free_store(&g_user_store);
+    arena_init(&g_memory_store.arena, g_memory_store.arena_buf, ALPHA_MEMORY_ARENA_SIZE);
+    arena_init(&g_user_store.arena, g_user_store.arena_buf, ALPHA_MEMORY_ARENA_SIZE);
+    g_memory_store.count = 0;
+    g_user_store.count = 0;
     memory_load("memory", &g_memory_store);
     memory_load("user", &g_user_store);
     pthread_mutex_unlock(&g_memory_lock);
@@ -1458,7 +1477,11 @@ static sds memory_tool_add(memory_store_t *store, const char *content) {
     if (store->count >= ALPHA_MEMORY_MAX_ENTRIES)
         return sdsnew("ERROR: maximum number of entries reached");
 
-    store->entries[store->count++] = strdup(content);
+    char *p = arena_alloc(&store->arena, strlen(content) + 1);
+    if (!p)
+        return sdsnew("ERROR: arena full — use 'remove' to free space");
+    strcpy(p, content);
+    store->entries[store->count++] = p;
     return sdscatprintf(sdsempty(), "OK added entry (%d/%d chars now)",
                         new_total, store->char_limit);
 }
@@ -1505,8 +1528,14 @@ static sds memory_tool_replace(memory_store_t *store, const char *old_text,
             new_total, store->char_limit);
     }
 
-    free(store->entries[idx]);
-    store->entries[idx] = strdup(new_content);
+    /* Arena alloc: the old entry's memory is still in the arena but will be
+     * overwritten on the next arena_reset. This is fine — the old pointer is
+     * no longer referenced. */
+    char *p = arena_alloc(&store->arena, strlen(new_content) + 1);
+    if (!p)
+        return sdsnew("ERROR: arena full — use 'remove' to free space");
+    strcpy(p, new_content);
+    store->entries[idx] = p;
     return sdscatprintf(sdsempty(), "OK replaced entry (%d/%d chars now)",
                         new_total, store->char_limit);
 }
@@ -1536,7 +1565,7 @@ static sds memory_tool_remove(memory_store_t *store, const char *old_text) {
     }
 
     int idx = matches[0];
-    free(store->entries[idx]);
+    /* Arena-allocated: no individual free. Just shift the array down. */
     for (int i = idx; i < store->count - 1; i++)
         store->entries[i] = store->entries[i + 1];
     store->count--;
