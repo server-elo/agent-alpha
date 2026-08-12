@@ -376,28 +376,33 @@ static sds log_tail(const char *root, int max_lines) {
 /* --- prompt ---------------------------------------------------------------- */
 
 static sds build_prompt(const char *root, const char *goal, int gen) {
-    sds tail = log_tail(root, 12);
+    sds tail = log_tail(root, 15);
     sds p = sdscatprintf(sdsempty(),
         "You are Agent Alpha, and you are evolving your own source code. Your working\n"
         "directory is the source tree of the binary you are running as: %s\n"
         "\n"
         "GOAL: %s\n"
         "\n"
+        "PERSISTENT PROJECT & EVOLUTION MEMORY:\n"
+        "Use the native `memory` tool (action=add target=memory) to track your exact project position across generations.\n"
+        "Record: (1) Current repo being inspected (e.g. Hermes Agent or GitHub repo), (2) List of files already inspected line-by-line,\n"
+        "(3) Next batch of files to inspect, (4) Reverse-engineering candidates to port next to native C11.\n"
+        "\n"
         "Rules that keep you alive:\n"
         "1. One small, focused improvement per generation. Read code before editing it.\n"
-        "2. After editing, prove it yourself: `make -j4` and `make test` must both pass.\n"
-        "3. NEVER delete or weaken tests, the Makefile, or source files to make the suite\n"
+        "2. Use `todo` to plan your steps, and `memory` to save project inspection state across re-executions.\n"
+        "3. After editing, prove it yourself: `make -j4` and `make test` must both pass.\n"
+        "4. NEVER delete or weaken tests, the Makefile, or source files to make the suite\n"
         "   pass. The driver checks for exactly that and reverts the whole generation.\n"
-        "4. C11, -Wall -Wextra clean. Match the existing style, including its habit of\n"
+        "5. C11, -Wall -Wextra clean. Match the existing style, including its habit of\n"
         "   explaining WHY a non-obvious line exists.\n"
-        "5. If behaviour changes, update README.md in the same generation.\n"
-        "6. The evolution log below records earlier generations. A reverted mutation is a\n"
+        "6. If behaviour changes, update README.md in the same generation.\n"
+        "7. The evolution log below records earlier generations. A reverted mutation is a\n"
         "   dead end -- do not repeat it.\n"
         "\n"
-        "When you stop, the driver re-runs the gate itself: build, full test suite, and a\n"
-        "smoke test of the new binary. If anything fails, `git reset --hard` reverts every\n"
-        "change you made and the failure is logged. If it passes, your changes are\n"
-        "committed as generation %d and the binary on disk becomes your improved self.\n"
+        "When you stop, the driver re-runs the gate itself: build, full test suite, and 360° Before/After Quality Benchmarks.\n"
+        "If anything fails or degrades, `git reset --hard` reverts every change you made. If it passes, your changes are\n"
+        "committed as generation %d and the binary on disk re-executes into your improved self.\n"
         "\n"
         "Evolution log so far:\n%s",
         root, goal, gen, tail);
