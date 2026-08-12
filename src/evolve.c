@@ -466,6 +466,16 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
                g + 1, generations, gen);
         fflush(stdout);
 
+        /* 1. BEFORE Benchmark: Run pre-mutation baseline benchmark on current binary */
+        int before_rc = -1;
+        struct timespec b_t0, b_t1;
+        clock_gettime(CLOCK_MONOTONIC, &b_t0);
+        sds before_bench = run_capture(root, "./alpha -m deepseek-v4-pro \"Use memory tool to add entry bench_before='val_before' then retrieve memory\" 2>&1", 45, &before_rc);
+        clock_gettime(CLOCK_MONOTONIC, &b_t1);
+        double before_secs = (double)(b_t1.tv_sec - b_t0.tv_sec) + (double)(b_t1.tv_nsec - b_t0.tv_nsec) / 1e9;
+        printf("[evolve] BEFORE baseline benchmark: rc=%d, elapsed=%.2fs\n", before_rc, before_secs);
+        fflush(stdout);
+
         sds prompt = build_prompt(root, goal, gen);
         sds reply = agent_run(cfg, prompt);
         sdsfree(prompt);
@@ -475,6 +485,32 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
 
         sds report = NULL;
         int ok = !alpha_cancel && (reply && reply[0] && strcmp(reply, "ERROR: empty response from LLM") != 0) && evolve_gate(root, &report);
+
+        /* 2. AFTER Benchmark & Comparison: Run post-mutation benchmark on new binary */
+        if (ok) {
+            int after_rc = -1;
+            struct timespec a_t0, a_t1;
+            clock_gettime(CLOCK_MONOTONIC, &a_t0);
+            sds after_bench = run_capture(root, "./alpha -m deepseek-v4-pro \"Use memory tool to add entry bench_after='val_after' then retrieve memory\" 2>&1", 45, &after_rc);
+            clock_gettime(CLOCK_MONOTONIC, &a_t1);
+            double after_secs = (double)(a_t1.tv_sec - a_t0.tv_sec) + (double)(a_t1.tv_nsec - a_t0.tv_nsec) / 1e9;
+            printf("[evolve] AFTER benchmark comparison: rc=%d, elapsed=%.2fs (vs BEFORE %.2fs)\n", after_rc, after_secs, before_secs);
+            fflush(stdout);
+
+            /* Compare execution results and latency:
+             * 1. Must exit 0 cleanly.
+             * 2. Must not produce an ERROR.
+             * 3. Latency must not degrade by more than 50% relative to BEFORE baseline. */
+            if (after_rc != 0 || !after_bench || strstr(after_bench, "ERROR") || after_secs > (before_secs * 1.5 + 2.0)) {
+                ok = 0;
+                report = sdscatprintf(report,
+                    "\nFAIL: AFTER benchmark regression (rc=%d, elapsed=%.2fs vs BEFORE %.2fs)\n",
+                    after_rc, after_secs, before_secs);
+            }
+            sdsfree(after_bench);
+        }
+        sdsfree(before_bench);
+
         if (!report) report = sdsnew(alpha_cancel ? "interrupted\n" : (!reply || !reply[0] || strcmp(reply, "ERROR: empty response from LLM") == 0) ? "FAIL: empty LLM response\n" : "");
 
         /* Audit flag: a generation that touched the tests or the Makefile is
