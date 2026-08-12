@@ -226,12 +226,51 @@ static sds build_url(const alpha_cfg_t *cfg) {
     return sdscatprintf(sdsempty(), "%.*s/chat/completions", (int)blen, base);
 }
 
+/* Strip or replace bytes that are not valid UTF-8. The Ark coding endpoint
+ * rejects the entire request body when any byte sequence is invalid UTF-8,
+ * which happens when tool output contains binary data. Operates in-place. */
+static void sanitize_utf8(sds s) {
+    size_t i, j = 0;
+    size_t len = sdslen(s);
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c <= 0x7F) {
+            s[j++] = s[i];                     /* 1-byte (ASCII) */
+        } else if (c >= 0xC2 && c <= 0xDF && i + 1 < len &&
+                   (unsigned char)s[i+1] >= 0x80 && (unsigned char)s[i+1] <= 0xBF) {
+            s[j++] = s[i++];                    /* 2-byte */
+            s[j++] = s[i];
+        } else if (c >= 0xE0 && c <= 0xEF && i + 2 < len &&
+                   (unsigned char)s[i+1] >= 0x80 && (unsigned char)s[i+1] <= 0xBF &&
+                   (unsigned char)s[i+2] >= 0x80 && (unsigned char)s[i+2] <= 0xBF) {
+            s[j++] = s[i++];                    /* 3-byte */
+            s[j++] = s[i++];
+            s[j++] = s[i];
+        } else if (c >= 0xF0 && c <= 0xF4 && i + 3 < len &&
+                   (unsigned char)s[i+1] >= 0x80 && (unsigned char)s[i+1] <= 0xBF &&
+                   (unsigned char)s[i+2] >= 0x80 && (unsigned char)s[i+2] <= 0xBF &&
+                   (unsigned char)s[i+3] >= 0x80 && (unsigned char)s[i+3] <= 0xBF) {
+            s[j++] = s[i++];                    /* 4-byte */
+            s[j++] = s[i++];
+            s[j++] = s[i++];
+            s[j++] = s[i];
+        } else {
+            s[j++] = '?';                        /* invalid byte -> replacement */
+        }
+    }
+    s[j] = 0;
+    sdssetlen(s, j);
+}
+
 /* Build the request body. Separate from the transport so the suite can assert
  * what is actually sent for a given config -- the previous test grepped this
  * file for a literal `"stream":true`, which proved only that the string existed
  * somewhere, and went stale the moment the flag became configurable. */
 static sds build_request_body(const alpha_cfg_t *cfg, cJSON *messages, int with_tools) {
-    char *msgs_s = cJSON_PrintUnformatted(messages);
+    char *msgs_raw = cJSON_PrintUnformatted(messages);
+    sds msgs_s = sdsnew(msgs_raw);
+    free(msgs_raw);
+    sanitize_utf8(msgs_s);
     const char *model = (cfg->model && cfg->model[0]) ? cfg->model : "local";
     int max_tokens = cfg->max_tokens > 0 ? cfg->max_tokens : 8192;
     double temp = cfg->temperature > 0.0 ? cfg->temperature : 0.2;
