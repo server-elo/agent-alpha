@@ -142,6 +142,53 @@ static void report_tail(sds *report, const char *label, sds out) {
                            label, keep, (int)keep, out + n - keep);
 }
 
+/* Run domain-specific 360° benchmark tasks based on modified files or goal topic */
+static int run_domain_benchmark(const char *root, sds *report) {
+    int rc = -1;
+    sds status = run_capture(root, "git status --porcelain", 30, &rc);
+    if (rc != 0 || !status) { sdsfree(status); return 1; }
+
+    /* Detect domain */
+    int is_memory = (strstr(status, "memory") != NULL);
+    int is_search = (strstr(status, "web_search") != NULL || strstr(status, "search") != NULL);
+    int is_tools  = (strstr(status, "tools") != NULL || strstr(status, "edit") != NULL);
+    sdsfree(status);
+
+    if (is_memory) {
+        /* Domain Task: Memory Store + Retrieve + Replace Benchmark */
+        sds out = run_capture(root, "./alpha -m deepseek-v4-pro \"Use memory tool to add entry test_key_999='domain_bench_value' then retrieve memory\" 2>&1", 45, &rc);
+        if (rc != 0 || !out || strstr(out, "ERROR") || !strstr(out, "domain_bench_value")) {
+            report_tail(report, "Domain Benchmark: Memory Tool", out);
+            *report = sdscat(*report, "FAIL: 360° Memory Domain Benchmark\n");
+            sdsfree(out);
+            return 0;
+        }
+        sdsfree(out);
+    } else if (is_search) {
+        /* Domain Task: Web Search Speed & Parsing Benchmark */
+        sds out = run_capture(root, "./alpha -m deepseek-v4-pro \"Use web_search to find latest C11 standard details\" 2>&1", 45, &rc);
+        if (rc != 0 || !out || strstr(out, "ERROR")) {
+            report_tail(report, "Domain Benchmark: Web Search Tool", out);
+            *report = sdscat(*report, "FAIL: 360° Web Search Domain Benchmark\n");
+            sdsfree(out);
+            return 0;
+        }
+        sdsfree(out);
+    } else if (is_tools) {
+        /* Domain Task: File Editing & Execution Benchmark */
+        sds out = run_capture(root, "./alpha -m deepseek-v4-pro \"List files in current dir and report count\" 2>&1", 45, &rc);
+        if (rc != 0 || !out || strstr(out, "ERROR")) {
+            report_tail(report, "Domain Benchmark: Tools & File Execution", out);
+            *report = sdscat(*report, "FAIL: 360° Tools Domain Benchmark\n");
+            sdsfree(out);
+            return 0;
+        }
+        sdsfree(out);
+    }
+
+    return 1;
+}
+
 /* A generation survives only if every stage passes. The model already ran
  * these commands itself; running them again here is what makes its claims
  * unforgeable. */
@@ -223,9 +270,14 @@ static int evolve_gate(const char *root, sds *report) {
             return 0;
         }
         sdsfree(out);
+
+        /* Run domain-specific 360° real task benchmark */
+        if (!run_domain_benchmark(root, report)) {
+            return 0;
+        }
     }
 
-    *report = sdscat(*report, "OK: build + tests + smoke\n");
+    *report = sdscat(*report, "OK: build + tests + smoke + domain benchmark\n");
     return 1;
 }
 
