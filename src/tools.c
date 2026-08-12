@@ -22,6 +22,49 @@
 
 /* NO security: any path, any shell. User asked open coding shell. */
 
+/* --- Binary extension detection (ported from Hermes Agent -------------------
+ * tools/binary_extensions.py)
+ *
+ * Fast, pure-string check: does the file path end with a known binary
+ * extension? No I/O needed — just the path string. Used by read_file to
+ * give a clear error before attempting to read binary files as text.
+ *
+ * The set covers images, video, audio, archives, executables, fonts,
+ * bytecode, databases, design files, and lock/profiling data. */
+
+static int has_binary_extension(const char *path) {
+    if (!path) return 0;
+    const char *dot = strrchr(path, '.');
+    if (!dot) return 0;
+    /* Compare case-insensitively */
+    const char *ext = dot; /* includes the dot */
+    size_t len = strlen(ext);
+
+    /* Sorted by frequency of encounter for early-out */
+    static const char *binary[] = {
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".tiff", ".tif",
+        ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".m4v", ".mpeg", ".mpg",
+        ".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".wma", ".aiff", ".opus",
+        ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar", ".xz", ".z", ".tgz", ".iso",
+        ".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".a", ".obj", ".lib",
+        ".app", ".msi", ".deb", ".rpm",
+        ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+        ".odt", ".ods", ".odp",
+        ".ttf", ".otf", ".woff", ".woff2", ".eot",
+        ".pyc", ".pyo", ".class", ".jar", ".war", ".ear", ".node", ".wasm", ".rlib",
+        ".sqlite", ".sqlite3", ".db", ".mdb", ".idx",
+        ".psd", ".ai", ".eps", ".sketch", ".fig", ".xd", ".blend", ".3ds", ".max",
+        ".swf", ".fla",
+        ".lockb", ".dat", ".data",
+        NULL
+    };
+    for (int i = 0; binary[i]; i++) {
+        if (len == strlen(binary[i]) && strcasecmp(ext, binary[i]) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 static sds read_file_all(const char *path, size_t max_bytes) {
     /* On macOS fopen("somedir", "rb") succeeds but fread returns 0 and sets
      * ferror. Detect this early so the caller gets a clear error instead of
@@ -1796,6 +1839,15 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
             snprintf(full, sizeof(full), "%s", path);
         else
             snprintf(full, sizeof(full), "%s/%s", cwd, path);
+        /* Fast binary check by extension — no I/O, just the path string.
+         * Catches images, archives, executables, etc. before we try to
+         * read them as text and hit the NUL-byte check (which still runs
+         * as a backstop for files with no extension or unknown ones). */
+        if (has_binary_extension(full))
+            return sdscatprintf(sdsempty(),
+                "ERROR: %s has a binary extension (%s). "
+                "Use execute_bash with xxd, strings, or file instead.",
+                full, strrchr(full, '.') ? strrchr(full, '.') : "unknown");
         sds body = read_file_all(full, 250000);
         if (has_nul(body, sdslen(body))) {
             sdsfree(body);
