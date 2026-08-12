@@ -389,6 +389,18 @@ static sds log_tail(const char *root, int max_lines) {
     return out;
 }
 
+/* --- sandbox ----------------------------------------------------------------- */
+
+static int setup_sandbox(const char *root, char sandbox[PATH_MAX], int gen) {
+    snprintf(sandbox, PATH_MAX, "%s/sandbox/gen_%03d", root, gen);
+    int rc = -1;
+    sds out = run_capture(root,
+        "mkdir -p sandbox/gen_%03d && cp -R src tests include Makefile deps sandbox/gen_%03d/",
+        30, &rc);
+    sdsfree(out);
+    return rc == 0;
+}
+
 /* --- prompt ---------------------------------------------------------------- */
 
 static sds build_prompt(const char *root, const char *goal, int gen) {
@@ -487,8 +499,15 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
                g + 1, generations, gen);
         fflush(stdout);
 
-        /* 1. BEFORE Benchmark: Run pre-mutation baseline benchmark on current binary.
-         * Uses cfg->model so the benchmark talks to whatever provider .env sets up. */
+        /* Setup sandbox for this generation */
+        char sandbox[PATH_MAX];
+        if (!setup_sandbox(root, sandbox, gen)) {
+            fprintf(stderr, "[evolve] sandbox setup failed\n");
+            break;
+        }
+        printf("[evolve] sandbox: %s\n", sandbox);
+
+        /* 1. BEFORE Benchmark: Run pre-mutation baseline benchmark on current binary. */
         const char *bm = (cfg->model && cfg->model[0]) ? cfg->model : "local";
         int before_rc = -1;
         struct timespec b_t0, b_t1;
@@ -526,12 +545,7 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
             printf("[evolve] AFTER benchmark comparison: rc=%d, elapsed=%.2fs (vs BEFORE %.2fs)\n", after_rc, after_secs, before_secs);
             fflush(stdout);
 
-            /* 360° Comprehensive Quality & Performance Evaluation:
-             * 1. Status: Must exit with returncode 0.
-             * 2. Error-free: Must not output "ERROR", "panic", "Segmentation fault", or "undefined".
-             * 3. Response Completeness Quality: Output must contain substantive non-empty answer.
-             * 4. Output Length Quality: Output size must be >= 90% of BEFORE baseline (no truncated/degraded answers).
-             * 5. Execution Speed: Latency must not degrade by more than 50% relative to BEFORE baseline. */
+            /* 360° Quality & Performance Evaluation */
             size_t b_len = before_bench ? sdslen(before_bench) : 0;
             size_t a_len = after_bench ? sdslen(after_bench) : 0;
 
