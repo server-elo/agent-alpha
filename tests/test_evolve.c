@@ -81,7 +81,7 @@ int main(void) {
     /* --- the gate, against a throwaway fixture --- */
     CHECK(fixture_make(), "fixture created");
     sds report = NULL;
-    CHECK(evolve_gate(FIX, &report) == 1, "gate passes a healthy fixture");
+    CHECK(evolve_gate(FIX, NULL, &report) == 1, "gate passes a healthy fixture");
     CHECK(report && strstr(report, "OK"), "gate report says OK");
     sdsfree(report);
 
@@ -95,7 +95,7 @@ int main(void) {
         "\t@echo === tests/bin/test_fake ===\n"
         "\t@echo nothing ran\n");
     report = NULL;
-    CHECK(evolve_gate(FIX, &report) == 0, "gate fails without ALL TESTS PASSED");
+    CHECK(evolve_gate(FIX, NULL, &report) == 0, "gate fails without ALL TESTS PASSED");
     CHECK(report && strstr(report, "FAIL: test suite"), "gate report names the suite");
     sdsfree(report);
 
@@ -109,7 +109,7 @@ int main(void) {
         "test:\n"
         "\t@echo ALL TESTS PASSED\n");
     report = NULL;
-    CHECK(evolve_gate(FIX, &report) == 0,
+    CHECK(evolve_gate(FIX, NULL, &report) == 0,
           "gate fails when ALL TESTS PASSED is printed but no test binary ran");
     CHECK(report && strstr(report, "bypass"),
           "gate report names the bypass attempt");
@@ -120,7 +120,7 @@ int main(void) {
     system("cd " FIX " && git checkout -q -- .");
     unlink(FIX "/Makefile");
     report = NULL;
-    CHECK(evolve_gate(FIX, &report) == 0, "gate fails when a tracked file is deleted");
+    CHECK(evolve_gate(FIX, NULL, &report) == 0, "gate fails when a tracked file is deleted");
     CHECK(report && strstr(report, "FAIL: tracked file deleted"),
           "gate report names the deletion");
     sdsfree(report);

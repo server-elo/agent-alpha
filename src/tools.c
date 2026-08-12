@@ -833,7 +833,6 @@ static sds list_dir(const char *path) {
     return out;
 }
 
-<<<<<<< Updated upstream
 /* --- web_search: DuckDuckGo HTML (no API key, no JS) ----------------------
  *
  * Fetches the non-JS HTML search at html.duckduckgo.com/html/ and extracts
@@ -1800,7 +1799,8 @@ static sds working_diff(const char *cwd, const char *mode) {
         result = sdscat(result, "(no changes)\n");
 
     return result;
-=======
+}
+
 /* Build a resolved path from a tool argument and the current working directory.
  *
  * Every tool that accepts a path must go through this function so that tilde
@@ -1827,7 +1827,6 @@ static void resolve_path(char out[PATH_MAX], const char *path, const char *cwd) 
             snprintf(out, PATH_MAX, "%s", exp);
         }
     }
->>>>>>> Stashed changes
 }
 
 sds tools_run(const char *name, cJSON *args, const char *cwd) {
@@ -1864,11 +1863,7 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(args, "path"));
         if (!path) return sdsnew("ERROR: path required");
         char full[PATH_MAX];
-<<<<<<< Updated upstream
-        if (path[0] == '/' || !cwd || !cwd[0])
-            snprintf(full, sizeof(full), "%s", path);
-        else
-            snprintf(full, sizeof(full), "%s/%s", cwd, path);
+        resolve_path(full, path, cwd);
         /* Fast binary check by extension — no I/O, just the path string.
          * Catches images, archives, executables, etc. before we try to
          * read them as text and hit the NUL-byte check (which still runs
@@ -1878,9 +1873,6 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
                 "ERROR: %s has a binary extension (%s). "
                 "Use execute_bash with xxd, strings, or file instead.",
                 full, strrchr(full, '.') ? strrchr(full, '.') : "unknown");
-=======
-        resolve_path(full, path, cwd);
->>>>>>> Stashed changes
         sds body = read_file_all(full, 250000);
         if (has_nul(body, sdslen(body))) {
             sdsfree(body);

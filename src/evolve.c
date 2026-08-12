@@ -142,8 +142,10 @@ static void report_tail(sds *report, const char *label, sds out) {
                            label, keep, (int)keep, out + n - keep);
 }
 
-/* Run domain-specific 360° benchmark tasks based on modified files or goal topic */
-static int run_domain_benchmark(const char *root, sds *report) {
+/* Run domain-specific 360° benchmark tasks based on modified files or goal topic.
+ * Uses the configured model (cfg->model) instead of a hardcoded model name, so
+ * evolution works with any provider the user has set in .env. */
+static int run_domain_benchmark(const char *root, const char *model, sds *report) {
     int rc = -1;
     sds status = run_capture(root, "git status --porcelain", 30, &rc);
     if (rc != 0 || !status) { sdsfree(status); return 1; }
@@ -154,9 +156,14 @@ static int run_domain_benchmark(const char *root, sds *report) {
     int is_tools  = (strstr(status, "tools") != NULL || strstr(status, "edit") != NULL);
     sdsfree(status);
 
+    const char *m = (model && model[0]) ? model : "local";
+
     if (is_memory) {
         /* Domain Task: Memory Store + Retrieve + Replace Benchmark */
-        sds out = run_capture(root, "./alpha -m deepseek-v4-pro \"Use memory tool to add entry test_key_999='domain_bench_value' then retrieve memory\" 2>&1", 45, &rc);
+        sds cmd = sdscatprintf(sdsempty(),
+            "./alpha -m %s \"Use memory tool to add entry test_key_999='domain_bench_value' then retrieve memory\" 2>&1", m);
+        sds out = run_capture(root, cmd, 45, &rc);
+        sdsfree(cmd);
         if (rc != 0 || !out || strstr(out, "ERROR") || !strstr(out, "domain_bench_value")) {
             report_tail(report, "Domain Benchmark: Memory Tool", out);
             *report = sdscat(*report, "FAIL: 360° Memory Domain Benchmark\n");
@@ -166,7 +173,10 @@ static int run_domain_benchmark(const char *root, sds *report) {
         sdsfree(out);
     } else if (is_search) {
         /* Domain Task: Web Search Speed & Parsing Benchmark */
-        sds out = run_capture(root, "./alpha -m deepseek-v4-pro \"Use web_search to find latest C11 standard details\" 2>&1", 45, &rc);
+        sds cmd = sdscatprintf(sdsempty(),
+            "./alpha -m %s \"Use web_search to find latest C11 standard details\" 2>&1", m);
+        sds out = run_capture(root, cmd, 45, &rc);
+        sdsfree(cmd);
         if (rc != 0 || !out || strstr(out, "ERROR")) {
             report_tail(report, "Domain Benchmark: Web Search Tool", out);
             *report = sdscat(*report, "FAIL: 360° Web Search Domain Benchmark\n");
@@ -176,7 +186,10 @@ static int run_domain_benchmark(const char *root, sds *report) {
         sdsfree(out);
     } else if (is_tools) {
         /* Domain Task: File Editing & Execution Benchmark */
-        sds out = run_capture(root, "./alpha -m deepseek-v4-pro \"List files in current dir and report count\" 2>&1", 45, &rc);
+        sds cmd = sdscatprintf(sdsempty(),
+            "./alpha -m %s \"List files in current dir and report count\" 2>&1", m);
+        sds out = run_capture(root, cmd, 45, &rc);
+        sdsfree(cmd);
         if (rc != 0 || !out || strstr(out, "ERROR")) {
             report_tail(report, "Domain Benchmark: Tools & File Execution", out);
             *report = sdscat(*report, "FAIL: 360° Tools Domain Benchmark\n");
@@ -192,7 +205,7 @@ static int run_domain_benchmark(const char *root, sds *report) {
 /* A generation survives only if every stage passes. The model already ran
  * these commands itself; running them again here is what makes its claims
  * unforgeable. */
-static int evolve_gate(const char *root, sds *report) {
+static int evolve_gate(const char *root, const char *model, sds *report) {
     *report = sdsempty();
     int rc = -1;
 
@@ -262,7 +275,10 @@ static int evolve_gate(const char *root, sds *report) {
      * speed and response health before approving the generation. Skip in throwaway
      * test fixture runs (which do not have a real API key or config). */
     if (!strstr(root, "_fixture")) {
-        out = run_capture(root, "./alpha -m deepseek-v4-pro \"hi\" 2>&1", 30, &rc);
+        const char *m = (model && model[0]) ? model : "local";
+        sds cmd = sdscatprintf(sdsempty(), "./alpha -m %s \"hi\" 2>&1", m);
+        out = run_capture(root, cmd, 30, &rc);
+        sdsfree(cmd);
         if (rc != 0 || !out || sdslen(out) == 0 || strstr(out, "ERROR")) {
             report_tail(report, "./alpha model benchmark", out);
             *report = sdscat(*report, "FAIL: real model execution benchmark\n");
@@ -272,7 +288,7 @@ static int evolve_gate(const char *root, sds *report) {
         sdsfree(out);
 
         /* Run domain-specific 360° real task benchmark */
-        if (!run_domain_benchmark(root, report)) {
+        if (!run_domain_benchmark(root, model, report)) {
             return 0;
         }
     }
@@ -471,11 +487,16 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
                g + 1, generations, gen);
         fflush(stdout);
 
-        /* 1. BEFORE Benchmark: Run pre-mutation baseline benchmark on current binary */
+        /* 1. BEFORE Benchmark: Run pre-mutation baseline benchmark on current binary.
+         * Uses cfg->model so the benchmark talks to whatever provider .env sets up. */
+        const char *bm = (cfg->model && cfg->model[0]) ? cfg->model : "local";
         int before_rc = -1;
         struct timespec b_t0, b_t1;
         clock_gettime(CLOCK_MONOTONIC, &b_t0);
-        sds before_bench = run_capture(root, "./alpha -m deepseek-v4-pro \"Use memory tool to add entry bench_before='val_before' then retrieve memory\" 2>&1", 45, &before_rc);
+        sds before_cmd = sdscatprintf(sdsempty(),
+            "./alpha -m %s \"Use memory tool to add entry bench_before='val_before' then retrieve memory\" 2>&1", bm);
+        sds before_bench = run_capture(root, before_cmd, 45, &before_rc);
+        sdsfree(before_cmd);
         clock_gettime(CLOCK_MONOTONIC, &b_t1);
         double before_secs = (double)(b_t1.tv_sec - b_t0.tv_sec) + (double)(b_t1.tv_nsec - b_t0.tv_nsec) / 1e9;
         printf("[evolve] BEFORE baseline benchmark: rc=%d, elapsed=%.2fs\n", before_rc, before_secs);
@@ -489,14 +510,17 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
         fflush(stdout);
 
         sds report = NULL;
-        int ok = !alpha_cancel && (reply && reply[0] && strcmp(reply, "ERROR: empty response from LLM") != 0) && evolve_gate(root, &report);
+        int ok = !alpha_cancel && (reply && reply[0] && strcmp(reply, "ERROR: empty response from LLM") != 0) && evolve_gate(root, cfg->model, &report);
 
         /* 2. AFTER Benchmark & Comparison: Run post-mutation benchmark on new binary */
         if (ok) {
             int after_rc = -1;
             struct timespec a_t0, a_t1;
             clock_gettime(CLOCK_MONOTONIC, &a_t0);
-            sds after_bench = run_capture(root, "./alpha -m deepseek-v4-pro \"Use memory tool to add entry bench_after='val_after' then retrieve memory\" 2>&1", 45, &after_rc);
+            sds after_cmd = sdscatprintf(sdsempty(),
+                "./alpha -m %s \"Use memory tool to add entry bench_after='val_after' then retrieve memory\" 2>&1", bm);
+            sds after_bench = run_capture(root, after_cmd, 45, &after_rc);
+            sdsfree(after_cmd);
             clock_gettime(CLOCK_MONOTONIC, &a_t1);
             double after_secs = (double)(a_t1.tv_sec - a_t0.tv_sec) + (double)(a_t1.tv_nsec - a_t0.tv_nsec) / 1e9;
             printf("[evolve] AFTER benchmark comparison: rc=%d, elapsed=%.2fs (vs BEFORE %.2fs)\n", after_rc, after_secs, before_secs);

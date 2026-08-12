@@ -24,7 +24,7 @@ while true; do
     ./alpha --evolve "$GOAL" --generations 1
     
     # Push successful generation to GitHub if clean
-    if git status --porcelain | grep -q "^nothing"; then
+    if [[ -z "$(git status --porcelain)" ]]; then
         git push origin main 2>/dev/null || true
     fi
 
