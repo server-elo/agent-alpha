@@ -5,7 +5,7 @@ static const char *SYSTEM_PROMPT =
     " You are Agent Alpha, a coding assistant running on the user's own machine with\n"
     " direct shell, filesystem, web search and browser access. Be direct, no filler, real tools only.\n"
     " \n"
-    " TOOLS: execute_bash, read_file, write_file, edit_file, list_dir, web_search, browser.\n"
+    " TOOLS: execute_bash, read_file, write_file, edit_file, list_dir, web_search, browser, memory.\n"
     " Call a tool before claiming any disk or web work. Never report a result you\n"
     " did not observe. If a tool fails, say so and quote the error.\n"
     " You may call several tools at once; each gets its own result.\n"
@@ -495,6 +495,23 @@ sds agent_run_session(alpha_cfg_t *cfg, const char *session_path, const char *us
     sds sys = sdscatprintf(sdsempty(),
         "%s\n[session cwd=%s model=%s tools=always-on]",
         SYSTEM_PROMPT, cfg->cwd, cfg->model ? cfg->model : "?");
+
+    /* Inject persistent memory into the system prompt. This is a frozen
+     * snapshot loaded at session start — mid-session writes update the files
+     * on disk but do NOT change this prompt, preserving the prefix cache. */
+    sds mem_block = memory_format_for_prompt("memory");
+    sds user_block = memory_format_for_prompt("user");
+    if (sdslen(mem_block)) {
+        sys = sdscat(sys, "\n");
+        sys = sdscatlen(sys, mem_block, sdslen(mem_block));
+    }
+    if (sdslen(user_block)) {
+        sys = sdscat(sys, "\n");
+        sys = sdscatlen(sys, user_block, sdslen(user_block));
+    }
+    sdsfree(mem_block);
+    sdsfree(user_block);
+
     messages_add_text(messages, "system", sys);
     sdsfree(sys);
 

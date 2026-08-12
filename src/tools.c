@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <curl/curl.h>
+#include <sys/file.h>
 
 /* Descendant tracking needs the kernel process table, and there is no portable
  * way to read it. macOS has no /proc, so it goes through sysctl + libproc;
@@ -1072,6 +1073,397 @@ static sds todo_tool_run(cJSON *args) {
     return out;
 }
 
+/* --- memory tool: persistent curated memory across sessions -----------------
+ *
+ * Two file-backed stores under ~/.alpha/memory/:
+ *   MEMORY.md — agent's personal notes (environment facts, conventions, lessons)
+ *   USER.md   — what the agent knows about the user (preferences, style)
+ *
+ * Entries are §-delimited (section sign). The tool supports add, replace, and
+ * remove actions via substring matching (no IDs). A frozen snapshot is injected
+ * into the system prompt at session start; mid-session writes update the files
+ * on disk immediately but do NOT change the system prompt — this preserves the
+ * prefix cache for the entire session.
+ *
+ * Character limits (not tokens) because char counts are model-independent:
+ *   MEMORY.md: 2200 chars, USER.md: 1375 chars.
+ *
+ * Design ported from Hermes Agent's memory_tool.py (tools/memory_tool.py). */
+
+#define ALPHA_MEMORY_DIR       ".alpha/memory"
+#define ALPHA_MEMORY_ENTRY_SEP "\n§\n"
+#define ALPHA_MEMORY_MAX_ENTRIES 64
+#define ALPHA_MEMORY_CHAR_LIMIT   2200
+#define ALPHA_USER_CHAR_LIMIT     1375
+
+typedef struct {
+    char *entries[ALPHA_MEMORY_MAX_ENTRIES];
+    int count;
+    int char_limit;
+} memory_store_t;
+
+static memory_store_t g_memory_store = { .count = 0, .char_limit = ALPHA_MEMORY_CHAR_LIMIT };
+static memory_store_t g_user_store    = { .count = 0, .char_limit = ALPHA_USER_CHAR_LIMIT };
+static pthread_mutex_t g_memory_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Resolve the memory directory, creating it if needed. Returns a static buffer
+ * that is valid until the next call. */
+static const char *memory_dir(void) {
+    static char dir[PATH_MAX];
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) home = "/tmp";
+    snprintf(dir, sizeof(dir), "%s/" ALPHA_MEMORY_DIR, home);
+    mkdir_p(dir);
+    return dir;
+}
+
+static const char *memory_path(const char *target) {
+    static char path[PATH_MAX];
+    const char *dir = memory_dir();
+    if (strcmp(target, "user") == 0)
+        snprintf(path, sizeof(path), "%s/USER.md", dir);
+    else
+        snprintf(path, sizeof(path), "%s/MEMORY.md", dir);
+    return path;
+}
+
+/* Parse a memory file into entries. Returns a freshly allocated array of
+ * strdup'd strings; caller must free each entry and the array. */
+static char **memory_parse(const char *raw, int *out_count) {
+    *out_count = 0;
+    if (!raw || !raw[0]) return NULL;
+    /* Work on a copy so we can tokenize */
+    char *copy = strdup(raw);
+    if (!copy) return NULL;
+
+    /* Count entries by finding the delimiter */
+    int cap = 16;
+    char **entries = malloc((size_t)cap * sizeof(char *));
+    if (!entries) { free(copy); return NULL; }
+
+    char *save = NULL;
+    char *tok = strtok_r(copy, ALPHA_MEMORY_ENTRY_SEP, &save);
+    while (tok) {
+        /* Trim leading/trailing whitespace */
+        while (*tok == ' ' || *tok == '\t' || *tok == '\n' || *tok == '\r') tok++;
+        char *end = tok + strlen(tok);
+        while (end > tok && (end[-1] == ' ' || end[-1] == '\t' ||
+                             end[-1] == '\n' || end[-1] == '\r')) end--;
+        *end = 0;
+        if (tok[0]) {
+            if (*out_count >= cap) {
+                cap *= 2;
+                char **nb = realloc(entries, (size_t)cap * sizeof(char *));
+                if (!nb) break;
+                entries = nb;
+            }
+            entries[*out_count] = strdup(tok);
+            (*out_count)++;
+        }
+        tok = strtok_r(NULL, ALPHA_MEMORY_ENTRY_SEP, &save);
+    }
+    free(copy);
+    return entries;
+}
+
+/* Read a memory file and parse it into a store. Returns 0 on success. */
+static int memory_load(const char *target, memory_store_t *store) {
+    const char *path = memory_path(target);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        /* No file yet — empty store is fine */
+        store->count = 0;
+        return 0;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 1048576) { fclose(f); store->count = 0; return 0; }
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return -1; }
+    size_t rd = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[rd] = 0;
+
+    char **entries = memory_parse(buf, &store->count);
+    free(buf);
+    if (!entries) { store->count = 0; return 0; }
+
+    /* Copy into the store, deduplicating */
+    int dst = 0;
+    for (int i = 0; i < store->count && dst < ALPHA_MEMORY_MAX_ENTRIES; i++) {
+        int dup = 0;
+        for (int j = 0; j < dst; j++) {
+            if (strcmp(store->entries[j], entries[i]) == 0) { dup = 1; break; }
+        }
+        if (!dup) {
+            free(store->entries[dst]); /* free old if any */
+            store->entries[dst++] = entries[i];
+        } else {
+            free(entries[i]);
+        }
+    }
+    /* Free any remaining parsed entries beyond the cap */
+    for (int i = dst; i < store->count; i++) free(entries[i]);
+    free(entries);
+    store->count = dst;
+    return 0;
+}
+
+/* Write a store back to its file. Uses atomic temp-file + rename. */
+static int memory_save(const char *target, memory_store_t *store) {
+    const char *path = memory_path(target);
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return -1;
+    for (int i = 0; i < store->count; i++) {
+        if (i > 0) fputs(ALPHA_MEMORY_ENTRY_SEP, f);
+        fputs(store->entries[i], f);
+    }
+    int ok = (fflush(f) == 0);
+    if (ok) ok = (fsync(fileno(f)) == 0);
+    fclose(f);
+    if (ok) ok = (rename(tmp, path) == 0);
+    else unlink(tmp);
+    return ok ? 0 : -1;
+}
+
+/* Compute the total char count of a store (including delimiters). */
+static int memory_char_count(memory_store_t *store) {
+    if (store->count == 0) return 0;
+    int total = 0;
+    for (int i = 0; i < store->count; i++) {
+        if (i > 0) total += (int)strlen(ALPHA_MEMORY_ENTRY_SEP);
+        total += (int)strlen(store->entries[i]);
+    }
+    return total;
+}
+
+/* Free all entries in a store. */
+static void memory_free_store(memory_store_t *store) {
+    for (int i = 0; i < store->count; i++) {
+        free(store->entries[i]);
+        store->entries[i] = NULL;
+    }
+    store->count = 0;
+}
+
+/* Initialize both stores from disk. Called once at startup. */
+void memory_init(void) {
+    pthread_mutex_lock(&g_memory_lock);
+    memory_free_store(&g_memory_store);
+    memory_free_store(&g_user_store);
+    memory_load("memory", &g_memory_store);
+    memory_load("user", &g_user_store);
+    pthread_mutex_unlock(&g_memory_lock);
+}
+
+/* Format a store as a system-prompt block. Returns an sds (caller frees).
+ * This is the frozen snapshot — it reflects the state at session start. */
+sds memory_format_for_prompt(const char *target) {
+    pthread_mutex_lock(&g_memory_lock);
+    memory_store_t *store = (strcmp(target, "user") == 0) ? &g_user_store : &g_memory_store;
+    if (store->count == 0) {
+        pthread_mutex_unlock(&g_memory_lock);
+        return sdsempty();
+    }
+    const char *header = (strcmp(target, "user") == 0)
+        ? "USER PROFILE (who the user is)"
+        : "MEMORY (your personal notes)";
+    int current = memory_char_count(store);
+    int limit = store->char_limit;
+    int pct = limit > 0 ? (current * 100 / limit) : 0;
+    if (pct > 100) pct = 100;
+
+    sds out = sdscatprintf(sdsempty(),
+        "══════════════════════════════════════════════\n"
+        "%s [%d%% — %d/%d chars]\n"
+        "══════════════════════════════════════════════\n",
+        header, pct, current, limit);
+    for (int i = 0; i < store->count; i++) {
+        if (i > 0) out = sdscat(out, ALPHA_MEMORY_ENTRY_SEP);
+        out = sdscat(out, store->entries[i]);
+    }
+    pthread_mutex_unlock(&g_memory_lock);
+    return out;
+}
+
+/* --- memory tool dispatch ------------------------------------------------ */
+
+static memory_store_t *memory_store_for(const char *target) {
+    return (strcmp(target, "user") == 0) ? &g_user_store : &g_memory_store;
+}
+
+static sds memory_tool_add(memory_store_t *store, const char *content) {
+    if (!content || !content[0])
+        return sdsnew("ERROR: content cannot be empty");
+
+    /* Reject exact duplicates */
+    for (int i = 0; i < store->count; i++) {
+        if (strcmp(store->entries[i], content) == 0)
+            return sdsnew("ERROR: entry already exists (no duplicate added)");
+    }
+
+    /* Check budget */
+    int current = memory_char_count(store);
+    int new_total = current;
+    if (store->count > 0) new_total += (int)strlen(ALPHA_MEMORY_ENTRY_SEP);
+    new_total += (int)strlen(content);
+    if (new_total > store->char_limit) {
+        return sdscatprintf(sdsempty(),
+            "ERROR: memory at %d/%d chars. Adding this entry (%zu chars) would "
+            "exceed the limit. Use 'replace' to merge overlapping entries or "
+            "'remove' to delete stale ones, then retry.",
+            current, store->char_limit, strlen(content));
+    }
+
+    if (store->count >= ALPHA_MEMORY_MAX_ENTRIES)
+        return sdsnew("ERROR: maximum number of entries reached");
+
+    store->entries[store->count++] = strdup(content);
+    return sdscatprintf(sdsempty(), "OK added entry (%d/%d chars now)",
+                        new_total, store->char_limit);
+}
+
+static sds memory_tool_replace(memory_store_t *store, const char *old_text,
+                                const char *new_content) {
+    if (!old_text || !old_text[0])
+        return sdsnew("ERROR: old_text cannot be empty");
+    if (!new_content || !new_content[0])
+        return sdsnew("ERROR: new_content cannot be empty (use 'remove' to delete)");
+
+    /* Find matching entries */
+    int matches[ALPHA_MEMORY_MAX_ENTRIES];
+    int nmatch = 0;
+    for (int i = 0; i < store->count; i++) {
+        if (strstr(store->entries[i], old_text))
+            matches[nmatch++] = i;
+    }
+    if (nmatch == 0)
+        return sdsnew("ERROR: no entry matched old_text");
+    if (nmatch > 1) {
+        /* Check if all matches are identical */
+        int same = 1;
+        for (int i = 1; i < nmatch; i++) {
+            if (strcmp(store->entries[matches[0]], store->entries[matches[i]]) != 0) {
+                same = 0;
+                break;
+            }
+        }
+        if (!same)
+            return sdsnew("ERROR: multiple distinct entries matched — be more specific");
+    }
+
+    int idx = matches[0];
+    /* Check budget */
+    int current = memory_char_count(store);
+    int new_total = current
+        - (int)strlen(store->entries[idx])
+        + (int)strlen(new_content);
+    if (new_total > store->char_limit) {
+        return sdscatprintf(sdsempty(),
+            "ERROR: replacement would put memory at %d/%d chars. "
+            "Shorten the new content or remove other entries first.",
+            new_total, store->char_limit);
+    }
+
+    free(store->entries[idx]);
+    store->entries[idx] = strdup(new_content);
+    return sdscatprintf(sdsempty(), "OK replaced entry (%d/%d chars now)",
+                        new_total, store->char_limit);
+}
+
+static sds memory_tool_remove(memory_store_t *store, const char *old_text) {
+    if (!old_text || !old_text[0])
+        return sdsnew("ERROR: old_text cannot be empty");
+
+    int matches[ALPHA_MEMORY_MAX_ENTRIES];
+    int nmatch = 0;
+    for (int i = 0; i < store->count; i++) {
+        if (strstr(store->entries[i], old_text))
+            matches[nmatch++] = i;
+    }
+    if (nmatch == 0)
+        return sdsnew("ERROR: no entry matched old_text");
+    if (nmatch > 1) {
+        int same = 1;
+        for (int i = 1; i < nmatch; i++) {
+            if (strcmp(store->entries[matches[0]], store->entries[matches[i]]) != 0) {
+                same = 0;
+                break;
+            }
+        }
+        if (!same)
+            return sdsnew("ERROR: multiple distinct entries matched — be more specific");
+    }
+
+    int idx = matches[0];
+    free(store->entries[idx]);
+    for (int i = idx; i < store->count - 1; i++)
+        store->entries[i] = store->entries[i + 1];
+    store->count--;
+
+    int current = memory_char_count(store);
+    return sdscatprintf(sdsempty(), "OK removed entry (%d/%d chars now)",
+                        current, store->char_limit);
+}
+
+static sds memory_tool_run(cJSON *args) {
+    const char *action = cJSON_GetStringValue(cJSON_GetObjectItem(args, "action"));
+    const char *target = cJSON_GetStringValue(cJSON_GetObjectItem(args, "target"));
+    const char *content = cJSON_GetStringValue(cJSON_GetObjectItem(args, "content"));
+    const char *old_text = cJSON_GetStringValue(cJSON_GetObjectItem(args, "old_text"));
+
+    if (!target) target = "memory";
+    if (strcmp(target, "memory") != 0 && strcmp(target, "user") != 0)
+        return sdsnew("ERROR: target must be 'memory' or 'user'");
+
+    if (!action) {
+        /* Read-only: return current entries */
+        pthread_mutex_lock(&g_memory_lock);
+        memory_store_t *store = memory_store_for(target);
+        cJSON *res = cJSON_CreateObject();
+        cJSON *arr = cJSON_CreateArray();
+        for (int i = 0; i < store->count; i++)
+            cJSON_AddItemToArray(arr, cJSON_CreateString(store->entries[i]));
+        cJSON_AddItemToObject(res, "entries", arr);
+        int current = memory_char_count(store);
+        cJSON_AddNumberToObject(res, "char_count", current);
+        cJSON_AddNumberToObject(res, "char_limit", store->char_limit);
+        cJSON_AddNumberToObject(res, "entry_count", store->count);
+        pthread_mutex_unlock(&g_memory_lock);
+
+        char *json_s = cJSON_PrintUnformatted(res);
+        sds out = sdsnew(json_s ? json_s : "{}");
+        if (json_s) free(json_s);
+        cJSON_Delete(res);
+        return out;
+    }
+
+    pthread_mutex_lock(&g_memory_lock);
+    memory_store_t *store = memory_store_for(target);
+    sds result = NULL;
+
+    if (strcmp(action, "add") == 0) {
+        result = memory_tool_add(store, content);
+    } else if (strcmp(action, "replace") == 0) {
+        result = memory_tool_replace(store, old_text, content);
+    } else if (strcmp(action, "remove") == 0) {
+        result = memory_tool_remove(store, old_text);
+    } else {
+        result = sdsnew("ERROR: unknown action — use add, replace, or remove");
+    }
+
+    /* Persist on success */
+    if (result && strncmp(result, "OK", 2) == 0)
+        memory_save(target, store);
+
+    pthread_mutex_unlock(&g_memory_lock);
+    return result;
+}
+
 sds tools_run(const char *name, cJSON *args, const char *cwd) {
     if (!name) return sdsnew("ERROR: no tool name");
     if (!args) args = cJSON_CreateObject();
@@ -1227,6 +1619,9 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         if (cJSON_IsNumber(mr)) max_results = mr->valueint;
         return web_search(query, max_results);
     }
+    if (strcmp(name, "memory") == 0) {
+        return memory_tool_run(args);
+    }
     return sdscatprintf(sdsempty(), "ERROR: unknown tool %s", name);
 }
 
@@ -1253,7 +1648,8 @@ cJSON *tools_schema(void) {
         "\"path\":{\"type\":\"string\"}}}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"browser\",\"description\":\"Pure-C browser. ONE sticky CDP tab. Loop: status/tabs -> open/navigate -> snapshot -> click/type/press/eval. close_others cleans junk. NEVER bash for click. Login/OAuth: snapshot+one click then stop. PROOF required.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\"},\"url\":{\"type\":\"string\"},\"selector\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"expression\":{\"type\":\"string\"},\"tab_id\":{\"type\":\"string\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"}},\"required\":[]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"description\":\"Search the web via DuckDuckGo HTML (no API key, no JS). Returns title, URL, and snippet for each result. Fast: one HTTP GET, ~0.5-2s.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Search query\"},\"max_results\":{\"type\":\"integer\",\"description\":\"Max results (1-20, default 10)\"}},\"required\":[\"query\"]}}},"
-        "{\"type\":\"function\",\"function\":{\"name\":\"todo\",\"description\":\"Manage task list for current session. Omit todos to read, provide todos array to create/update items. Each item: {id, content, status: pending|in_progress|completed|cancelled}. merge=true updates by id.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"todos\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"},\"status\":{\"type\":\"string\"}},\"required\":[\"id\",\"content\",\"status\"]}},\"merge\":{\"type\":\"boolean\"}},\"required\":[]}}}"
+        "{\"type\":\"function\",\"function\":{\"name\":\"todo\",\"description\":\"Manage task list for current session. Omit todos to read, provide todos array to create/update items. Each item: {id, content, status: pending|in_progress|completed|cancelled}. merge=true updates by id.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"todos\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"},\"status\":{\"type\":\"string\"}},\"required\":[\"id\",\"content\",\"status\"]}},\"merge\":{\"type\":\"boolean\"}},\"required\":[]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"memory\",\"description\":\"Persistent curated memory that survives across sessions. Two stores: 'memory' for your notes (environment facts, conventions, lessons) and 'user' for user profile (preferences, style). Entries are §-delimited. Actions: add (append), replace (substring match), remove (substring match). Omit action to read current entries. Character limits: 2200 (memory), 1375 (user).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"add\",\"replace\",\"remove\"]},\"target\":{\"type\":\"string\",\"enum\":[\"memory\",\"user\"],\"description\":\"Which store: 'memory' (default) or 'user'\"},\"content\":{\"type\":\"string\",\"description\":\"Entry content for add/replace\"},\"old_text\":{\"type\":\"string\",\"description\":\"Substring identifying the entry for replace/remove\"}},\"required\":[]}}}"
         "]";
     return cJSON_Parse(json);
 }

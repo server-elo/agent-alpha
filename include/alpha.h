@@ -123,6 +123,10 @@ sds llm_chat(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message, int w
 /* Tool dispatch: name + args JSON object → result text (caller frees with sdsfree). */
 sds tools_run(const char *name, cJSON *args, const char *cwd);
 
+/* Persistent memory: load from disk at startup, format for system prompt. */
+void memory_init(void);
+sds memory_format_for_prompt(const char *target);
+
 /* Caps on one CDP WebSocket reply. A snapshot of a large page is legitimately
  * hundreds of KB, and the old single-frame 500 KB limit silently dropped the
  * reply; these bound memory without rejecting real pages. */

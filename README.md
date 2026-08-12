@@ -88,7 +88,7 @@ terminal, and when `NO_COLOR` is set.
 ## Tools
 
 `execute_bash`, `read_file`, `write_file`, `edit_file`, `list_dir`, `browser`,
-`web_search`.
+`web_search`, `memory`.
 
 The browser tool drives an existing Chrome over the DevTools protocol: one
 sticky tab, `snapshot` before `click`. Start Chrome with
@@ -98,6 +98,19 @@ sticky tab, `snapshot` before `click`. Start Chrome with
 JavaScript). It returns title, URL and snippet for each result. One HTTP POST,
 typically 0.5–2s. Rate-limited requests are detected and reported as a clear
 error.
+
+`memory` provides persistent curated memory that survives across sessions.
+Two file-backed stores under `~/.alpha/memory/`:
+- **MEMORY.md** — the agent's personal notes (environment facts, conventions,
+  lessons learned). 2200 char limit.
+- **USER.md** — what the agent knows about the user (preferences, style,
+  background). 1375 char limit.
+
+Entries are §-delimited (section sign). Actions: `add` (append), `replace`
+(substring match), `remove` (substring match). Omit `action` to read current
+entries. A frozen snapshot is injected into the system prompt at session start;
+mid-session writes update the files on disk immediately but do not change the
+prompt, preserving the prefix cache.
 
 ## Telegram
 
@@ -188,7 +201,7 @@ Two limits worth knowing:
 make test
 ```
 
-525 checks over the tool layer, session handling, the SSE parser, provider
+665 checks over the tool layer, session handling, the SSE parser, provider
 resolution, config loading, the CDP WebSocket client and the Telegram loop.
 Both the macOS and Linux process-tracking paths are exercised on either host.
 The suite discards its binaries before every

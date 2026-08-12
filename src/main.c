@@ -252,6 +252,7 @@ int alpha_main_disabled(void) { return 0; }
 int main(int argc, char **argv) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
     load_config_env();
+    memory_init();
 
     const char *pname = getenv("ALPHA_PROVIDER");
     const char *url   = getenv("ALPHA_BASE_URL");

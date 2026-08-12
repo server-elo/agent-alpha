@@ -1222,6 +1222,483 @@ static void test_web_search_tool_dispatch(void) {
     sdsfree(r);
 }
 
+/* --- memory tool: persistent curated memory ------------------------------- */
+
+/* Helper: set HOME to a temp dir so memory files don't touch the real ~/.alpha */
+static char g_mem_home[PATH_MAX];
+
+static void memory_setup(void) {
+    snprintf(g_mem_home, sizeof(g_mem_home), "/tmp/alpha_mem_test_%d", (int)getpid());
+    mkdir(g_mem_home, 0755);
+    setenv("HOME", g_mem_home, 1);
+    /* Reset stores to empty */
+    pthread_mutex_lock(&g_memory_lock);
+    memory_free_store(&g_memory_store);
+    memory_free_store(&g_user_store);
+    g_memory_store.count = 0;
+    g_user_store.count = 0;
+    pthread_mutex_unlock(&g_memory_lock);
+}
+
+static void memory_teardown(void) {
+    char cmd[PATH_MAX + 64];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", g_mem_home);
+    system(cmd);
+}
+
+static void test_memory_add(void) {
+    TEST_BEGIN("memory: add entries to memory store");
+    memory_setup();
+
+    /* Add a single entry */
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "add");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "content", "The user prefers Python over JavaScript");
+    sds r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "add succeeds");
+    CHECK(strstr(r, "added entry") != NULL, "response says entry was added");
+    sdsfree(r);
+
+    /* Read back to verify */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "target", "memory");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strstr(r, "Python over JavaScript") != NULL, "entry is persisted in store");
+    sdsfree(r);
+
+    /* Add to user store */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "add");
+    cJSON_AddStringToObject(a, "target", "user");
+    cJSON_AddStringToObject(a, "content", "User name is Alice");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "add to user store succeeds");
+    sdsfree(r);
+
+    /* Verify user store */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "target", "user");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strstr(r, "Alice") != NULL, "user entry is persisted");
+    sdsfree(r);
+
+    /* Duplicate add is rejected */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "add");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "content", "The user prefers Python over JavaScript");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "duplicate add is rejected");
+    CHECK(strstr(r, "already exists") != NULL, "reason says already exists");
+    sdsfree(r);
+
+    /* Empty content is rejected */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "add");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "content", "");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "empty content is rejected");
+    sdsfree(r);
+
+    memory_teardown();
+}
+
+static void test_memory_replace(void) {
+    TEST_BEGIN("memory: replace entries by substring match");
+    memory_setup();
+
+    /* Add an entry first */
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "add");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "content", "The project uses C11 with -Wall -Wextra");
+    sds r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "add succeeds");
+    sdsfree(r);
+
+    /* Replace by substring */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "replace");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "old_text", "C11");
+    cJSON_AddStringToObject(a, "content", "The project uses C17 with -Wall -Wextra");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "replace by substring succeeds");
+    sdsfree(r);
+
+    /* Verify the replacement */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "target", "memory");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strstr(r, "C17") != NULL, "replacement is visible");
+    CHECK(strstr(r, "C11") == NULL, "old text is gone");
+    sdsfree(r);
+
+    /* Replace with non-matching old_text */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "replace");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "old_text", "nonexistent_xyz");
+    cJSON_AddStringToObject(a, "content", "something");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "non-matching replace is rejected");
+    CHECK(strstr(r, "no entry matched") != NULL, "reason says no match");
+    sdsfree(r);
+
+    /* Replace with empty old_text */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "replace");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "old_text", "");
+    cJSON_AddStringToObject(a, "content", "something");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "empty old_text is rejected");
+    sdsfree(r);
+
+    /* Replace with empty new_content */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "replace");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "old_text", "C17");
+    cJSON_AddStringToObject(a, "content", "");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "empty new_content is rejected");
+    sdsfree(r);
+
+    memory_teardown();
+}
+
+static void test_memory_remove(void) {
+    TEST_BEGIN("memory: remove entries by substring match");
+    memory_setup();
+
+    /* Add two entries */
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "add");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "content", "Entry one: project conventions");
+    sds r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "first add succeeds");
+    sdsfree(r);
+
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "add");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "content", "Entry two: tool quirks");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "second add succeeds");
+    sdsfree(r);
+
+    /* Remove by substring */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "remove");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "old_text", "Entry one");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "remove by substring succeeds");
+    sdsfree(r);
+
+    /* Verify removal */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "target", "memory");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strstr(r, "Entry one") == NULL, "removed entry is gone");
+    CHECK(strstr(r, "Entry two") != NULL, "other entry still present");
+    sdsfree(r);
+
+    /* Remove non-matching */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "remove");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "old_text", "nonexistent_xyz");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "non-matching remove is rejected");
+    sdsfree(r);
+
+    /* Remove with empty old_text */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "remove");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "old_text", "");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "empty old_text for remove is rejected");
+    sdsfree(r);
+
+    memory_teardown();
+}
+
+static void test_memory_read_only(void) {
+    TEST_BEGIN("memory: read-only mode returns current entries");
+    memory_setup();
+
+    /* Empty store */
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "target", "memory");
+    sds r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strstr(r, "\"entry_count\":0") != NULL, "empty store reports 0 entries");
+    CHECK(strstr(r, "\"char_count\":0") != NULL, "empty store reports 0 chars");
+    sdsfree(r);
+
+    /* Add an entry, then read */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "add");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "content", "Test entry for read-only");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    sdsfree(r);
+
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "target", "memory");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strstr(r, "\"entry_count\":1") != NULL, "reports 1 entry");
+    CHECK(strstr(r, "Test entry for read-only") != NULL, "entry content is present");
+    CHECK(strstr(r, "\"char_limit\":") != NULL, "char limit is reported");
+    sdsfree(r);
+
+    memory_teardown();
+}
+
+static void test_memory_invalid_target(void) {
+    TEST_BEGIN("memory: invalid target is rejected");
+    memory_setup();
+
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "add");
+    cJSON_AddStringToObject(a, "target", "invalid_target");
+    cJSON_AddStringToObject(a, "content", "test");
+    sds r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "invalid target is rejected");
+    CHECK(strstr(r, "must be") != NULL, "reason says what is valid");
+    sdsfree(r);
+
+    memory_teardown();
+}
+
+static void test_memory_unknown_action(void) {
+    TEST_BEGIN("memory: unknown action is rejected");
+    memory_setup();
+
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "delete");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "content", "test");
+    sds r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "unknown action is rejected");
+    CHECK(strstr(r, "unknown action") != NULL, "reason says unknown action");
+    sdsfree(r);
+
+    memory_teardown();
+}
+
+static void test_memory_persistence(void) {
+    TEST_BEGIN("memory: entries survive across store reloads");
+    memory_setup();
+
+    /* Add an entry */
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "add");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "content", "Persistent fact: the build uses make -j4");
+    sds r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "add succeeds");
+    sdsfree(r);
+
+    /* Verify file exists on disk */
+    const char *path = memory_path("memory");
+    struct stat st;
+    CHECK(stat(path, &st) == 0, "memory file exists on disk");
+
+    /* Reload the store from disk (simulating a new session) */
+    pthread_mutex_lock(&g_memory_lock);
+    memory_free_store(&g_memory_store);
+    memory_load("memory", &g_memory_store);
+    pthread_mutex_unlock(&g_memory_lock);
+
+    /* Read back */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "target", "memory");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strstr(r, "Persistent fact") != NULL, "entry survives reload");
+    sdsfree(r);
+
+    memory_teardown();
+}
+
+static void test_memory_format_for_prompt(void) {
+    TEST_BEGIN("memory: format_for_prompt produces correct blocks");
+    memory_setup();
+
+    /* Add entries to both stores */
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "add");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "content", "Memory entry one");
+    sds r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    sdsfree(r);
+
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "add");
+    cJSON_AddStringToObject(a, "target", "user");
+    cJSON_AddStringToObject(a, "content", "User entry one");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    sdsfree(r);
+
+    /* Format memory block */
+    sds mem = memory_format_for_prompt("memory");
+    CHECK(strstr(mem, "MEMORY (your personal notes)") != NULL,
+          "memory block has the correct header");
+    CHECK(strstr(mem, "Memory entry one") != NULL,
+          "memory block contains the entry");
+    CHECK(strstr(mem, "chars") != NULL,
+          "memory block shows usage stats");
+    sdsfree(mem);
+
+    /* Format user block */
+    sds usr = memory_format_for_prompt("user");
+    CHECK(strstr(usr, "USER PROFILE (who the user is)") != NULL,
+          "user block has the correct header");
+    CHECK(strstr(usr, "User entry one") != NULL,
+          "user block contains the entry");
+    sdsfree(usr);
+
+    /* Empty store returns empty string */
+    pthread_mutex_lock(&g_memory_lock);
+    memory_free_store(&g_memory_store);
+    g_memory_store.count = 0;
+    pthread_mutex_unlock(&g_memory_lock);
+    mem = memory_format_for_prompt("memory");
+    CHECK(sdslen(mem) == 0, "empty store produces empty prompt block");
+    sdsfree(mem);
+
+    memory_teardown();
+}
+
+static void test_memory_char_limit(void) {
+    TEST_BEGIN("memory: char limit is enforced");
+    memory_setup();
+
+    /* Build a string that fills most of the limit */
+    char big[ALPHA_MEMORY_CHAR_LIMIT + 100];
+    memset(big, 'X', sizeof(big) - 1);
+    big[sizeof(big) - 1] = 0;
+
+    /* First add: fill to just 50 chars under the limit */
+    big[ALPHA_MEMORY_CHAR_LIMIT - 50] = 0; /* 2150 chars */
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "add");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "content", big);
+    sds r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "OK", 2) == 0, "entry under limit is accepted");
+    sdsfree(r);
+
+    /* Second add: a 100-char entry that pushes over the limit.
+     * 2150 + 3 (delimiter) + 100 = 2253 > 2200 */
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "action", "add");
+    cJSON_AddStringToObject(a, "target", "memory");
+    cJSON_AddStringToObject(a, "content",
+        "This entry is long enough to push the total character count over the 2200-char limit for the memory store");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strncmp(r, "ERROR", 5) == 0, "entry over limit is rejected");
+    CHECK(strstr(r, "exceed the limit") != NULL, "reason mentions the limit");
+    sdsfree(r);
+
+    memory_teardown();
+}
+
+static void test_memory_multiple_entries(void) {
+    TEST_BEGIN("memory: multiple entries are stored and deduplicated");
+    memory_setup();
+
+    /* Add several entries */
+    const char *entries[] = {
+        "Fact A: the sky is blue",
+        "Fact B: water is wet",
+        "Fact C: code compiles",
+        NULL
+    };
+    for (int i = 0; entries[i]; i++) {
+        cJSON *a = cJSON_CreateObject();
+        cJSON_AddStringToObject(a, "action", "add");
+        cJSON_AddStringToObject(a, "target", "memory");
+        cJSON_AddStringToObject(a, "content", entries[i]);
+        sds r = tools_run("memory", a, "/tmp");
+        cJSON_Delete(a);
+        CHECK(strncmp(r, "OK", 2) == 0, "entry added");
+        sdsfree(r);
+    }
+
+    /* Read back */
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "target", "memory");
+    sds r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strstr(r, "\"entry_count\":3") != NULL, "all 3 entries present");
+    CHECK(strstr(r, "Fact A") != NULL, "entry A present");
+    CHECK(strstr(r, "Fact B") != NULL, "entry B present");
+    CHECK(strstr(r, "Fact C") != NULL, "entry C present");
+    sdsfree(r);
+
+    /* Reload and verify dedup */
+    pthread_mutex_lock(&g_memory_lock);
+    memory_free_store(&g_memory_store);
+    memory_load("memory", &g_memory_store);
+    pthread_mutex_unlock(&g_memory_lock);
+
+    a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "target", "memory");
+    r = tools_run("memory", a, "/tmp");
+    cJSON_Delete(a);
+    CHECK(strstr(r, "\"entry_count\":3") != NULL, "still 3 entries after reload (no dups)");
+    sdsfree(r);
+
+    memory_teardown();
+}
+
+static void test_memory_null_args(void) {
+    TEST_BEGIN("memory: NULL args are handled gracefully");
+    memory_setup();
+
+    sds r = tools_run("memory", NULL, "/tmp");
+    CHECK(strncmp(r, "ERROR", 5) != 0, "NULL args with memory does not crash");
+    /* With NULL args, it defaults to read-only mode for 'memory' target */
+    sdsfree(r);
+
+    memory_teardown();
+}
+
 int main(void) {
     test_mkdir_no_shell();
     test_write_file_no_shell();
@@ -1262,6 +1739,17 @@ int main(void) {
     test_strip_html_func();
     test_collapse_ws_func();
     test_web_search_tool_dispatch();
+    test_memory_add();
+    test_memory_replace();
+    test_memory_remove();
+    test_memory_read_only();
+    test_memory_invalid_target();
+    test_memory_unknown_action();
+    test_memory_persistence();
+    test_memory_format_for_prompt();
+    test_memory_char_limit();
+    test_memory_multiple_entries();
+    test_memory_null_args();
     system("rm -rf /tmp/alpha_t");
     return test_report("tools");
 }
