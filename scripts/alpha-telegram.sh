@@ -9,7 +9,19 @@ BIN="$ROOT/alpha"
 
 load_env() {
   unset ALPHA_PROVIDER ALPHA_BASE_URL ALPHA_API_KEY ALPHA_MODEL ALPHA_CWD ALPHA_MAX_TURNS ALPHA_TELEGRAM_ALLOW ALPHA_TELEGRAM_BOT_TOKEN TELEGRAM_BOT_TOKEN
-  if [[ -f "$ROOT/.env" ]]; then
+  # Telegram always uses the global auth (BytePlus). Repo .env may point at a
+  # different provider for evolution, so never let it override telegram.
+  if [[ -n "${ALPHA_ENV_FILE:-}" && -f "$ALPHA_ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$ALPHA_ENV_FILE"
+    set +a
+  elif [[ -f "$HOME/.alpha/env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$HOME/.alpha/env"
+    set +a
+  elif [[ -f "$ROOT/.env" ]]; then
     set -a
     # shellcheck disable=SC1091
     source "$ROOT/.env"

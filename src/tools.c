@@ -833,6 +833,7 @@ static sds list_dir(const char *path) {
     return out;
 }
 
+<<<<<<< Updated upstream
 /* --- web_search: DuckDuckGo HTML (no API key, no JS) ----------------------
  *
  * Fetches the non-JS HTML search at html.duckduckgo.com/html/ and extracts
@@ -1799,6 +1800,34 @@ static sds working_diff(const char *cwd, const char *mode) {
         result = sdscat(result, "(no changes)\n");
 
     return result;
+=======
+/* Build a resolved path from a tool argument and the current working directory.
+ *
+ * Every tool that accepts a path must go through this function so that tilde
+ * expansion and relative-path resolution are applied the same way everywhere.
+ * Before this helper existed only list_dir expanded ~; read_file, write_file
+ * and edit_file treated "~/notes.txt" as a literal directory named "~". */
+static void resolve_path(char out[PATH_MAX], const char *path, const char *cwd) {
+    if (!path || !path[0]) {
+        if (cwd && cwd[0]) snprintf(out, PATH_MAX, "%s", cwd);
+        else snprintf(out, PATH_MAX, ".");
+        return;
+    }
+    if (path[0] == '/' || !cwd || !cwd[0])
+        snprintf(out, PATH_MAX, "%s", path);
+    else
+        snprintf(out, PATH_MAX, "%s/%s", cwd, path);
+    /* Expand leading ~ to the home directory (only ~ and ~/ are handled;
+     * ~user is rare in practice and would need getpwnam). */
+    if (out[0] == '~') {
+        const char *home = getenv("HOME");
+        if (home && home[0] && (out[1] == '/' || out[1] == 0)) {
+            char exp[PATH_MAX];
+            snprintf(exp, sizeof(exp), "%s%s", home, out + 1);
+            snprintf(out, PATH_MAX, "%s", exp);
+        }
+    }
+>>>>>>> Stashed changes
 }
 
 sds tools_run(const char *name, cJSON *args, const char *cwd) {
@@ -1835,6 +1864,7 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(args, "path"));
         if (!path) return sdsnew("ERROR: path required");
         char full[PATH_MAX];
+<<<<<<< Updated upstream
         if (path[0] == '/' || !cwd || !cwd[0])
             snprintf(full, sizeof(full), "%s", path);
         else
@@ -1848,6 +1878,9 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
                 "ERROR: %s has a binary extension (%s). "
                 "Use execute_bash with xxd, strings, or file instead.",
                 full, strrchr(full, '.') ? strrchr(full, '.') : "unknown");
+=======
+        resolve_path(full, path, cwd);
+>>>>>>> Stashed changes
         sds body = read_file_all(full, 250000);
         if (has_nul(body, sdslen(body))) {
             sdsfree(body);
@@ -1863,10 +1896,7 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         if (!path) return sdsnew("ERROR: path required");
         if (!content) content = "";
         char full[PATH_MAX];
-        if (path[0] == '/' || !cwd || !cwd[0])
-            snprintf(full, sizeof(full), "%s", path);
-        else
-            snprintf(full, sizeof(full), "%s/%s", cwd, path);
+        resolve_path(full, path, cwd);
         if (write_file_all(full, content, strlen(content)) != 0)
             return sdscatprintf(sdsempty(), "ERROR write %s: %s", full, strerror(errno));
         return sdscatprintf(sdsempty(), "OK wrote %zu bytes → %s", strlen(content), full);
@@ -1878,10 +1908,7 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         if (!path || !old_s) return sdsnew("ERROR: path + old_str required");
         if (!new_s) new_s = "";
         char full[PATH_MAX];
-        if (path[0] == '/' || !cwd || !cwd[0])
-            snprintf(full, sizeof(full), "%s", path);
-        else
-            snprintf(full, sizeof(full), "%s/%s", cwd, path);
+        resolve_path(full, path, cwd);
         /* read_file_all truncates silently at its cap and appends a marker.
          * Editing that result would write the truncated text back and destroy
          * everything past the cap, while still reporting "OK". Refuse instead:
@@ -1962,26 +1989,7 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
     if (strcmp(name, "list_dir") == 0 || strcmp(name, "ls") == 0) {
         const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(args, "path"));
         char full[PATH_MAX];
-        if (!path || !path[0]) {
-            if (cwd && cwd[0]) snprintf(full, sizeof(full), "%s", cwd);
-            else snprintf(full, sizeof(full), ".");
-        } else if (path[0] == '/' || !cwd || !cwd[0]) {
-            snprintf(full, sizeof(full), "%s", path);
-        } else {
-            snprintf(full, sizeof(full), "%s/%s", cwd, path);
-        }
-        /* expand ~ */
-        if (full[0] == '~') {
-            const char *home = getenv("HOME");
-            if (home && home[0]) {
-                char exp[PATH_MAX];
-                if (full[1] == '/' || full[1] == 0)
-                    snprintf(exp, sizeof(exp), "%s%s", home, full + 1);
-                else
-                    snprintf(exp, sizeof(exp), "%s", full);
-                snprintf(full, sizeof(full), "%s", exp);
-            }
-        }
+        resolve_path(full, path, cwd);
         return list_dir(full);
     }
     if (strcmp(name, "browser") == 0 || strcmp(name, "web_browser") == 0) {
