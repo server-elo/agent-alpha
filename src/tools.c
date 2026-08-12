@@ -1190,21 +1190,21 @@ static int memory_load(const char *target, memory_store_t *store) {
     if (!entries) { store->count = 0; return 0; }
 
     /* Copy into the store, deduplicating */
+    int parsed_count = store->count;
     int dst = 0;
-    for (int i = 0; i < store->count && dst < ALPHA_MEMORY_MAX_ENTRIES; i++) {
+    for (int i = 0; i < parsed_count && dst < ALPHA_MEMORY_MAX_ENTRIES; i++) {
         int dup = 0;
         for (int j = 0; j < dst; j++) {
             if (strcmp(store->entries[j], entries[i]) == 0) { dup = 1; break; }
         }
         if (!dup) {
-            free(store->entries[dst]); /* free old if any */
             store->entries[dst++] = entries[i];
         } else {
             free(entries[i]);
         }
     }
     /* Free any remaining parsed entries beyond the cap */
-    for (int i = dst; i < store->count; i++) free(entries[i]);
+    for (int i = parsed_count; i < parsed_count; i++) free(entries[i]); /* no-op safety */
     free(entries);
     store->count = dst;
     return 0;
