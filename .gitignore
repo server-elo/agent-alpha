@@ -13,6 +13,7 @@ tests/bin/
 # Evolution run state: generation log and archived binaries. Also ignored so
 # `git clean -fd` after a reverted generation cannot delete them.
 evolution/
+sandbox/
 
 # Runtime logs
 telegram.log

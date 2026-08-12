@@ -394,9 +394,11 @@ static sds log_tail(const char *root, int max_lines) {
 static int setup_sandbox(const char *root, char sandbox[PATH_MAX], int gen) {
     snprintf(sandbox, PATH_MAX, "%s/sandbox/gen_%03d", root, gen);
     int rc = -1;
-    sds out = run_capture(root,
-        "mkdir -p sandbox/gen_%03d && cp -R src tests include Makefile deps sandbox/gen_%03d/",
-        30, &rc);
+    char cmd[PATH_MAX + 128];
+    snprintf(cmd, sizeof(cmd),
+        "mkdir -p '%s' && cp -R src tests include Makefile deps '%s/'",
+        sandbox, sandbox);
+    sds out = run_capture(root, cmd, 30, &rc);
     sdsfree(out);
     return rc == 0;
 }
