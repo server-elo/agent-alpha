@@ -1699,6 +1699,80 @@ static void test_memory_null_args(void) {
     memory_teardown();
 }
 
+/* --- ANSI escape stripping (ported from Hermes Agent ansi_strip.py) -------- */
+static void test_strip_ansi_func(void) {
+    TEST_BEGIN("strip_ansi: ANSI escape sequences are removed from shell output");
+
+    /* CSI color codes */
+    char buf1[] = "\033[31mred text\033[0m";
+    strip_ansi(buf1);
+    CHECK(strcmp(buf1, "red text") == 0, "CSI color codes removed");
+
+    /* CSI cursor movement */
+    char buf2[] = "\033[2J\033[Hhello";
+    strip_ansi(buf2);
+    CHECK(strcmp(buf2, "hello") == 0, "CSI cursor codes removed");
+
+    /* OSC title sequence (BEL-terminated) */
+    char buf3[] = "\033]0;My Title\007actual output";
+    strip_ansi(buf3);
+    CHECK(strcmp(buf3, "actual output") == 0, "OSC BEL-terminated removed");
+
+    /* OSC title sequence (ST-terminated) */
+    char buf4[] = "\033]0;My Title\033\\actual output";
+    strip_ansi(buf4);
+    CHECK(strcmp(buf4, "actual output") == 0, "OSC ST-terminated removed");
+
+    /* 8-bit C1 controls */
+    char buf5[] = "\x9b" "31m" "red text" "\x9b" "0m";
+    strip_ansi(buf5);
+    CHECK(strcmp(buf5, "red text") == 0, "8-bit CSI removed");
+
+    /* Plain text passes through unchanged */
+    char buf6[] = "hello world\nno escapes here";
+    strip_ansi(buf6);
+    CHECK(strcmp(buf6, "hello world\nno escapes here") == 0,
+          "plain text unchanged");
+
+    /* Empty string */
+    char buf7[] = "";
+    strip_ansi(buf7);
+    CHECK(strcmp(buf7, "") == 0, "empty string unchanged");
+
+    /* Mixed: text with embedded escapes */
+    char buf8[] = "before\033[1mbold\033[0mafter";
+    strip_ansi(buf8);
+    CHECK(strcmp(buf8, "beforeboldafter") == 0, "mixed text and escapes");
+
+    /* DCS string */
+    char buf9[] = "\033P0;0|16/16\033\\after";
+    strip_ansi(buf9);
+    CHECK(strcmp(buf9, "after") == 0, "DCS string removed");
+
+    /* nF escape (ESC SP F) */
+    char buf10[] = "\033 Fafter";
+    strip_ansi(buf10);
+    CHECK(strcmp(buf10, "after") == 0, "nF escape removed");
+
+    /* Fp single-byte escape (ESC 7 = DECSC) */
+    char buf11[] = "\0337saved\0338restored";
+    strip_ansi(buf11);
+    CHECK(strcmp(buf11, "savedrestored") == 0, "Fp single-byte escapes removed");
+
+    /* Integration: shell_run output with ANSI codes */
+    sds r = shell_run(
+        "printf '\\033[32mGREEN\\033[0m\\n\\033[1mBOLD\\033[0m\\nplain\\n'",
+        "/tmp");
+    CHECK(strstr(r, "GREEN") != NULL, "green text preserved");
+    CHECK(strstr(r, "BOLD") != NULL, "bold text preserved");
+    CHECK(strstr(r, "plain") != NULL, "plain text preserved");
+    /* The escape sequences themselves must be gone */
+    CHECK(strstr(r, "\033[32m") == NULL, "CSI 32m removed from shell output");
+    CHECK(strstr(r, "\033[0m") == NULL, "CSI 0m removed from shell output");
+    CHECK(strstr(r, "\033[1m") == NULL, "CSI 1m removed from shell output");
+    sdsfree(r);
+}
+
 int main(void) {
     test_mkdir_no_shell();
     test_write_file_no_shell();
@@ -1750,6 +1824,7 @@ int main(void) {
     test_memory_char_limit();
     test_memory_multiple_entries();
     test_memory_null_args();
+    test_strip_ansi_func();
     system("rm -rf /tmp/alpha_t");
     return test_report("tools");
 }

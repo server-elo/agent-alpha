@@ -418,6 +418,95 @@ static void pt_kill_all(proctrack_t *t) {
     for (int i = 0; i < t->n; i++) kill(t->pids[i], SIGKILL);
 }
 
+/* --- ANSI escape stripping (ported from Hermes Agent ansi_strip.py) ---------
+ *
+ * ANSI escape sequences in command output confuse the model and cause it to
+ * copy escape sequences into file writes. Strip them from shell_run output
+ * before returning it to the model.
+ *
+ * Covers: CSI (ESC[), OSC (ESC]), DCS/SOS/PM/APC strings, nF multi-byte
+ * escapes, Fp/Fe/Fs single-byte escapes, and 8-bit C1 control characters
+ * (0x80-0x9F). */
+
+/* Fast-path check: does the string contain any ESC or C1 byte? */
+static int has_escape_bytes(const char *s, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == 0x1b || (c >= 0x80 && c <= 0x9f)) return 1;
+    }
+    return 0;
+}
+
+/* Strip ANSI escape sequences in-place. Returns the new length. */
+static size_t strip_ansi(char *s) {
+    if (!s || !s[0]) return 0;
+    size_t len = strlen(s);
+    if (!has_escape_bytes(s, len)) return len;
+
+    char *w = s;
+    const char *r = s;
+    while (*r) {
+        unsigned char c = (unsigned char)*r;
+        if (c == 0x1b) {
+            r++;
+            if (!*r) break;
+            c = (unsigned char)*r;
+            if (c == '[') {
+                /* CSI: ESC[ param* intermediate* final */
+                r++;
+                /* Skip parameter bytes (0x30-0x3F) */
+                while (*r && (unsigned char)*r >= 0x30 && (unsigned char)*r <= 0x3f) r++;
+                /* Skip intermediate bytes (0x20-0x2F) */
+                while (*r && (unsigned char)*r >= 0x20 && (unsigned char)*r <= 0x2f) r++;
+                /* Consume final byte (0x40-0x7E) */
+                if (*r && (unsigned char)*r >= 0x40 && (unsigned char)*r <= 0x7e) r++;
+            } else if (c == ']') {
+                /* OSC: ESC] ... (BEL or ST) */
+                r++;
+                while (*r && *r != 0x07 && !(*r == 0x1b && r[1] == '\\')) r++;
+                if (*r == 0x07) r++;
+                else if (*r == 0x1b && r[1] == '\\') r += 2;
+            } else if (c == 'P' || c == 'X' || c == '^' || c == '_') {
+                /* DCS/SOS/PM/APC: ESC P/X/^/_ ... ST */
+                r++;
+                while (*r && !(*r == 0x1b && r[1] == '\\')) r++;
+                if (*r == 0x1b && r[1] == '\\') r += 2;
+            } else if (c >= 0x20 && c <= 0x2f) {
+                /* nF escape: ESC nF* final */
+                r++;
+                while (*r && (unsigned char)*r >= 0x20 && (unsigned char)*r <= 0x2f) r++;
+                if (*r && (unsigned char)*r >= 0x30 && (unsigned char)*r <= 0x7e) r++;
+            } else if (c >= 0x30 && c <= 0x7e) {
+                /* Fp/Fe/Fs single-byte */
+                r++;
+            } else {
+                /* Unknown escape, skip the ESC */
+                /* (already advanced past ESC) */
+            }
+        } else if (c >= 0x80 && c <= 0x9f) {
+            /* 8-bit C1 control character */
+            if (c == 0x9b) {
+                /* 8-bit CSI */
+                r++;
+                while (*r && (unsigned char)*r >= 0x30 && (unsigned char)*r <= 0x3f) r++;
+                while (*r && (unsigned char)*r >= 0x20 && (unsigned char)*r <= 0x2f) r++;
+                if (*r && (unsigned char)*r >= 0x40 && (unsigned char)*r <= 0x7e) r++;
+            } else if (c == 0x9d) {
+                /* 8-bit OSC */
+                r++;
+                while (*r && (unsigned char)*r != 0x07 && (unsigned char)*r != 0x9c) r++;
+                if (*r) r++;
+            } else {
+                r++;
+            }
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = 0;
+    return (size_t)(w - s);
+}
+
 /* /bin/zsh is the macOS default but is frequently absent on Linux, where
  * exec'ing it left every command failing with 127. Take ALPHA_SHELL if set,
  * else the first shell that actually exists. /bin/sh is guaranteed by POSIX,
@@ -544,6 +633,10 @@ static sds shell_run(const char *cmd, const char *cwd) {
         if (out) sdsfree(out);
         out = sdsnew("(no output)");
     }
+    /* Strip ANSI escape sequences before the model sees them. ANSI codes in
+     * command output confuse the model and cause it to copy escape sequences
+     * into file writes. The strip is done in-place on the sds buffer. */
+    strip_ansi(out);
     if (cancelled)
         out = sdscat(out, "\nERROR: command interrupted by the user.");
     else if (timed_out)
