@@ -304,7 +304,7 @@ static sds build_request_body(const alpha_cfg_t *cfg, cJSON *messages, int with_
             model, msgs_s ? msgs_s : "[]", stream ? "true" : "false",
             temp + 0.2, max_tokens);
     }
-    free(msgs_s);
+    sdsfree(msgs_s);
     return body;
 }
 
