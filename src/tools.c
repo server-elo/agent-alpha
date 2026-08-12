@@ -1848,6 +1848,40 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
                 "ERROR: %s is binary (contains NUL bytes). Editing it as text "
                 "would discard everything after the first NUL.", full);
         }
+        /* is_already_applied: the most common edit failure in production is a
+         * re-send of an edit that has already landed (old_str == new_str, or
+         * old_str gone while new_str is present). Surface that as an explicit
+         * success-shaped no-op so the model moves on instead of re-reading
+         * and re-patching. Ported from Hermes Agent's fuzzy_match.py.
+         *
+         * Deliberately conservative:
+         * - new_str must be non-trivial (>= 8 chars stripped) — a tiny target
+         *   matching by coincidence must not mask a genuine typo'd edit;
+         * - new_str must appear EXACTLY in the content (no fuzzy matching);
+         * - when old_str differs from new_str, old_str must be GONE. */
+        {
+            /* Strip leading/trailing whitespace from new_str for the length check */
+            const char *ns = new_s;
+            while (*ns == ' ' || *ns == '\t' || *ns == '\n' || *ns == '\r') ns++;
+            size_t ns_len = strlen(ns);
+            while (ns_len > 0 && (ns[ns_len - 1] == ' ' || ns[ns_len - 1] == '\t' ||
+                                  ns[ns_len - 1] == '\n' || ns[ns_len - 1] == '\r'))
+                ns_len--;
+            if (ns_len >= 8 && strstr(body, new_s)) {
+                if (strcmp(old_s, new_s) == 0) {
+                    sdsfree(body);
+                    return sdsnew("OK (no change): old_str and new_str are identical, "
+                                  "and the file already contains this text.");
+                }
+                if (!strstr(body, old_s)) {
+                    sdsfree(body);
+                    return sdsnew("OK (no change): the edit appears to be already "
+                                  "applied — new_str is present and old_str is gone. "
+                                  "Do not re-send this patch.");
+                }
+            }
+        }
+
         char *pos = strstr(body, old_s);
         if (!pos) {
             sdsfree(body);
