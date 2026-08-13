@@ -522,6 +522,16 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
         }
         printf("[evolve] sandbox: %s\n", sandbox);
 
+        /* Take Warden cryptographic SHA-256 seal snapshot of protected files BEFORE model edits */
+        evolve_hash_table seal_before;
+        sds seal_init_report = NULL;
+        if (!evolve_seal_snapshot(root, seal_before, &seal_init_report)) {
+            fprintf(stderr, "[evolve] Warden seal initialization failed: %s\n", seal_init_report ? seal_init_report : "unknown");
+            sdsfree(seal_init_report);
+            break;
+        }
+        sdsfree(seal_init_report);
+
         /* 1. BEFORE Benchmark: Run pre-mutation baseline benchmark on current binary. */
         const char *bm = (cfg->model && cfg->model[0]) ? cfg->model : "local";
         int before_rc = -1;
@@ -544,7 +554,20 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
         fflush(stdout);
 
         sds report = NULL;
-        int ok = !alpha_cancel && (reply && reply[0] && strcmp(reply, "ERROR: empty response from LLM") != 0) && evolve_gate(root, cfg->model, &report);
+        int ok = !alpha_cancel && (reply && reply[0] && strcmp(reply, "ERROR: empty response from LLM") != 0);
+
+        /* Verify Warden cryptographic seal & git protection BEFORE running gate */
+        if (ok) {
+            if (!evolve_seal_verify(root, seal_before, &report)) {
+                ok = 0;
+            } else if (!evolve_git_protected_clean(root, &report)) {
+                ok = 0;
+            }
+        }
+
+        if (ok) {
+            ok = evolve_gate(root, cfg->model, &report);
+        }
 
         /* 2. AFTER Benchmark & Comparison: Run post-mutation benchmark on new binary */
         if (ok) {
