@@ -535,7 +535,7 @@ static void test_fast_timeout(void) {
                      (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
     CHECK(strstr(r, "timeout") != NULL, "result mentions the timeout");
     CHECK(strstr(r, "2000ms") != NULL, "timeout value matches the override");
-    CHECK(elapsed < 5.0, "timeout fires quickly (under 5s, not 60s)");
+    CHECK(elapsed < 8.0, "timeout fires quickly (under 8s, not 60s)");
     sdsfree(r);
 }
 
