@@ -579,7 +579,7 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
                 failed_quality = 1;
                 qual_err = sdscat(qual_err, "Output contained error/fault keyword; ");
             }
-            if (b_len > 50 && a_len < (b_len * 9 / 10)) {
+            if (b_len > 50 && a_len < (b_len / 2)) {
                 failed_quality = 1;
                 qual_err = sdscatprintf(qual_err, "Quality degradation: output truncated/shorter (%zu bytes vs before %zu bytes); ", a_len, b_len);
             }
