@@ -291,17 +291,17 @@ static int evolve_warden_model_bench(
     return 1;
 }
 
-static int evolve_gate(const char *root, const char *model, sds *report) {
+static int evolve_gate(const char *build_dir, const char *model, sds *report) {
     *report = sdsempty();
     int rc = -1;
 
     /* Reject if tests/ or Makefile changed */
-    if (!evolve_git_protected_clean(root, report)) {
+    if (!evolve_git_protected_clean(build_dir, report)) {
         return 0;
     }
 
     /* Build */
-    sds out = run_capture(root, "make -j4", 600, &rc);
+    sds out = run_capture(build_dir, "make -j4", 600, &rc);
     if (rc != 0) {
         report_tail(report, "make -j4", out);
         *report = sdscat(*report, "FAIL: build\n");
@@ -311,7 +311,7 @@ static int evolve_gate(const char *root, const char *model, sds *report) {
     sdsfree(out);
 
     /* Tests */
-    out = run_capture(root, "make test", 900, &rc);
+    out = run_capture(build_dir, "make test", 900, &rc);
     int tests_ok = (rc == 0 && out && strstr(out, "ALL TESTS PASSED") && strstr(out, "=== tests/bin/"));
     if (!tests_ok) {
         report_tail(report, "make test", out);
@@ -328,23 +328,23 @@ static int evolve_gate(const char *root, const char *model, sds *report) {
     sdsfree(out);
 
     /* Warden smoke test */
-    if (!evolve_warden_smoke(root, report)) {
+    if (!evolve_warden_smoke(build_dir, report)) {
         return 0;
     }
 
     /* Warden model benchmark */
-    if (!strstr(root, "_fixture")) {
-        if (!evolve_warden_model_bench(root, model, report)) {
+    if (!strstr(build_dir, "_fixture")) {
+        if (!evolve_warden_model_bench(build_dir, model, report)) {
             return 0;
         }
 
-        /* Run domain-specific 360° real task benchmark */
-        if (!run_domain_benchmark(root, model, report)) {
+        /* Run domain-specific 360° real task benchmark */  
+        if (!run_domain_benchmark(build_dir, model, report)) {
             return 0;
         }
     }
 
-    *report = sdscat(*report, "OK: build + tests + smoke + domain benchmark\n");
+    *report = sdscat(*report, "OK: build + tests + warden smoke + model benchmark + domain benchmark\n");
     return 1;
 }
 
@@ -576,7 +576,7 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
         /* Take Warden cryptographic SHA-256 seal snapshot of protected files BEFORE model edits */
         evolve_hash_table seal_before;
         sds seal_init_report = NULL;
-        if (!evolve_seal_snapshot(root, seal_before, &seal_init_report)) {
+        if (!evolve_seal_snapshot(sandbox, seal_before, &seal_init_report)) {
             fprintf(stderr, "[evolve] Warden seal initialization failed: %s\n", seal_init_report ? seal_init_report : "unknown");
             sdsfree(seal_init_report);
             break;
@@ -609,15 +609,15 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
 
         /* Verify Warden cryptographic seal & git protection BEFORE running gate */
         if (ok) {
-            if (!evolve_seal_verify(root, seal_before, &report)) {
+            if (!evolve_seal_verify(sandbox, seal_before, &report)) {
                 ok = 0;
-            } else if (!evolve_git_protected_clean(root, &report)) {
+            } else if (!evolve_git_protected_clean(sandbox, &report)) {
                 ok = 0;
             }
         }
 
         if (ok) {
-            ok = evolve_gate(root, cfg->model, &report);
+            ok = evolve_gate(sandbox, cfg->model, &report);
         }
 
         /* 2. AFTER Benchmark & Comparison: Run post-mutation benchmark on new binary */
