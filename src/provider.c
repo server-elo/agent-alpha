@@ -33,6 +33,7 @@ static const alpha_provider_t PROVIDERS[] = {
     { "mistral",    "https://api.mistral.ai/v1",              "MISTRAL_API_KEY",  "mistral-large-latest",    0 },
     { "deepseek",   "https://api.deepseek.com/v1",            "DEEPSEEK_API_KEY", "deepseek-chat",           0 },
     { "xai",        "https://api.x.ai/v1",                    "XAI_API_KEY",      "grok-2-latest",           0 },
+    { "gemini",     "https://generativelanguage.googleapis.com/v1beta/openai/", "GEMINI_API_KEY", "gemini-2.5-flash", 0 },
 };
 
 #define NPROVIDERS ((int)(sizeof(PROVIDERS) / sizeof(PROVIDERS[0])))
