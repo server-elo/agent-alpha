@@ -205,27 +205,102 @@ static int run_domain_benchmark(const char *root, const char *model, sds *report
 /* A generation survives only if every stage passes. The model already ran
  * these commands itself; running them again here is what makes its claims
  * unforgeable. */
+
+/* --- Warden execution helpers ---------------------------------------- */
+
+static int evolve_warden_smoke(
+    const char *dir,
+    sds *report
+) {
+    warden_limits_t lim = warden_limits_default();
+    lim.timeout_ms = 30000;
+
+    char out[8192];
+
+    char *const argv[] = {
+        (char *)"./alpha",
+        (char *)"--providers",
+        NULL
+    };
+
+    int rc = warden_execute_capture(
+        dir,
+        "./alpha",
+        argv,
+        &lim,
+        out,
+        sizeof(out)
+    );
+
+    if (rc != WARDEN_OK) {
+        if (report) {
+            *report = sdscatprintf(
+                *report,
+                "FAIL: Warden smoke test failed rc=%d\n%.4000s\n",
+                rc,
+                out
+            );
+        }
+        return 0;
+    }
+
+    return 1;
+}
+
+static int evolve_warden_model_bench(
+    const char *dir,
+    const char *model,
+    sds *report
+) {
+    const char *m = (model && model[0]) ? model : "local";
+
+    warden_limits_t lim = warden_limits_default();
+    lim.timeout_ms = 60000;
+
+    char out[8192];
+
+    char *const argv[] = {
+        (char *)"./alpha",
+        (char *)"-m",
+        (char *)m,
+        (char *)"hi",
+        NULL
+    };
+
+    int rc = warden_execute_capture(
+        dir,
+        "./alpha",
+        argv,
+        &lim,
+        out,
+        sizeof(out)
+    );
+
+    if (rc != WARDEN_OK || out[0] == '\0' || strstr(out, "ERROR")) {
+        if (report) {
+            *report = sdscatprintf(
+                *report,
+                "FAIL: Warden model benchmark failed rc=%d\n%.4000s\n",
+                rc,
+                out
+            );
+        }
+        return 0;
+    }
+
+    return 1;
+}
+
 static int evolve_gate(const char *root, const char *model, sds *report) {
     *report = sdsempty();
     int rc = -1;
 
-    /* Reward-hacking guard: a generation that deletes source or test files
-     * to make the suite pass is reverted, whatever the suite then says. */
-    sds status = run_capture(root, "git status --porcelain", 30, &rc);
-    if (rc == 0) {
-        char *save = NULL;
-        for (char *line = strtok_r(status, "\n", &save); line;
-             line = strtok_r(NULL, "\n", &save)) {
-            if (line[0] == 'D' || line[1] == 'D') {
-                *report = sdscatprintf(*report,
-                    "FAIL: tracked file deleted: %s\n", line + 3);
-                sdsfree(status);
-                return 0;
-            }
-        }
+    /* Reject if tests/ or Makefile changed */
+    if (!evolve_git_protected_clean(root, report)) {
+        return 0;
     }
-    sdsfree(status);
 
+    /* Build */
     sds out = run_capture(root, "make -j4", 600, &rc);
     if (rc != 0) {
         report_tail(report, "make -j4", out);
@@ -235,21 +310,12 @@ static int evolve_gate(const char *root, const char *model, sds *report) {
     }
     sdsfree(out);
 
-    /* The string, not just the exit code: a Makefile whose test target was
-     * edited to exit 0 without running anything must not pass. */
+    /* Tests */
     out = run_capture(root, "make test", 900, &rc);
-    /* "ALL TESTS PASSED" alone is not enough: a generation that edits the
-     * Makefile test target to just echo that string and exit 0 would pass
-     * every check here. The run-tests recipe prints "=== tests/bin/name ==="
-     * for each binary it actually executes, so require at least one such
-     * line as proof that the recipe ran rather than being bypassed. */
-    int tests_ok = (rc == 0 && out
-                    && strstr(out, "ALL TESTS PASSED")
-                    && strstr(out, "=== tests/bin/"));
+    int tests_ok = (rc == 0 && out && strstr(out, "ALL TESTS PASSED") && strstr(out, "=== tests/bin/"));
     if (!tests_ok) {
         report_tail(report, "make test", out);
-        if (rc == 0 && out && strstr(out, "ALL TESTS PASSED")
-            && !strstr(out, "=== tests/bin/"))
+        if (rc == 0 && out && strstr(out, "ALL TESTS PASSED") && !strstr(out, "=== tests/bin/"))
             *report = sdscat(*report,
                 "FAIL: test suite (ALL TESTS PASSED was printed but no test "
                 "binary actually ran — the Makefile test target may have been "
@@ -261,31 +327,16 @@ static int evolve_gate(const char *root, const char *model, sds *report) {
     }
     sdsfree(out);
 
-    /* The suite cannot cover its own startup path; a binary that wedges or
-     * crashes before answering --providers was observed passing make test. */
-    out = run_capture(root, "./alpha --providers", 30, &rc);
-    sdsfree(out);
-    if (rc != 0) {
-        *report = sdscat(*report, "FAIL: new binary smoke test\n");
+    /* Warden smoke test */
+    if (!evolve_warden_smoke(root, report)) {
         return 0;
     }
 
-    /* Benchmarking / 360° Real Model Comparison:
-     * Run a real tool invocation check via the compiled binary to measure execution
-     * speed and response health before approving the generation. Skip in throwaway
-     * test fixture runs (which do not have a real API key or config). */
+    /* Warden model benchmark */
     if (!strstr(root, "_fixture")) {
-        const char *m = (model && model[0]) ? model : "local";
-        sds cmd = sdscatprintf(sdsempty(), "./alpha -m %s \"hi\" 2>&1", m);
-        out = run_capture(root, cmd, 30, &rc);
-        sdsfree(cmd);
-        if (rc != 0 || !out || sdslen(out) == 0 || strstr(out, "ERROR")) {
-            report_tail(report, "./alpha model benchmark", out);
-            *report = sdscat(*report, "FAIL: real model execution benchmark\n");
-            sdsfree(out);
+        if (!evolve_warden_model_bench(root, model, report)) {
             return 0;
         }
-        sdsfree(out);
 
         /* Run domain-specific 360° real task benchmark */
         if (!run_domain_benchmark(root, model, report)) {
