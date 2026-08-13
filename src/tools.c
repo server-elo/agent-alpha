@@ -1242,16 +1242,18 @@ static sds todo_tool_run(cJSON *args) {
 #define ALPHA_MEMORY_ARENA_SIZE 4096
 
 /* Bump allocator (arena) — ported from clay.h's Clay_Arena pattern.
- * O(1) alloc, O(1) free-all. No individual free() calls needed. */
+ * O(1) alloc, O(1) free-all. No individual free() calls needed.
+ *
+ * The buffer is embedded in the struct so the arena is always valid without
+ * a separate init call — zero-initialization sets offset=0 and the buf[]
+ * exists at a fixed address. This matters when the memory module is compiled
+ * as part of a test that does not call memory_init(). */
 typedef struct {
-    char *base;       /* base of arena memory */
-    size_t size;      /* total capacity */
-    size_t offset;    /* current bump offset (next free byte) */
+    char buf[ALPHA_MEMORY_ARENA_SIZE];
+    size_t offset;
 } arena_t;
 
-static void arena_init(arena_t *a, char *buf, size_t sz) {
-    a->base = buf;
-    a->size = sz;
+static void arena_init(arena_t *a) {
     a->offset = 0;
 }
 
@@ -1262,8 +1264,8 @@ static void arena_reset(arena_t *a) {
 static char *arena_alloc(arena_t *a, size_t sz) {
     /* Align to 8 bytes so subsequent allocations are naturally aligned. */
     size_t aligned = (sz + 7) & ~(size_t)7;
-    if (a->offset + aligned > a->size) return NULL;
-    char *p = a->base + a->offset;
+    if (a->offset + aligned > sizeof(a->buf)) return NULL;
+    char *p = a->buf + a->offset;
     a->offset += aligned;
     return p;
 }
@@ -1273,7 +1275,6 @@ typedef struct {
     int count;
     int char_limit;
     arena_t arena;                /* bump allocator for this store's entries */
-    char arena_buf[ALPHA_MEMORY_ARENA_SIZE]; /* backing memory for the arena */
 } memory_store_t;
 
 static memory_store_t g_memory_store = { .count = 0, .char_limit = ALPHA_MEMORY_CHAR_LIMIT };
@@ -1406,8 +1407,8 @@ void memory_free_store(memory_store_t *store) {
 /* Initialize both stores from disk. Called once at startup. */
 void memory_init(void) {
     pthread_mutex_lock(&g_memory_lock);
-    arena_init(&g_memory_store.arena, g_memory_store.arena_buf, ALPHA_MEMORY_ARENA_SIZE);
-    arena_init(&g_user_store.arena, g_user_store.arena_buf, ALPHA_MEMORY_ARENA_SIZE);
+    arena_init(&g_memory_store.arena);
+    arena_init(&g_user_store.arena);
     g_memory_store.count = 0;
     g_user_store.count = 0;
     memory_load("memory", &g_memory_store);
