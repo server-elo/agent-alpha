@@ -73,11 +73,18 @@ typedef struct {
     int local;                  /* runs on this machine: no key required */
 } alpha_provider_t;
 
+/* Look up a provider preset by name (e.g. "ollama", "openai", "anthropic").
+ * Returns NULL if no preset with that name exists. */
 const alpha_provider_t *alpha_provider_by_name(const char *name);
+
 /* Best-effort match of a base URL back to a preset, so an explicit
- * ALPHA_BASE_URL still picks up that provider's key env var and default model. */
+ * ALPHA_BASE_URL still picks up that provider's key env var and default model.
+ * Returns NULL if no preset matches the URL. */
 const alpha_provider_t *alpha_provider_by_url(const char *base_url);
-const alpha_provider_t *alpha_provider_at(int i);   /* NULL past the end */
+
+/* Iterate over all known provider presets. Returns the i-th preset, or NULL
+ * when i is past the end. Start at i=0 and call repeatedly. */
+const alpha_provider_t *alpha_provider_at(int i);
 
 /* Streaming/tool progress, so a front end can render a reply as it arrives
  * instead of after it finishes. All fields optional. */
@@ -112,10 +119,20 @@ void alpha_cfg_defaults(alpha_cfg_t *cfg);
  * shell command. Cleared by the agent loop when it starts a new request. */
 extern volatile sig_atomic_t alpha_cancel;
 
-/* messages: cJSON array of chat messages (owned by caller).
- * with_tools=0 → plain chat completion (fast, no tool schema). */
-/* out_failed (optional): set to 1 on transport/HTTP/parse failure.
- * Never infer failure from the text — a model may legitimately reply "ERROR: ...". */
+/* --- llm_chat_ex / llm_chat -------------------------------------------------
+ *
+ * Send a chat completion request to the configured LLM endpoint.
+ *
+ *   messages:    cJSON array of chat messages (owned by caller).
+ *   out_message: (output) set to the assistant's reply message object, or NULL
+ *                on failure. Caller must cJSON_Delete it.
+ *   with_tools:  0 → plain chat completion (fast, no tool schema).
+ *   out_failed:  (optional) set to 1 on transport/HTTP/parse failure.
+ *                Never infer failure from the text — a model may legitimately
+ *                reply "ERROR: ...".
+ *
+ * Returns the assistant's reply text as an sds string (caller frees).
+ * llm_chat is a convenience wrapper that discards out_failed. */
 sds llm_chat_ex(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message,
                 int with_tools, int *out_failed);
 sds llm_chat(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message, int with_tools);
@@ -137,10 +154,17 @@ sds memory_format_for_prompt(const char *target);
 #define ALPHA_WS_MAX_MESSAGE (16u * 1024 * 1024)
 #endif
 
-/* Pure-C browser tool (CDP, with a macOS open fallback). */
+/* Pure-C browser tool (CDP, with a macOS open fallback).
+ * args is a JSON object with the browser action and parameters.
+ * Returns the browser output as an sds string (caller frees). */
 sds browser_tool_run(cJSON *args);
 
-/* OpenAI-style tools array for request. Caller frees. */
+/* Build the OpenAI-style tools array describing every tool Alpha supports.
+ * The result is a cJSON array of function objects, each with name, description,
+ * and parameters schema. Caller must cJSON_Delete the result.
+ *
+ * The schema is built once per call (not cached) so the tool descriptions can
+ * be updated at runtime if needed. */
 cJSON *tools_schema(void);
 
 /* One-shot (no memory). */
