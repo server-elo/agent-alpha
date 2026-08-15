@@ -590,7 +590,7 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
         clock_gettime(CLOCK_MONOTONIC, &b_t0);
         sds before_cmd = sdscatprintf(sdsempty(),
             "./alpha -m %s \"Use memory tool to add entry bench_before='val_before' then retrieve memory\" 2>&1", bm);
-        sds before_bench = run_capture(root, before_cmd, 120, &before_rc);
+        sds before_bench = run_capture(root, before_cmd, 300, &before_rc);
         sdsfree(before_cmd);
         clock_gettime(CLOCK_MONOTONIC, &b_t1);
         double before_secs = (double)(b_t1.tv_sec - b_t0.tv_sec) + (double)(b_t1.tv_nsec - b_t0.tv_nsec) / 1e9;
@@ -627,7 +627,7 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
             clock_gettime(CLOCK_MONOTONIC, &a_t0);
             sds after_cmd = sdscatprintf(sdsempty(),
                 "./alpha -m %s \"Use memory tool to add entry bench_after='val_after' then retrieve memory\" 2>&1", bm);
-            sds after_bench = run_capture(root, after_cmd, 120, &after_rc);
+            sds after_bench = run_capture(root, after_cmd, 300, &after_rc);
             sdsfree(after_cmd);
             clock_gettime(CLOCK_MONOTONIC, &a_t1);
             double after_secs = (double)(a_t1.tv_sec - a_t0.tv_sec) + (double)(a_t1.tv_nsec - a_t0.tv_nsec) / 1e9;
