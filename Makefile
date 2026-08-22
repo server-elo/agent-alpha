@@ -7,11 +7,18 @@ SRC = src/main.c src/agent_loop.c src/llm.c src/tools.c src/browser.c src/telegr
 OBJ = $(SRC:.c=.o)
 TARGET = alpha
 
-.PHONY: all clean run telegram repl install test
+MCP_SRC = src/mcp_main.c src/tools.c src/browser.c src/provider.c src/ui.c deps/cJSON.c deps/sds.c
+MCP_OBJ = $(MCP_SRC:.c=.o)
+MCP_TARGET = alpha-mcp
 
-all: $(TARGET)
+.PHONY: all clean run telegram repl install test alpha-mcp
+
+all: $(TARGET) $(MCP_TARGET)
 
 $(TARGET): $(OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(MCP_TARGET): $(MCP_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 src/%.o: src/%.c include/alpha.h src/ui.h
