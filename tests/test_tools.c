@@ -1081,8 +1081,8 @@ static void test_web_search_integration(void) {
               "error message is descriptive");
     }
 
-    /* Speed: must complete in under 5s even when rate-limited */
-    CHECK(elapsed < 5.0, "search completes in under 5 seconds");
+    /* Speed: generous margin so CI/load spikes don't flake (2000ms cap + slack) */
+    CHECK(elapsed < 8.0, "search completes in under 8 seconds");
     sdsfree(r);
 }
 

@@ -653,7 +653,12 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
                 failed_quality = 1;
                 qual_err = sdscat(qual_err, "Output contained error/fault keyword; ");
             }
-            if (b_len > 50 && a_len < (b_len / 2)) {
+            /* Only flag real truncation: output collapsing to near-nothing.
+             * LLM output length naturally varies between runs -- rejecting
+             * concise-but-correct answers reverted good mutations (gens
+             * 18/19/21). A short answer that still exits 0 with no error
+             * keywords did the task. */
+            if (b_len > 400 && a_len < 100) {
                 failed_quality = 1;
                 qual_err = sdscatprintf(qual_err, "Quality degradation: output truncated/shorter (%zu bytes vs before %zu bytes); ", a_len, b_len);
             }

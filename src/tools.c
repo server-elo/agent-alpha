@@ -563,6 +563,18 @@ static const char *shell_path(void) {
     return "/bin/sh";
 }
 
+/* Single-quote a string for safe embedding in a POSIX shell command.
+ * Each embedded single quote becomes '\'' (close, escaped quote, reopen). */
+static sds shell_quote(const char *s) {
+    if (!s) s = "";
+    sds out = sdscatlen(sdsempty(), "'", 1);
+    for (const char *p = s; *p; p++) {
+        if (*p == '\'') out = sdscatlen(out, "'\\''", 4);
+        else out = sdscatlen(out, p, 1);
+    }
+    return sdscatlen(out, "'", 1);
+}
+
 static sds shell_run(const char *cmd, const char *cwd) {
     if (!cmd || !cmd[0]) return sdsnew("ERROR: empty command");
 
@@ -1863,6 +1875,25 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
     if (!name) return sdsnew("ERROR: no tool name");
     if (!args) args = cJSON_CreateObject();
 
+    if (strcmp(name, "execute_powershell") == 0 || strcmp(name, "pwsh") == 0) {
+        const char *cmd = cJSON_GetStringValue(cJSON_GetObjectItem(args, "command"));
+        if (!cmd) cmd = cJSON_GetStringValue(cJSON_GetObjectItem(args, "script"));
+        if (!cmd || !cmd[0]) return sdsnew("ERROR: empty PowerShell command");
+        /* Fail fast with an install hint instead of a bare exec-not-found. */
+        if (access("/opt/homebrew/bin/pwsh", X_OK) != 0
+            && system("command -v pwsh >/dev/null 2>&1") != 0)
+            return sdsnew("ERROR: pwsh (PowerShell 7+) is not installed. "
+                          "Install it with: brew install --cask powershell");
+        /* Prefer Homebrew pwsh; fall back to PATH. -NoProfile keeps startup
+         * fast and prevents user profile scripts from hijacking the agent. */
+        sds pwsh_cmd = sdscatprintf(sdsempty(),
+            "command -v pwsh >/dev/null 2>&1 && pwsh -NoProfile -NonInteractive -Command %s 2>&1 || /opt/homebrew/bin/pwsh -NoProfile -NonInteractive -Command %s 2>&1",
+            shell_quote(cmd), shell_quote(cmd));
+        sds out = shell_run(pwsh_cmd, cwd);
+        sdsfree(pwsh_cmd);
+        return out;
+    }
+
     if (strcmp(name, "execute_bash") == 0 || strcmp(name, "bash") == 0) {
         const char *cmd = cJSON_GetStringValue(cJSON_GetObjectItem(args, "command"));
         if (!cmd) cmd = cJSON_GetStringValue(cJSON_GetObjectItem(args, "cmd"));
@@ -2042,6 +2073,10 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
 cJSON *tools_schema(void) {
     const char *json =
         "["
+        "{\"type\":\"function\",\"function\":{\"name\":\"execute_powershell\","
+        "\"description\":\"Execute PowerShell 7+ via pwsh (pipelines, objects, scripts). macOS.\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"command\":{\"type\":\"string\",\"description\":\"PowerShell command or script to run\"}},\"required\":[\"command\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"execute_bash\","
         "\"description\":\"Run any shell command (open; no sandbox).\","
         "\"parameters\":{\"type\":\"object\",\"properties\":{"

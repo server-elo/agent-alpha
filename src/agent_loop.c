@@ -351,7 +351,30 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
         trim_live_messages(messages);
         cJSON *msg = NULL;
         int failed = 0;
-        sds content = llm_chat_ex(cfg, messages, &msg, 1 /* always tools available */, &failed);
+        sds content = NULL;
+        /* Transient provider hiccups (rate limits, 5xx, dropped connections)
+         * used to burn an entire turn or evolution generation. Retry only
+         * clearly-transient errors -- config errors (401/404) would fail
+         * identically on every attempt and just add latency. */
+        for (int attempt = 0;; attempt++) {
+            sdsfree(content);   /* NULL-safe: frees the previous failed attempt */
+            msg = NULL;
+            content = llm_chat_ex(cfg, messages, &msg,
+                                  1 /* always tools available */, &failed);
+            if (!failed || attempt >= 2) break;
+            int transient = strstr(content, "HTTP 429") != NULL
+                         || strstr(content, "HTTP 500") != NULL
+                         || strstr(content, "HTTP 502") != NULL
+                         || strstr(content, "HTTP 503") != NULL
+                         || strstr(content, "HTTP 504") != NULL
+                         || strstr(content, "cannot reach") != NULL
+                         || strstr(content, "timed out") != NULL;
+            if (!transient) break;
+            int backoff = 2 * (attempt + 1);
+            fprintf(stderr, "[alpha] transient LLM error, retrying in %ds...\n",
+                    backoff);
+            sleep(backoff);
+        }
         /* Only a real transport/HTTP/parse failure aborts. A model is allowed to
          * legitimately answer with text starting "ERROR: the build failed". */
         if (failed) {
