@@ -3,7 +3,7 @@ CFLAGS = -std=c11 -Wall -Wextra -Werror=return-type -O2 -Iinclude -Ideps -pthrea
 LDFLAGS = -lcurl -pthread
 
 SRC = src/main.c src/agent_loop.c src/llm.c src/tools.c src/browser.c src/telegram.c \
-      src/provider.c src/ui.c src/evolve.c deps/cJSON.c deps/sds.c
+      src/provider.c src/ui.c src/evolve.c src/warden.c deps/cJSON.c deps/sds.c
 OBJ = $(SRC:.c=.o)
 TARGET = alpha
 
@@ -79,8 +79,8 @@ tests/bin/test_browser: tests/test_browser.c src/browser.c $(TEST_HDRS) | tests/
 # Includes evolve.c directly to reach the static gate/log helpers; agent_run
 # comes from the linked objects. The gate tests run a real make against a
 # throwaway fixture, never against this tree.
-tests/bin/test_evolve: tests/test_evolve.c src/evolve.c src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
-	$(CC) $(CFLAGS) -o $@ $< src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) $(LDFLAGS)
+tests/bin/test_evolve: tests/test_evolve.c src/evolve.c src/agent_loop.o src/llm.o src/tools.o src/warden.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
+	$(CC) $(CFLAGS) -o $@ $< src/agent_loop.o src/llm.o src/tools.o src/warden.o $(TEST_DEPS) $(LDFLAGS)
 
 tests/bin:
 	mkdir -p tests/bin

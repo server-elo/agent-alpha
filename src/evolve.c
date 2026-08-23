@@ -8,6 +8,7 @@
  * per-generation binaries. */
 
 #include "alpha.h"
+#include "warden.h"
 #include <fcntl.h>
 #include <stdint.h>
 #ifdef __APPLE__
@@ -206,7 +207,174 @@ static int run_domain_benchmark(const char *root, const char *model, sds *report
  * these commands itself; running them again here is what makes its claims
  * unforgeable. */
 
-/* --- Warden execution helpers ---------------------------------------- */
+/* --- Warden cryptographic seal ----------------------------------------------
+ *
+ * The model being evolved could otherwise edit its own gate: weaken a test,
+ * gut the Makefile, or rewrite evolve.c itself. The seal takes SHA-256 hashes
+ * of those protected files BEFORE the model edits anything, and verify()
+ * recomputes them AFTER. Any mismatch = the genome tried to tamper with its
+ * own harness, and the generation is rejected before the gate even runs.
+ * Missing files are recorded as all-zero hashes (also fails verify). */
+
+#define EVOLVE_PROTECTED_COUNT 4
+static const char *EVOLVE_PROTECTED_FILES[EVOLVE_PROTECTED_COUNT] = {
+    "Makefile", "src/evolve.c", "src/agent_loop.c", "tests/test_evolve.c"
+};
+
+typedef struct {
+    char hex[65];
+} seal_hash_t;
+
+typedef struct {
+    seal_hash_t files[EVOLVE_PROTECTED_COUNT];
+} evolve_hash_table;
+
+static int evolve_seal_snapshot(const char *sandbox_dir,
+                                evolve_hash_table *table,
+                                sds *report) {
+    if (!sandbox_dir || !table || !report) return 0;
+    sds err = sdsempty();
+    int ok = 1;
+    for (int i = 0; i < EVOLVE_PROTECTED_COUNT; i++) {
+        char full[PATH_MAX];
+        snprintf(full, sizeof(full), "%s/%s", sandbox_dir,
+                 EVOLVE_PROTECTED_FILES[i]);
+        char hex[65];
+        if (warden_sha256_file(full, hex) != WARDEN_OK) {
+            /* A protected file that cannot be read now cannot be verified
+             * later either -- refuse to arm the seal on an incomplete base. */
+            err = sdscatprintf(err, "seal: cannot hash %s; ",
+                               EVOLVE_PROTECTED_FILES[i]);
+            ok = 0;
+        } else {
+            memcpy(table->files[i].hex, hex, 65);
+        }
+    }
+    if (!ok) {
+        *report = sdscatprintf(*report ? *report : sdsempty(),
+            "FAIL: Warden seal initialization: %s\n", err);
+    }
+    sdsfree(err);
+    return ok;
+}
+
+static int evolve_seal_verify(const char *sandbox_dir,
+                              evolve_hash_table *table,
+                              sds *report) {
+    if (!sandbox_dir || !table || !report) return 0;
+    sds err = sdsempty();
+    int ok = 1;
+    for (int i = 0; i < EVOLVE_PROTECTED_COUNT; i++) {
+        char full[PATH_MAX];
+        snprintf(full, sizeof(full), "%s/%s", sandbox_dir,
+                 EVOLVE_PROTECTED_FILES[i]);
+        char hex[65];
+        if (warden_sha256_file(full, hex) != WARDEN_OK) {
+            /* Present at seal time, unreadable now == deleted by the model. */
+            err = sdscatprintf(err, "tamper: %s deleted/unreadable; ",
+                               EVOLVE_PROTECTED_FILES[i]);
+            ok = 0;
+            continue;
+        }
+        if (memcmp(table->files[i].hex, hex, 65) != 0) {
+            err = sdscatprintf(err, "tamper: %s modified; ",
+                               EVOLVE_PROTECTED_FILES[i]);
+            ok = 0;
+        }
+    }
+    if (!ok) {
+        *report = sdscatprintf(*report ? *report : sdsempty(),
+            "FAIL: Warden seal verification -- protected files were touched: "
+            "%s\n", err);
+    }
+    sdsfree(err);
+    return ok;
+}
+
+static int evolve_git_protected_clean(const char *build_dir, sds *report) {
+    /* The gate must never reward a mutation that weakened its own harness.
+     * Sandboxes are plain directory copies (no .git), so instead of git we
+     * byte-compare each protected file against its counterpart in the MAIN
+     * tree -- the baseline the generation forked from. Sandbox layout is
+     * <root>/sandbox/gen_NNN by construction (setup_sandbox). */
+    const char *mark = strstr(build_dir, "/sandbox/");
+    if (!mark || mark == build_dir) {
+        /* Not an evolution sandbox (e.g. the gate-test fixture): the
+         * main-tree comparison does not apply there. Deletion of tracked
+         * files is still caught by the git guard that runs before this. */
+        return 1;
+    }
+    size_t n = (size_t)(mark - build_dir);
+    char root[PATH_MAX];
+    if (n >= sizeof(root)) n = sizeof(root) - 1;
+    memcpy(root, build_dir, n);
+    root[n] = 0;
+
+    static const char *paths[] = {
+        "Makefile", "src/evolve.c", "src/agent_loop.c",
+        "src/warden.c", "src/llm.c", "tests/test_evolve.c"
+    };
+    int ok = 1;
+    sds err = sdsempty();
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        char a[PATH_MAX], b[PATH_MAX];
+        char ha[65], hb[65];
+        snprintf(a, sizeof(a), "%s/%s", root, paths[i]);
+        snprintf(b, sizeof(b), "%s/%s", build_dir, paths[i]);
+        int ra = warden_sha256_file(a, ha);
+        int rb = warden_sha256_file(b, hb);
+        if (ra != WARDEN_OK || rb != WARDEN_OK) {
+            /* A protected file missing from either side means deletion. */
+            err = sdscatprintf(err, "%s missing/unreadable (%s); ", paths[i],
+                               ra != WARDEN_OK ? "main" : "sandbox");
+            ok = 0;
+        } else if (memcmp(ha, hb, 65) != 0) {
+            err = sdscatprintf(err, "%s modified in sandbox; ", paths[i]);
+            ok = 0;
+        }
+    }
+    if (!ok) {
+        *report = sdscatprintf(*report ? *report : sdsempty(),
+            "FAIL: protected harness files differ from main tree: %s\n", err);
+    }
+    sdsfree(err);
+    return ok;
+}
+
+/* A generation that deletes a git-tracked file is rejected before the build
+ * is even attempted: deleting code is never an improvement, and a removal
+ * could also hide a weakened harness from the stages below. Sandboxes are
+ * plain directory copies without .git -- there the main-tree comparison in
+ * evolve_git_protected_clean covers deletions instead. */
+static int evolve_no_tracked_deletions(const char *build_dir, sds *report) {
+    char probe[PATH_MAX];
+    snprintf(probe, sizeof(probe), "%s/.git", build_dir);
+    if (!file_exists(probe)) return 1;
+
+    int rc = -1;
+    sds status = run_capture(build_dir, "git status --porcelain", 30, &rc);
+    if (rc != 0 || !status) { sdsfree(status); return 1; }
+
+    /* Porcelain lines are "XY PATH": X staged, Y worktree. Either column
+     * reading D means a tracked file was removed. Untracked (??) and
+     * modified entries are the normal business of a generation. */
+    sds deleted = sdsempty();
+    for (char *line = strtok(status, "\n"); line; line = strtok(NULL, "\n")) {
+        if (sdslen(status) < 3) continue;
+        if ((line[0] == 'D' && line[1] == ' ') ||
+            (line[0] == ' ' && line[1] == 'D')) {
+            deleted = sdscatprintf(deleted, "%s; ", line + 3);
+        }
+    }
+    int ok = sdslen(deleted) == 0;
+    if (!ok) {
+        *report = sdscatprintf(*report ? *report : sdsempty(),
+            "FAIL: tracked file deleted: %s\n", deleted);
+    }
+    sdsfree(deleted);
+    sdsfree(status);
+    return ok;
+}
 
 static int evolve_warden_smoke(
     const char *dir,
@@ -297,6 +465,11 @@ static int evolve_gate(const char *build_dir, const char *model, sds *report) {
 
     /* Reject if tests/ or Makefile changed */
     if (!evolve_git_protected_clean(build_dir, report)) {
+        return 0;
+    }
+
+    /* Reward-hacking guard: reject deletions before building. */
+    if (!evolve_no_tracked_deletions(build_dir, report)) {
         return 0;
     }
 
@@ -576,7 +749,7 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
         /* Take Warden cryptographic SHA-256 seal snapshot of protected files BEFORE model edits */
         evolve_hash_table seal_before;
         sds seal_init_report = NULL;
-        if (!evolve_seal_snapshot(sandbox, seal_before, &seal_init_report)) {
+        if (!evolve_seal_snapshot(sandbox, &seal_before, &seal_init_report)) {
             fprintf(stderr, "[evolve] Warden seal initialization failed: %s\n", seal_init_report ? seal_init_report : "unknown");
             sdsfree(seal_init_report);
             break;
@@ -609,7 +782,7 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
 
         /* Verify Warden cryptographic seal & git protection BEFORE running gate */
         if (ok) {
-            if (!evolve_seal_verify(sandbox, seal_before, &report)) {
+            if (!evolve_seal_verify(sandbox, &seal_before, &report)) {
                 ok = 0;
             } else if (!evolve_git_protected_clean(sandbox, &report)) {
                 ok = 0;
