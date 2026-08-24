@@ -15,7 +15,7 @@ set +a
 
 export ALPHA_EVOLVE=1
 
-GOAL="You have the full 256k token context window available on your local Metal GPU with quantized KV cache. Use this full capacity boldly — do not limit yourself to small tweaks. Ingest entire modules, deep-inspect /Users/lorenc/.hermes/hermes-agent/ and trending C repos, reverse-engineer complete missing tools and architectures into Agent Alpha in C (src/tools.c, include/alpha.h), write full unit tests in tests/, and ensure all 617+ checks and 360° benchmarks pass."
+GOAL="You have the full 256k token context window available on your local Metal GPU with quantized KV cache. Use this full capacity boldly and do not limit yourself to small tweaks. Ingest entire modules, deep-inspect /Users/lorenc/.hermes/hermes-agent/ and trending C repos, reverse-engineer complete missing tools and architectures into Agent Alpha in C (src/tools.c, include/alpha.h), write full unit tests in tests/, and ensure all 617+ checks and 360° benchmarks pass."
 
 echo "[alpha-loop] Starting continuous infinite evolution daemon..."
 
