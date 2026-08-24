@@ -17,9 +17,11 @@ all: $(TARGET) $(MCP_TARGET)
 
 $(TARGET): $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	@codesign -s - -f $@ 2>/dev/null || true
 
 $(MCP_TARGET): $(MCP_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	@codesign -s - -f $@ 2>/dev/null || true
 
 src/%.o: src/%.c include/alpha.h src/ui.h
 	$(CC) $(CFLAGS) -c -o $@ $<
