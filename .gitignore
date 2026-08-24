@@ -10,9 +10,9 @@ alpha
 sessions/
 tests/bin/
 
-# Evolution run state: generation log and archived binaries. Also ignored so
-# `git clean -fd` after a reverted generation cannot delete them.
-evolution/
+# Evolution run state: generation log is tracked; binary archives and sandboxes ignored
+evolution/*
+!evolution/log.jsonl
 sandbox/
 
 # Runtime logs
