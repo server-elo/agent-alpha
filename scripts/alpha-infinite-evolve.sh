@@ -15,7 +15,7 @@ set +a
 
 export ALPHA_EVOLVE=1
 
-GOAL="Perform systematic line-by-line inspection of /Users/lorenc/.hermes/hermes-agent/. Track inspected files in memory (target=memory). Reverse-engineer and implement missing tools or logic into Agent Alpha in C (src/tools.c). Re-execute into next generation until all files are thoroughly checked, then proceed to GitHub trending C repos."
+GOAL="You have the full 256k token context window available on your local Metal GPU with quantized KV cache. Use this full capacity boldly — do not limit yourself to small tweaks. Ingest entire modules, deep-inspect /Users/lorenc/.hermes/hermes-agent/ and trending C repos, reverse-engineer complete missing tools and architectures into Agent Alpha in C (src/tools.c, include/alpha.h), write full unit tests in tests/, and ensure all 617+ checks and 360° benchmarks pass."
 
 echo "[alpha-loop] Starting continuous infinite evolution daemon..."
 
