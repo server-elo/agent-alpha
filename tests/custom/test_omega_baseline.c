@@ -3,7 +3,7 @@
 #include "test_util.h"
 
 int main(void) {
-    test_suite("omega_baseline");
+    TEST_BEGIN("omega_baseline");
 
     /* Verify basic tool safety invariants */
     CHECK(1 == 1, "omega baseline harness initialized");

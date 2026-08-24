@@ -1294,9 +1294,17 @@ static memory_store_t g_user_store    = { .count = 0, .char_limit = ALPHA_USER_C
 static pthread_mutex_t g_memory_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Resolve the memory directory, creating it if needed. Returns a static buffer
- * that is valid until the next call. */
+ * that is valid until the next call. ALPHA_MEMORY_DIR overrides the default
+ * location — the evolution driver uses it to keep benchmark subprocess writes
+ * out of the real store. */
 static const char *memory_dir(void) {
     static char dir[PATH_MAX];
+    const char *env = getenv("ALPHA_MEMORY_DIR");
+    if (env && env[0]) {
+        snprintf(dir, sizeof(dir), "%s", env);
+        mkdir_p(dir);
+        return dir;
+    }
     const char *home = getenv("HOME");
     if (!home || !home[0]) home = "/tmp";
     snprintf(dir, sizeof(dir), "%s/" ALPHA_MEMORY_DIR, home);

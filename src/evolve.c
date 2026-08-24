@@ -222,16 +222,23 @@ static int run_domain_benchmark(const char *dir, const char *model, sds *report)
 
     sds safe_model = shell_escape((model && model[0]) ? model : "local");
 
+    /* Benchmark subprocesses must not write to the real ~/.alpha/memory —
+     * their bench_* / test_key_* entries used to leak into the store every
+     * generation and get injected into every future system prompt. */
+    sds memdir = sdscatprintf(sdsempty(), "%s/.bench-memory", dir);
+    sds safe_memdir = shell_escape(memdir);
+    sdsfree(memdir);
+
     if (is_memory) {
         sds cmd = sdscatprintf(sdsempty(),
-            "./alpha -m %s 'Use memory tool to add entry test_key_999=domain_bench_value then retrieve memory' 2>&1",
-            safe_model);
+            "ALPHA_MEMORY_DIR=%s ./alpha -m %s 'Use memory tool to add entry test_key_999=domain_bench_value then retrieve memory' 2>&1",
+            safe_memdir, safe_model);
         sds out = run_capture(dir, cmd, 120, &rc);
         sdsfree(cmd);
         if (rc != 0 || !out || strstr(out, "ERROR") || !strstr(out, "domain_bench_value")) {
             report_tail(report, "Domain Benchmark: Memory Tool", out);
             report_append(report, "FAIL: 360° Memory Domain Benchmark\n");
-            sdsfree(out); sdsfree(safe_model);
+            sdsfree(out); sdsfree(safe_model); sdsfree(safe_memdir);
             return 0;
         }
         sdsfree(out);
@@ -244,7 +251,7 @@ static int run_domain_benchmark(const char *dir, const char *model, sds *report)
         if (rc != 0 || !out || strstr(out, "ERROR")) {
             report_tail(report, "Domain Benchmark: Web Search Tool", out);
             report_append(report, "FAIL: 360° Web Search Domain Benchmark\n");
-            sdsfree(out); sdsfree(safe_model);
+            sdsfree(out); sdsfree(safe_model); sdsfree(safe_memdir);
             return 0;
         }
         sdsfree(out);
@@ -257,12 +264,13 @@ static int run_domain_benchmark(const char *dir, const char *model, sds *report)
         if (rc != 0 || !out || strstr(out, "ERROR")) {
             report_tail(report, "Domain Benchmark: Tools & File Execution", out);
             report_append(report, "FAIL: 360° Tools Domain Benchmark\n");
-            sdsfree(out); sdsfree(safe_model);
+            sdsfree(out); sdsfree(safe_model); sdsfree(safe_memdir);
             return 0;
         }
         sdsfree(out);
     }
     sdsfree(safe_model);
+    sdsfree(safe_memdir);
     return 1;
 }
 
@@ -463,7 +471,7 @@ static int run_omega_red_team(const char *build_dir, const char *model, sds *rep
             "#include \"alpha.h\"\n"
             "#include \"test_util.h\"\n\n"
             "int main(void) {\n"
-            "    test_suite(\"omega_adversarial_fuzz\");\n"
+            "    TEST_BEGIN(\"omega_adversarial_fuzz\");\n"
             "    /* Edge-case NULL safety checks */\n"
             "    CHECK(1 == 1, \"omega hostile fuzzing harness active\");\n"
             "    return test_report(\"omega_adversarial_fuzz\");\n"
@@ -584,7 +592,15 @@ static void log_append(const char *root, int gen, const char *goal,
 #endif
 
     sds g = json_escape(goal, 200);
-    sds n = json_escape(note ? note : "", 300);
+    /* Keep the TAIL of the report, not the head: report_append() puts the
+     * "FAIL: ..." reason at the very end, so storing the first 300 chars
+     * logged a few truncated clang command lines and discarded the actual
+     * failure. The agent reads this log to learn what not to repeat — the
+     * note has to contain the reason. */
+    const char *np = note ? note : "";
+    size_t nl = strlen(np);
+    if (nl > 2000) np += nl - 2000;
+    sds n = json_escape(np, 2000);
     fprintf(f, "{\"gen\":%d,\"ts\":%lld,\"goal\":\"%s\",\"result\":\"%s\","
                "\"commit\":\"%s\",\"touched_tests\":%s,\"note\":\"%s\"}\n",
             gen, (long long)time(NULL), g, result,
@@ -621,8 +637,10 @@ static sds log_tail(const char *root, int max_lines) {
     }
     sds out = sdsnewlen(buf + start, (size_t)((long)rd - start));
     free(buf);
-    if (sdslen(out) > 4000) {
-        sds t = sdsnewlen(out + sdslen(out) - 4000, 4000);
+    /* Notes are up to ~2 KB each now; 8 KB keeps roughly the 4 most recent
+     * generations in the prompt instead of just the last one. */
+    if (sdslen(out) > 8000) {
+        sds t = sdsnewlen(out + sdslen(out) - 8000, 8000);
         sdsfree(out);
         out = t;
     }
@@ -735,6 +753,31 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
     snprintf(evdir, sizeof(evdir), "%s/evolution", root);
     mkdir(evdir, 0755);
 
+    /* Cross-process exclusivity. next_generation() reads max(gen) from the log
+     * and log_append() locks only around the write, so two overlapping evolve
+     * runs picked the same generation number and raced on the tree (seen as
+     * duplicate gen entries in log.jsonl). Hold an advisory write lock for the
+     * whole run instead. The fd survives the re-exec (fcntl locks are
+     * per-process, and a process re-locking its own file succeeds), and
+     * run_capture children close fds 3..1024 so they never inherit it. */
+    char lockpath[PATH_MAX];
+    snprintf(lockpath, sizeof(lockpath), "%s/.lock", evdir);
+    int lockfd = open(lockpath, O_RDWR | O_CREAT, 0644);
+    if (lockfd < 0) {
+        fprintf(stderr, "evolve: cannot open %s: %s\n", lockpath, strerror(errno));
+        return 2;
+    }
+    struct flock evfl;
+    memset(&evfl, 0, sizeof(evfl));
+    evfl.l_type = F_WRLCK;
+    evfl.l_whence = SEEK_SET;
+    if (fcntl(lockfd, F_SETLK, &evfl) == -1) {
+        fprintf(stderr, "evolve: another evolution run already holds %s — exiting.\n",
+                lockpath);
+        close(lockfd);
+        return 2;
+    }
+
     int rc = -1;
     sds out = run_capture(root, "git rev-parse --is-inside-work-tree", 20, &rc);
     int is_repo = (rc == 0 && out && strstr(out, "true"));
@@ -800,15 +843,19 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
             continue;
         }
 
-        /* BEFORE benchmark in sandbox */
+        /* BEFORE benchmark in sandbox (memory writes isolated to the sandbox —
+         * bench_* entries must never reach the real ~/.alpha/memory store) */
         const char *bm = (cfg->model && cfg->model[0]) ? cfg->model : "local";
         sds safe_bm = shell_escape(bm);
+        sds bench_memdir = sdscatprintf(sdsempty(), "%s/.bench-memory", sandbox);
+        sds safe_bench_memdir = shell_escape(bench_memdir);
+        sdsfree(bench_memdir);
         int before_rc = -1;
         struct timespec b_t0, b_t1;
         clock_gettime(CLOCK_MONOTONIC, &b_t0);
         sds before_cmd = sdscatprintf(sdsempty(),
-            "./alpha -m %s 'Use memory tool to add entry bench_before=val_before then retrieve memory' 2>&1",
-            safe_bm);
+            "ALPHA_MEMORY_DIR=%s ./alpha -m %s 'Use memory tool to add entry bench_before=val_before then retrieve memory' 2>&1",
+            safe_bench_memdir, safe_bm);
         sds before_bench = run_capture(sandbox, before_cmd, 300, &before_rc);
         sdsfree(before_cmd); sdsfree(safe_bm);
         clock_gettime(CLOCK_MONOTONIC, &b_t1);
@@ -846,8 +893,8 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
             struct timespec a_t0, a_t1;
             clock_gettime(CLOCK_MONOTONIC, &a_t0);
             sds after_cmd = sdscatprintf(sdsempty(),
-                "./alpha -m %s 'Use memory tool to add entry bench_after=val_after then retrieve memory' 2>&1",
-                safe_bm2);
+                "ALPHA_MEMORY_DIR=%s ./alpha -m %s 'Use memory tool to add entry bench_after=val_after then retrieve memory' 2>&1",
+                safe_bench_memdir, safe_bm2);
             sds after_bench = run_capture(sandbox, after_cmd, 300, &after_rc);
             sdsfree(after_cmd); sdsfree(safe_bm2);
             clock_gettime(CLOCK_MONOTONIC, &a_t1);
@@ -896,6 +943,7 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
             sdsfree(after_bench);
         }
         sdsfree(before_bench);
+        sdsfree(safe_bench_memdir);
 
         if (!report) report = sdsnew(alpha_cancel ? "interrupted\n"
             : (!reply || !reply[0] || strcmp(reply, "ERROR: empty response from LLM") == 0)

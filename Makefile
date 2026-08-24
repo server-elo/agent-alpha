@@ -38,6 +38,11 @@ TEST_SRC = tests/test_tools.c tests/test_session.c tests/test_telegram.c tests/t
            tests/test_provider.c tests/test_portable.c tests/test_config.c \
            tests/test_browser.c tests/test_evolve.c
 TEST_BIN = $(TEST_SRC:tests/%.c=tests/bin/%)
+# Core suite plus whatever the evolution agent dropped into tests/custom/.
+# run-tests referenced ALL_TEST_BINS without it ever being defined, so make
+# ran ZERO test binaries and still printed ALL TESTS PASSED — and the evolve
+# gate (which requires the "=== tests/bin/" marker) reverted every generation.
+ALL_TEST_BINS = $(TEST_BIN) $(patsubst tests/custom/%.c,tests/bin/%,$(wildcard tests/custom/test_*.c))
 TEST_DEPS = src/browser.o src/provider.o deps/cJSON.o deps/sds.o
 # tests/test_util.h holds the assertion macros: a change there alters what every
 # CHECK means, yet nothing listed it as a prerequisite, so make reported the
@@ -94,8 +99,9 @@ tests/bin/test_evolve: tests/test_evolve.c src/evolve.c src/agent_loop.o src/llm
 	@codesign -s - -f $@ 2>/dev/null || true
 
 # Dynamic Custom & Adversarial Red-Team Tests
+# -Itests so custom tests can include test_util.h like the core suite does.
 tests/bin/%: tests/custom/%.c $(TEST_DEPS) $(TEST_HDRS) | tests/bin
-	$(CC) $(CFLAGS) -o $@ $< src/agent_loop.o src/llm.o src/tools.o src/warden.o $(TEST_DEPS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -Itests -o $@ $< src/agent_loop.o src/llm.o src/tools.o src/warden.o $(TEST_DEPS) $(LDFLAGS)
 	@codesign -s - -f $@ 2>/dev/null || true
 
 tests/bin:
