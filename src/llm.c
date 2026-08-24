@@ -453,6 +453,11 @@ sds llm_chat_ex(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message,
                 curl_easy_strerror(rc), sdslen(st.content));
     }
 
+    /* If content is empty but reasoning was streamed, promote it to prevent false empty response drops */
+    if (sdslen(st.content) == 0 && sdslen(st.reasoning) > 0) {
+        st.content = sdscat(st.content, st.reasoning);
+    }
+
     if (sdslen(st.content) == 0 && st.ntc == 0) {
         stream_state_free(&st);
         if (out_failed) *out_failed = 1;

@@ -37,7 +37,7 @@
  * long answers outright (a 16384-token reply measured 262s against a 300s cap)
  * and threw away every token already received. */
 #ifndef ALPHA_LLM_STALL_SECONDS
-#define ALPHA_LLM_STALL_SECONDS 120
+#define ALPHA_LLM_STALL_SECONDS 300
 #endif
 /* Total cap for the non-streaming path only. Nothing arrives there until
  * generation has finished, so a stall timeout cannot distinguish a healthy
