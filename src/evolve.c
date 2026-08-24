@@ -864,18 +864,27 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
         sdsfree(tt);
 
         if (ok) {
+            /* Sync sandbox code and binary back into main project tree */
+            char synccmd[PATH_MAX * 2 + 128];
+            snprintf(synccmd, sizeof(synccmd),
+                "cp -R '%s/src/' '%s/src/' && cp -R '%s/include/' '%s/include/' && cp -R '%s/tests/' '%s/tests/' && cp '%s/alpha' '%s/alpha' 2>/dev/null || true",
+                sandbox, root, sandbox, root, sandbox, root, sandbox, root);
+            int sync_rc = -1;
+            sds syncout = run_capture(root, synccmd, 60, &sync_rc);
+            sdsfree(syncout);
+
             char gdir[PATH_MAX];
             snprintf(gdir, sizeof(gdir), "%s/evolution/gen-%03d", root, gen);
             mkdir(gdir, 0755);
-            char cpcmd[PATH_MAX + 64];
-            snprintf(cpcmd, sizeof(cpcmd), "cp alpha 'evolution/gen-%03d/alpha'", gen);
+            char cpcmd[PATH_MAX * 2 + 64];
+            snprintf(cpcmd, sizeof(cpcmd), "cp '%s/alpha' '%s/evolution/gen-%03d/alpha'", sandbox, root, gen);
             int cp_rc = -1;
             sds cpout = run_capture(root, cpcmd, 60, &cp_rc);
             sdsfree(cpout);
 
             char msg[256];
             snprintf(msg, sizeof(msg), "evolve: generation %d", gen);
-            char commitcmd[300];
+            char commitcmd[PATH_MAX + 300];
             snprintf(commitcmd, sizeof(commitcmd),
                 "git add -A && git -c user.name=agent-alpha "
                 "-c user.email=alpha@localhost commit -q -m '%s'", msg);
