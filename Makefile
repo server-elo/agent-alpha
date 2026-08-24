@@ -93,30 +93,22 @@ tests/bin/test_evolve: tests/test_evolve.c src/evolve.c src/agent_loop.o src/llm
 	$(CC) $(CFLAGS) -o $@ $< src/agent_loop.o src/llm.o src/tools.o src/warden.o $(TEST_DEPS) $(LDFLAGS)
 	@codesign -s - -f $@ 2>/dev/null || true
 
+# Dynamic Custom & Adversarial Red-Team Tests
+tests/bin/%: tests/custom/%.c $(TEST_DEPS) $(TEST_HDRS) | tests/bin
+	$(CC) $(CFLAGS) -o $@ $< src/agent_loop.o src/llm.o src/tools.o src/warden.o $(TEST_DEPS) $(LDFLAGS)
+	@codesign -s - -f $@ 2>/dev/null || true
+
 tests/bin:
 	mkdir -p tests/bin
 
-# GNU make 3.81 (the macOS system make) compares mtimes truncated to whole
-# seconds: a source edited 0.3s after the previous build is reported "up to
-# date" and the STALE binary runs. Measured directly -- a prerequisite 0.3s
-# newer does not rebuild, 1.5s newer does. That is the normal edit-then-test
-# rhythm, and it is how three deliberately broken sources were observed
-# reporting all checks passing. A suite that certifies every other fix must not
-# be able to lie about which code it ran, so the binaries are always discarded
-# first. Costs ~2s.
-# The agent binary is discarded too, not just the test binaries: test_config
-# execs ./alpha to check argument parsing and the argv scrub against the real
-# program, so a stale ./alpha means those checks certify code that is no longer
-# in the tree. Measured -- a sabotage of --provider precedence reported all
-# checks passing until ./alpha was rebuilt.
 test:
 	@rm -rf tests/bin
 	@rm -f $(TARGET) $(OBJ)
 	@$(MAKE) --no-print-directory run-tests
 
 .PHONY: run-tests
-run-tests: $(TARGET) $(TEST_BIN)
-	@fail=0; for t in $(TEST_BIN); do \
+run-tests: $(TARGET) $(ALL_TEST_BINS)
+	@fail=0; for t in $(ALL_TEST_BINS); do \
 		echo "=== $$t ==="; ./$$t || fail=1; \
 	done; \
 	if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; exit 1; fi
