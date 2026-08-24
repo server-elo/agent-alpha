@@ -889,7 +889,7 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
         sds prompt = build_prompt(sandbox, goal, gen);
         
         /* Temporarily set cwd to sandbox so agent works there */
-        char *orig_cwd = cfg->cwd;
+        const char *orig_cwd = cfg->cwd;
         cfg->cwd = sandbox;
         
         sds reply = agent_run(cfg, prompt);
