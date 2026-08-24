@@ -46,43 +46,52 @@ TEST_HDRS = tests/test_util.h include/alpha.h
 
 tests/bin/test_tools: tests/test_tools.c src/tools.c $(TEST_DEPS) $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -DALPHA_SHELL_TIMEOUT_MS=2000 -o $@ $< $(TEST_DEPS) $(LDFLAGS)
+	@codesign -s - -f $@ 2>/dev/null || true
 
 tests/bin/test_session: tests/test_session.c src/agent_loop.c src/llm.o src/tools.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< src/llm.o src/tools.o $(TEST_DEPS) $(LDFLAGS)
+	@codesign -s - -f $@ 2>/dev/null || true
 
 # The voice timeout is 3 minutes in production; the suite must not wait that
 # long to prove a wedged transcriber gets killed, so it is compiled short.
 tests/bin/test_telegram: tests/test_telegram.c src/telegram.c src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -DALPHA_VOICE_TIMEOUT_MS=3000 -DALPHA_LOG_MAX_BYTES=65536 -o $@ $< src/agent_loop.o src/llm.o src/tools.o $(TEST_DEPS) $(LDFLAGS)
+	@codesign -s - -f $@ 2>/dev/null || true
 
 tests/bin/test_llm: tests/test_llm.c src/llm.c src/tools.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< src/tools.o $(TEST_DEPS) $(LDFLAGS)
+	@codesign -s - -f $@ 2>/dev/null || true
 
 # Includes provider.c and ui.c directly, so it must not also link them.
 tests/bin/test_provider: tests/test_provider.c src/provider.c src/ui.c src/ui.h $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< deps/cJSON.o deps/sds.o $(LDFLAGS)
+	@codesign -s - -f $@ 2>/dev/null || true
 
 # Compiles the /proc branch of tools.c on any host and runs it against a
 # synthetic /proc, so the Linux path is exercised rather than merely parsed.
 tests/bin/test_portable: tests/test_portable.c src/tools.c $(TEST_DEPS) $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< $(TEST_DEPS) $(LDFLAGS)
+	@codesign -s - -f $@ 2>/dev/null || true
 
 # main.c has a main(); ALPHA_NO_MAIN suppresses it so the config helpers can be
 # reached directly instead of being retyped into the test (a copy would pass
 # while the shipped code was broken).
 tests/bin/test_config: tests/test_config.c src/main.c src/ui.o src/provider.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -DALPHA_NO_MAIN -o $@ $< src/ui.o src/provider.o deps/cJSON.o deps/sds.o $(LDFLAGS)
+	@codesign -s - -f $@ 2>/dev/null || true
 
 # Includes browser.c directly to reach the static WebSocket client, so it must
 # not also link src/browser.o.
 tests/bin/test_browser: tests/test_browser.c src/browser.c $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< src/provider.o deps/cJSON.o deps/sds.o $(LDFLAGS)
+	@codesign -s - -f $@ 2>/dev/null || true
 
 # Includes evolve.c directly to reach the static gate/log helpers; agent_run
 # comes from the linked objects. The gate tests run a real make against a
 # throwaway fixture, never against this tree.
 tests/bin/test_evolve: tests/test_evolve.c src/evolve.c src/agent_loop.o src/llm.o src/tools.o src/warden.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< src/agent_loop.o src/llm.o src/tools.o src/warden.o $(TEST_DEPS) $(LDFLAGS)
+	@codesign -s - -f $@ 2>/dev/null || true
 
 tests/bin:
 	mkdir -p tests/bin
