@@ -460,6 +460,112 @@ static void test_auth_header_is_conditional(void) {
     sdsfree(h);
 }
 
+/* --- salvaging tool calls the model wrote as text ----------------------------
+ *
+ * The failure mode these guard: a local model writes "<tool_call>{...}</tool_call>"
+ * or "<invoke name=...>" into its content, the server passes it through as text,
+ * and the agent loop takes the reply as a final answer — a turn that believed it
+ * worked and did nothing. */
+static void test_salvage_tool_call_json_markup(void) {
+    TEST_BEGIN("salvage: <tool_call> JSON markup becomes a real tool call");
+    stream_state_t st;
+    stream_state_init(&st);
+    st.content = sdscat(st.content,
+        "Let me read the file.\n"
+        "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"Makefile\"}}</tool_call>\n");
+    salvage_text_tool_calls(&st);
+    CHECK_EQ_INT(st.ntc, 1, "one call salvaged");
+    CHECK(st.ntc == 1 && strcmp(st.tcs[0].name, "read_file") == 0, "name recovered");
+    cJSON *args = st.ntc == 1 ? cJSON_Parse(st.tcs[0].args) : NULL;
+    CHECK(args != NULL, "arguments are valid JSON");
+    const char *p = args ? cJSON_GetStringValue(cJSON_GetObjectItem(args, "path")) : NULL;
+    CHECK(p && strcmp(p, "Makefile") == 0, "argument value recovered");
+    if (args) cJSON_Delete(args);
+    CHECK(strstr(st.content, "<tool_call>") == NULL, "markup removed from content");
+    CHECK(strstr(st.content, "Let me read the file.") != NULL, "prose kept");
+    /* The rebuilt message must carry the salvaged call like a streamed one. */
+    cJSON *msg = stream_build_message(&st);
+    cJSON *tcs = cJSON_GetObjectItem(msg, "tool_calls");
+    CHECK(cJSON_IsArray(tcs) && cJSON_GetArraySize(tcs) == 1,
+          "salvaged call is in the message tool_calls");
+    cJSON_Delete(msg);
+    stream_state_free(&st);
+}
+
+static void test_salvage_invoke_xml_markup(void) {
+    TEST_BEGIN("salvage: Hermes-style <invoke> markup becomes a real tool call");
+    stream_state_t st;
+    stream_state_init(&st);
+    st.content = sdscat(st.content,
+        "<invoke name=\"execute_bash\">\n"
+        "<parameter name=\"command\">ls -la src/</parameter>\n"
+        "</invoke>\n");
+    salvage_text_tool_calls(&st);
+    CHECK_EQ_INT(st.ntc, 1, "one call salvaged from XML");
+    CHECK(st.ntc == 1 && strcmp(st.tcs[0].name, "execute_bash") == 0, "name from attribute");
+    cJSON *args = st.ntc == 1 ? cJSON_Parse(st.tcs[0].args) : NULL;
+    const char *cmd = args ? cJSON_GetStringValue(cJSON_GetObjectItem(args, "command")) : NULL;
+    CHECK(cmd && strcmp(cmd, "ls -la src/") == 0, "parameter recovered as JSON");
+    if (args) cJSON_Delete(args);
+    CHECK(strstr(st.content, "<invoke") == NULL && strstr(st.content, "</invoke>") == NULL,
+          "markup fully removed from content");
+    stream_state_free(&st);
+}
+
+static void test_salvage_rejects_unknown_tool_names(void) {
+    TEST_BEGIN("salvage: markup naming a non-tool stays text and never executes");
+    stream_state_t st;
+    stream_state_init(&st);
+    st.content = sdscat(st.content,
+        "Example: <tool_call>{\"name\":\"delete_everything\",\"arguments\":{}}</tool_call>\n");
+    salvage_text_tool_calls(&st);
+    CHECK_EQ_INT(st.ntc, 0, "unknown tool is not salvaged");
+    CHECK(strstr(st.content, "delete_everything") != NULL, "text left untouched");
+    stream_state_free(&st);
+}
+
+static void test_salvage_ignores_payloadless_spam(void) {
+    TEST_BEGIN("salvage: a bare \"[Calling tool\" loop has nothing to recover");
+    stream_state_t st;
+    stream_state_init(&st);
+    for (int i = 0; i < 50; i++) st.content = sdscat(st.content, "[Calling tool\n");
+    salvage_text_tool_calls(&st);
+    CHECK_EQ_INT(st.ntc, 0, "no call is fabricated from payloadless spam");
+    CHECK(strstr(st.content, "[Calling tool") != NULL, "spam stays visible as text");
+    stream_state_free(&st);
+}
+
+static void test_salvage_never_overrides_structured_calls(void) {
+    TEST_BEGIN("salvage: structured tool_calls win; markup is not double-counted");
+    const char *sse =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"<tool_call>{\\\"name\\\":\\\"list_dir\\\",\\\"arguments\\\":{}}</tool_call>\","
+        "\"tool_calls\":[{\"index\":1,\"id\":\"r1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\n"
+        "data: [DONE]\n";
+    stream_state_t st;
+    stream_state_init(&st);
+    stream_feed(&st, sse, strlen(sse));
+    salvage_text_tool_calls(&st);
+    CHECK_EQ_INT(st.ntc, 1, "only the structured call is kept");
+    CHECK(st.ntc == 1 && strcmp(st.tcs[0].name, "read_file") == 0, "the real one, not the markup");
+    stream_state_free(&st);
+}
+
+static void test_salvage_multiple_blocks(void) {
+    TEST_BEGIN("salvage: several markup calls in one reply are all recovered");
+    stream_state_t st;
+    stream_state_init(&st);
+    st.content = sdscat(st.content,
+        "<tool_call>{\"name\":\"list_dir\",\"arguments\":{\"path\":\"src\"}}</tool_call>\n"
+        "then\n"
+        "<tool_call>{\"name\":\"read_file\",\"parameters\":{\"path\":\"README.md\"}}</tool_call>\n");
+    salvage_text_tool_calls(&st);
+    CHECK_EQ_INT(st.ntc, 2, "both calls salvaged");
+    CHECK(st.ntc == 2 && strcmp(st.tcs[0].name, "list_dir") == 0, "in order, first");
+    CHECK(st.ntc == 2 && strcmp(st.tcs[1].name, "read_file") == 0, "in order, second");
+    CHECK(strstr(st.content, "then") != NULL, "prose between calls kept");
+    stream_state_free(&st);
+}
+
 int main(void) {
     test_content_is_independent_of_chunk_boundaries();
     test_utf8_survives_a_split_character();
@@ -478,5 +584,11 @@ int main(void) {
     test_reasoning_is_kept_out_of_the_answer();
     test_non_streaming_response_is_parsed();
     test_auth_header_is_conditional();
+    test_salvage_tool_call_json_markup();
+    test_salvage_invoke_xml_markup();
+    test_salvage_rejects_unknown_tool_names();
+    test_salvage_ignores_payloadless_spam();
+    test_salvage_never_overrides_structured_calls();
+    test_salvage_multiple_blocks();
     return test_report("llm");
 }

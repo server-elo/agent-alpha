@@ -419,6 +419,28 @@ static int evolve_no_tracked_deletions(const char *build_dir, sds *report) {
     return ok;
 }
 
+/* A generation only counts if the agent changed something. The sandbox starts
+ * as a byte-copy of root's source dirs, so any real edit shows up as a tree
+ * difference. Without this check the gate (build + tests + benchmarks) passes
+ * on a generation that shipped nothing, and the commit then sweeps up the
+ * harness's own pending log.jsonl line — a "keep" with an empty diff, which
+ * is exactly what the goal text calls a failure. */
+static int evolve_sandbox_changed(const char *root, const char *sandbox) {
+    char cmd[PATH_MAX * 4 + 512];
+    /* *.o and tests/bin are build products; the sandbox rebuild always
+     * regenerates them, so they would report a spurious difference. */
+    snprintf(cmd, sizeof(cmd),
+        "diff -rq -x '*.o' '%s/src' '%s/src' >/dev/null 2>&1 && "
+        "diff -rq '%s/include' '%s/include' >/dev/null 2>&1 && "
+        "diff -rq -x '*.o' -x bin '%s/tests' '%s/tests' >/dev/null 2>&1 && "
+        "diff -rq -x '*.o' '%s/deps' '%s/deps' >/dev/null 2>&1",
+        root, sandbox, root, sandbox, root, sandbox, root, sandbox);
+    int rc = -1;
+    sds out = run_capture(root, cmd, 60, &rc);
+    sdsfree(out);
+    return rc != 0;   /* diff exits 0 only when every tree is identical */
+}
+
 static int evolve_warden_smoke(const char *dir, sds *report) {
     warden_limits_t lim = warden_limits_default();
     lim.timeout_ms = 30000;
@@ -888,6 +910,14 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
         if (ok) {
             if (!evolve_seal_verify(sandbox, &seal_before, &report)) ok = 0;
             else if (!evolve_git_protected_clean(sandbox, &report)) ok = 0;
+            /* Cheap check before the expensive gate: an empty generation must
+             * not burn a full build + benchmark cycle on its way to "keep". */
+            else if (!evolve_sandbox_changed(root, sandbox)) {
+                report_append(&report,
+                    "FAIL: empty generation — no source change in src/, include/, "
+                    "tests/ or deps/ (the agent shipped nothing)\n");
+                ok = 0;
+            }
         }
         if (ok) ok = evolve_gate(sandbox, cfg->model, &report);
 
@@ -965,10 +995,11 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
                 "cp -R '%s/src/'* '%s/src/' 2>/dev/null; "
                 "cp -R '%s/include/'* '%s/include/' 2>/dev/null; "
                 "cp -R '%s/tests/'* '%s/tests/' 2>/dev/null; "
+                "cp -R '%s/deps/'* '%s/deps/' 2>/dev/null; "
                 "cp '%s/alpha' '%s/alpha' 2>/dev/null; "
                 "cp '%s/Makefile' '%s/Makefile' 2>/dev/null; "
                 "true",
-                sandbox, root, sandbox, root, sandbox, root, sandbox, root, sandbox, root);
+                sandbox, root, sandbox, root, sandbox, root, sandbox, root, sandbox, root, sandbox, root);
             int sync_rc = -1;
             sds syncout = run_capture(root, synccmd, 60, &sync_rc);
             sdsfree(syncout);

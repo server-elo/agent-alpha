@@ -125,6 +125,34 @@ int main(void) {
           "gate report names the deletion");
     sdsfree(report);
 
+    /* --- empty-generation check ---------------------------------------------
+     * The sandbox starts as a byte-copy of root's source dirs. A generation
+     * whose sandbox matches root exactly shipped nothing, however convincing
+     * the transcript sounds — and the harness must not call that a "keep". */
+    system("rm -rf /tmp/alpha_chg_root /tmp/alpha_chg_sbx && "
+           "mkdir -p /tmp/alpha_chg_root/src /tmp/alpha_chg_root/include "
+           "/tmp/alpha_chg_root/tests /tmp/alpha_chg_root/deps");
+    write_file("/tmp/alpha_chg_root/src/a.c", "int a;\n");
+    write_file("/tmp/alpha_chg_root/include/a.h", "#pragma once\n");
+    system("cp -R /tmp/alpha_chg_root/src /tmp/alpha_chg_root/include "
+           "/tmp/alpha_chg_root/tests /tmp/alpha_chg_root/deps /tmp/alpha_chg_sbx 2>/dev/null || "
+           "(mkdir -p /tmp/alpha_chg_sbx && cp -R /tmp/alpha_chg_root/src /tmp/alpha_chg_root/include "
+           "/tmp/alpha_chg_root/tests /tmp/alpha_chg_root/deps /tmp/alpha_chg_sbx/)");
+    CHECK(evolve_sandbox_changed("/tmp/alpha_chg_root", "/tmp/alpha_chg_sbx") == 0,
+          "identical trees mean an empty generation");
+    /* Build products appear in the sandbox on every run and must not count. */
+    write_file("/tmp/alpha_chg_sbx/src/a.o", "fake object\n");
+    CHECK(evolve_sandbox_changed("/tmp/alpha_chg_root", "/tmp/alpha_chg_sbx") == 0,
+          "rebuilt .o files alone do not count as a change");
+    write_file("/tmp/alpha_chg_sbx/src/b.c", "int b;\n");
+    CHECK(evolve_sandbox_changed("/tmp/alpha_chg_root", "/tmp/alpha_chg_sbx") == 1,
+          "a new source file is a real change");
+    unlink("/tmp/alpha_chg_sbx/src/b.c");
+    write_file("/tmp/alpha_chg_sbx/include/a.h", "#pragma once\n/* touched */\n");
+    CHECK(evolve_sandbox_changed("/tmp/alpha_chg_root", "/tmp/alpha_chg_sbx") == 1,
+          "an edited header is a real change");
+    system("rm -rf /tmp/alpha_chg_root /tmp/alpha_chg_sbx");
+
     system("rm -rf " FIX " /tmp/alpha_evolve_log /tmp/alpha_evolve_empty");
     return test_report("test_evolve");
 }

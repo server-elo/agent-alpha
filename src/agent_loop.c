@@ -339,6 +339,7 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
     if (max_turns > 200) max_turns = 200;
     int browser_turns = 0;
     int transport_fails = 0;
+    int fmt_nudges = 0;
 
     const alpha_events_t *ev = cfg->events;
 
@@ -391,6 +392,24 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
         cJSON *tcs = msg ? cJSON_GetObjectItem(msg, "tool_calls") : NULL;
         int ntools = cJSON_IsArray(tcs) ? cJSON_GetArraySize(tcs) : 0;
         if (ntools <= 0) {
+            /* The model tried to call a tool but wrote it as text markup
+             * ("[Calling tool", "<invoke ...>", "<tool_call>") that neither the
+             * server nor the salvage parser turned into a structured call.
+             * Nothing executed; accepting this as the final answer is how a
+             * generation ships nothing while believing it worked. Say the call
+             * never ran and let it retry — bounded, so a model that cannot
+             * recover still gets to end its turn. */
+            if (fmt_nudges < 3 && content &&
+                (strstr(content, "[Calling tool") || strstr(content, "<invoke") ||
+                 strstr(content, "<tool_call"))) {
+                fmt_nudges++;
+                messages_add_text(messages, "user",
+                    "[FORMAT ERROR] Your tool call was written as plain text and was "
+                    "NOT executed — no tool ran. Re-issue it now as a real tool call "
+                    "using the function-calling mechanism, not as text or markup.");
+                sdsfree(content);
+                continue;
+            }
             sdsfree(last);
             last = content;
             break;

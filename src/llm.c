@@ -182,6 +182,175 @@ static int llm_progress_cb(void *ud, curl_off_t dt, curl_off_t dn,
     return alpha_cancel ? 1 : 0;
 }
 
+/* --- salvaging tool calls emitted as text ------------------------------------
+ *
+ * Local fine-tunes sometimes write a tool call as markup inside the content
+ * instead of using the structured tool_calls channel (observed in production:
+ * "<tool_call>{...}</tool_call>", Hermes-style "<invoke name=...>", and bare
+ * "[Calling tool" repetition loops). The server passes that through as plain
+ * text, and the agent loop would take "I am calling the tool" as the final
+ * answer -- a turn that did nothing but believed it worked.
+ *
+ * Well-formed markup is recovered here into real tool calls. Bare "[Calling
+ * tool" loops carry no payload and cannot be recovered; the agent loop nudges
+ * the model to re-issue those. Only names from tools_schema() (plus the aliases
+ * tools_run accepts) are honoured, so prose merely showing an example call can
+ * never fire a real tool. */
+static int salvage_name_known(const char *name) {
+    if (!name || !name[0]) return 0;
+    static const char *alias[] = { "bash", "ls", "web_browser", "diff", NULL };
+    for (int i = 0; alias[i]; i++)
+        if (strcmp(name, alias[i]) == 0) return 1;
+    int found = 0;
+    cJSON *schema = tools_schema();
+    cJSON *t = NULL;
+    cJSON_ArrayForEach(t, schema) {
+        const char *n = cJSON_GetStringValue(cJSON_GetObjectItem(
+            cJSON_GetObjectItem(t, "function"), "name"));
+        if (n && strcmp(n, name) == 0) { found = 1; break; }
+    }
+    cJSON_Delete(schema);
+    return found;
+}
+
+/* Extract name="..." (or name='...') from a tag starting at `tag`.
+ * Returns a malloc'd name (caller frees) and advances *past to just after the
+ * closing quote, or NULL when the attribute is absent/malformed. */
+static char *salvage_tag_name(const char *tag, const char **past) {
+    const char *p = strstr(tag, "name");
+    if (!p) return NULL;
+    p += 4;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '=') return NULL;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '"' && *p != '\'') return NULL;
+    char quote = *p++;
+    const char *end = strchr(p, quote);
+    if (!end || end == p) return NULL;
+    char *name = strndup(p, (size_t)(end - p));
+    if (past) *past = end + 1;
+    return name;
+}
+
+static void salvage_add_call(stream_state_t *st, const char *name, const char *args) {
+    if (st->ntc >= ALPHA_STREAM_MAX_TOOLCALLS) { st->overflow = 1; return; }
+    stream_tc_t *t = &st->tcs[st->ntc];
+    t->used = 1;
+    t->index = 1000 + st->ntc;      /* cannot collide with a streamed index */
+    t->id = sdsempty();
+    t->name = sdsnew(name);
+    t->args = sdsnew(args && args[0] ? args : "{}");
+    st->ntc++;
+}
+
+/* Scan st->content for text-markup tool calls; move each valid one into the
+ * tool-call table and out of the content. Content without valid markup is left
+ * byte-identical. */
+static void salvage_text_tool_calls(stream_state_t *st) {
+    if (st->ntc > 0 || !st->content || !st->content[0]) return;
+
+    sds kept = sdsempty();
+    const char *c = st->content;
+    size_t len = sdslen(st->content);
+    size_t pos = 0;
+    int salvaged = 0;
+
+    while (pos < len) {
+        const char *tc = strstr(c + pos, "<tool_call>");
+        const char *iv = strstr(c + pos, "<invoke");
+        const char *start = NULL;
+        int kind = 0;               /* 1 = <tool_call> JSON, 2 = <invoke> XML */
+        if (tc && (!iv || tc < iv)) { start = tc; kind = 1; }
+        else if (iv) { start = iv; kind = 2; }
+        if (!start) break;
+
+        sds name = NULL;
+        sds args = NULL;
+        const char *block_end = NULL;   /* one past the closing tag */
+
+        if (kind == 1) {
+            const char *body = start + strlen("<tool_call>");
+            const char *close = strstr(body, "</tool_call>");
+            if (!close) break;          /* truncated markup: leave the text */
+            sds raw = sdsnewlen(body, (size_t)(close - body));
+            cJSON *call = cJSON_Parse(raw);
+            sdsfree(raw);
+            if (call) {
+                const char *n = cJSON_GetStringValue(cJSON_GetObjectItem(call, "name"));
+                cJSON *a = cJSON_GetObjectItem(call, "arguments");
+                if (!a) a = cJSON_GetObjectItem(call, "parameters");
+                if (n && salvage_name_known(n)) {
+                    name = sdsnew(n);
+                    if (cJSON_IsString(a)) args = sdsnew(a->valuestring);
+                    else if (a) {
+                        char *printed = cJSON_PrintUnformatted(a);
+                        args = sdsnew(printed ? printed : "{}");
+                        free(printed);
+                    } else args = sdsnew("{}");
+                }
+                cJSON_Delete(call);
+            }
+            block_end = close + strlen("</tool_call>");
+        } else {
+            const char *past = NULL;
+            char *n = salvage_tag_name(start, &past);
+            const char *close = strstr(start, "</invoke>");
+            if (n && close && salvage_name_known(n)) {
+                name = sdsnew(n);
+                cJSON *params = cJSON_CreateObject();
+                const char *p = past;
+                while (p < close) {
+                    const char *pt = strstr(p, "<parameter");
+                    if (!pt || pt >= close) break;
+                    const char *kpast = NULL;
+                    char *k = salvage_tag_name(pt, &kpast);
+                    if (!k) break;
+                    const char *vstart = strchr(kpast, '>');
+                    const char *vend = vstart ? strstr(vstart, "</parameter>") : NULL;
+                    if (!vstart || !vend || vend > close) { free(k); break; }
+                    sds v = sdsnewlen(vstart + 1, (size_t)(vend - vstart - 1));
+                    cJSON_AddStringToObject(params, k, v);
+                    sdsfree(v);
+                    free(k);
+                    p = vend + strlen("</parameter>");
+                }
+                char *printed = cJSON_PrintUnformatted(params);
+                args = sdsnew(printed ? printed : "{}");
+                free(printed);
+                cJSON_Delete(params);
+            }
+            free(n);
+            if (!close) break;          /* truncated markup: leave the text */
+            block_end = close + strlen("</invoke>");
+        }
+
+        if (name) {
+            salvage_add_call(st, name, args);
+            salvaged++;
+            /* text between the previous block and this one stays */
+            kept = sdscatlen(kept, c + pos, (size_t)(start - (c + pos)));
+            pos = (size_t)(block_end - c);
+        } else {
+            /* not a usable call: keep the opening tag as text and move on */
+            kept = sdscatlen(kept, c + pos, (size_t)(start - (c + pos)) + 1);
+            pos = (size_t)(start - c) + 1;
+        }
+        sdsfree(name);
+        sdsfree(args);
+    }
+
+    if (salvaged > 0) {
+        kept = sdscatlen(kept, c + pos, len - pos);
+        sdsfree(st->content);
+        st->content = kept;
+        fprintf(stderr, "[alpha] salvaged %d tool call(s) the model wrote as text markup\n",
+                salvaged);
+    } else {
+        sdsfree(kept);
+    }
+}
+
 /* Rebuild the non-streaming `message` object the rest of the agent expects, so
  * streaming stays entirely inside this file. */
 static cJSON *stream_build_message(stream_state_t *st) {
@@ -457,6 +626,12 @@ sds llm_chat_ex(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message,
     if (sdslen(st.content) == 0 && sdslen(st.reasoning) > 0) {
         st.content = sdscat(st.content, st.reasoning);
     }
+
+    /* A model that wrote its tool call as text markup gets one chance to be
+     * understood anyway; bare "[Calling tool" loops carry no payload and are
+     * left as text for the agent loop to reject. */
+    if (with_tools && st.ntc == 0 && sdslen(st.content) > 0)
+        salvage_text_tool_calls(&st);
 
     if (sdslen(st.content) == 0 && st.ntc == 0) {
         stream_state_free(&st);
