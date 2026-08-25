@@ -18,12 +18,11 @@ set +a
 
 export ALPHA_EVOLVE=1
 
-# Action-Oriented Full-Sovereignty Goal.
-# Enforces fast reading (max 2 turns) followed immediately by writing C code and unit tests.
-GOAL="You choose your own mission across Agent Alpha, but autonomy means SHIPPING REAL CODE. Follow this strict sequence: (1) In turns 1-2, read the target source files in include/ or src/; (2) In turns 3-5, write your C changes directly using write_file or patch_file; (3) Write new unit tests in tests/custom/test_<name>.c; (4) Run make -j4 && make test to certify all checks pass. Never spend all turns reading without writing code. Keep diffs focused and robust under -Wall -Wextra. Never touch sealed harness files (Makefile, src/evolve.c, src/warden.c, etc.)."
+# Direct Action C Tool Evolution Goal.
+GOAL="Survey include/alpha.h and src/tools.c in Turn 1, then immediately choose ONE impactful capability to build (e.g. regex search, AST parser, fast JSON query, embedded KV index, diff-patching engine, process monitor). Write clean C11 in src/tools.c or src/, create rich unit tests in tests/custom/test_<name>.c, and verify with make -j4 && make test. Always invoke tools directly. Your final diff must be non-empty. Never edit sealed harness files (Makefile, src/evolve.c, src/warden.c, etc.)."
 
-MAX_CONSECUTIVE_REVERTS=5
-SLEEP_BETWEEN=15
+MAX_CONSECUTIVE_REVERTS=10
+SLEEP_BETWEEN=10
 
 echo "[alpha-loop] Starting continuous evolution daemon (stop after $MAX_CONSECUTIVE_REVERTS consecutive reverts)..."
 
