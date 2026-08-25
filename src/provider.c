@@ -79,5 +79,8 @@ void alpha_cfg_defaults(alpha_cfg_t *cfg) {
     if (!cfg) return;
     if (cfg->max_turns <= 0) cfg->max_turns = 24;
     if (cfg->temperature <= 0.0) cfg->temperature = 0.2;
-    if (cfg->max_tokens <= 0) cfg->max_tokens = 8192;
+    /* Reasoning models spend most of the budget on the think block; at 8192 the
+     * actual tool call regularly got cut mid-markup (observed: the truncated
+     * half-call lands in content as text and the turn silently did nothing). */
+    if (cfg->max_tokens <= 0) cfg->max_tokens = 32768;
 }

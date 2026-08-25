@@ -392,21 +392,34 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
         cJSON *tcs = msg ? cJSON_GetObjectItem(msg, "tool_calls") : NULL;
         int ntools = cJSON_IsArray(tcs) ? cJSON_GetArraySize(tcs) : 0;
         if (ntools <= 0) {
-            /* The model tried to call a tool but wrote it as text markup
-             * ("[Calling tool", "<invoke ...>", "<tool_call>") that neither the
-             * server nor the salvage parser turned into a structured call.
-             * Nothing executed; accepting this as the final answer is how a
-             * generation ships nothing while believing it worked. Say the call
-             * never ran and let it retry — bounded, so a model that cannot
-             * recover still gets to end its turn. */
-            if (fmt_nudges < 3 && content &&
+            /* Two text-only failure modes must not be accepted as a finished
+             * answer — in both, nothing was executed:
+             * (a) the model wrote its call as text markup ("[Calling tool",
+             *     "<invoke ...>", "<tool_call>") that neither the server nor the
+             *     salvage parser turned into a structured call;
+             * (b) the reply hit the output token cap mid-call (the "[TRUNCATED"
+             *     marker llm.c appends), leaving half a call as text.
+             * Say the call never ran and let it retry — bounded, so a model
+             * that cannot recover still gets to end its turn. */
+            int fmt_fail = content &&
                 (strstr(content, "[Calling tool") || strstr(content, "<invoke") ||
-                 strstr(content, "<tool_call"))) {
+                 strstr(content, "<tool_call"));
+            int truncated = content && strstr(content, "[TRUNCATED:");
+            if (fmt_nudges < 3 && (fmt_fail || truncated)) {
                 fmt_nudges++;
+                if (!cfg->quiet)
+                    fprintf(stderr, "[alpha] %s, nudging model to retry (turn %d)\n",
+                            truncated ? "reply cut off at the token cap mid-call"
+                                      : "tool call emitted as text",
+                            turn);
                 messages_add_text(messages, "user",
-                    "[FORMAT ERROR] Your tool call was written as plain text and was "
-                    "NOT executed — no tool ran. Re-issue it now as a real tool call "
-                    "using the function-calling mechanism, not as text or markup.");
+                    truncated
+                    ? "[FORMAT ERROR] Your reply hit the output token limit and was cut "
+                      "off before the tool call completed — nothing was executed. Keep "
+                      "the reasoning SHORT and re-issue the tool call now."
+                    : "[FORMAT ERROR] Your tool call was written as plain text and was "
+                      "NOT executed — no tool ran. Re-issue it now as a real tool call "
+                      "using the function-calling mechanism, not as text or markup.");
                 sdsfree(content);
                 continue;
             }

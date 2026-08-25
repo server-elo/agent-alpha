@@ -441,7 +441,7 @@ static sds build_request_body(const alpha_cfg_t *cfg, cJSON *messages, int with_
     free(msgs_raw);
     sanitize_utf8(msgs_s);
     const char *model = (cfg->model && cfg->model[0]) ? cfg->model : "local";
-    int max_tokens = cfg->max_tokens > 0 ? cfg->max_tokens : 8192;
+    int max_tokens = cfg->max_tokens > 0 ? cfg->max_tokens : 32768;
     double temp = cfg->temperature > 0.0 ? cfg->temperature : 0.2;
     int stream = cfg->stream;
     sds body;
