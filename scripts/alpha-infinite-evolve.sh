@@ -28,6 +28,12 @@ echo "[alpha-loop] Starting continuous evolution daemon (stop after $MAX_CONSECU
 
 reverts=0
 while true; do
+    # A wedged model server (/health OK but every completion errors out)
+    # would otherwise burn MAX_CONSECUTIVE_REVERTS generations on empty replies.
+    if ! scripts/alpha-server-ensure.sh; then
+        echo "[alpha-loop] model server unrecoverable — stopping."
+        exit 1
+    fi
     echo "[alpha-loop] Launching evolution run at $(date)..."
     ./alpha --evolve "$GOAL" --generations 1
 
