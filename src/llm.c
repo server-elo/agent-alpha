@@ -622,6 +622,18 @@ sds llm_chat_ex(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message,
                 curl_easy_strerror(rc), sdslen(st.content));
     }
 
+    /* vllm-mlx reports an aborted generation as a final chunk with
+     * finish_reason "error" (observed after a Metal allocation failure:
+     * "[metal::malloc] Resource limit exceeded"). Partial text streamed
+     * before the abort is not a reply the model chose to give — it can be a
+     * degenerate loop cut off mid-token — so the whole turn is a transient
+     * failure the caller may retry, never usable content. */
+    if (strcmp(st.finish_reason, "error") == 0) {
+        stream_state_free(&st);
+        if (out_failed) *out_failed = 1;
+        return sdsnew("ERROR: server aborted generation (finish_reason=error)");
+    }
+
     /* If content is empty but reasoning was streamed, promote it to prevent false empty response drops */
     if (sdslen(st.content) == 0 && sdslen(st.reasoning) > 0) {
         st.content = sdscat(st.content, st.reasoning);
