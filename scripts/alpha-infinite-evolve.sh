@@ -18,10 +18,10 @@ set +a
 
 export ALPHA_EVOLVE=1
 
-# Small, landable changes only. The gate (build + full test suite + warden
-# seal + benchmarks) rejects sweeping rewrites, and the sealed harness files
-# listed in the goal can never be touched by a generation.
-GOAL="Make ONE small, well-scoped improvement to Agent Alpha. Good candidates: fix a real bug you find by reading the code, handle a missing edge case, improve a tool's output or error message, or add a small, focused capability to src/tools.c, src/browser.c, src/provider.c, src/telegram.c, src/ui.c or src/main.c. Add unit tests for new logic in tests/custom/test_<name>.c. Verify with make -j4 && make test — every check must pass. Keep the diff minimal: a small change that passes the gate beats a grand redesign that gets reverted. NEVER touch the sealed harness files: Makefile, src/evolve.c, src/agent_loop.c, src/warden.c, src/llm.c, tests/test_evolve.c."
+# Ambitious C feature & tool evolution goal.
+# Commands Agent Alpha to leverage the full 256k token context to reverse-engineer
+# complete missing tools, build high-performance C modules, and write exhaustive unit tests.
+GOAL="Leverage your full 256k token context window to build substantial new capabilities into Agent Alpha in native C11. Good goals: (1) Add complete, high-performance tools to src/tools.c (e.g., fast AST query, ripgrep/regex integration, structured memory indexes, embedded SQLite/KV cache, diff-patching engine, process supervisor); (2) Enhance core engine performance, latency, and memory throughput; (3) Add rich unit tests in tests/custom/test_<name>.c proving every new tool and edge case. Verify thoroughly with make -j4 && make test. Write clean, robust C11 (-Wall -Wextra clean). NEVER touch sealed harness files (Makefile, src/evolve.c, src/warden.c, src/agent_loop.c, src/llm.c, tests/test_evolve.c)."
 
 MAX_CONSECUTIVE_REVERTS=5
 SLEEP_BETWEEN=15
