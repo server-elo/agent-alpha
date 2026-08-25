@@ -18,10 +18,9 @@ set +a
 
 export ALPHA_EVOLVE=1
 
-# Ambitious C feature & tool evolution goal.
-# Commands Agent Alpha to leverage the full 256k token context to reverse-engineer
-# complete missing tools, build high-performance C modules, and write exhaustive unit tests.
-GOAL="Leverage your full 256k token context window to build substantial new capabilities into Agent Alpha in native C11. Good goals: (1) Add complete, high-performance tools to src/tools.c (e.g., fast AST query, ripgrep/regex integration, structured memory indexes, embedded SQLite/KV cache, diff-patching engine, process supervisor); (2) Enhance core engine performance, latency, and memory throughput; (3) Add rich unit tests in tests/custom/test_<name>.c proving every new tool and edge case. Verify thoroughly with make -j4 && make test. Write clean, robust C11 (-Wall -Wextra clean). NEVER touch sealed harness files (Makefile, src/evolve.c, src/warden.c, src/agent_loop.c, src/llm.c, tests/test_evolve.c)."
+# Full-Project Architectural Autonomy Goal.
+# The agent decides what to architect, modify, or invent across the entire codebase.
+GOAL="You have full architectural sovereignty to decide what to build, modify, or create across the entire project. Ingest libraries, design new C modules, extend headers in include/, invent native tools in src/, optimize streaming inference, upgrade the Telegram bot or browser subsystem, and add rich test suites in tests/custom/test_<name>.c. You decide the engineering direction for maximum capability, intelligence, and speed. Verify with make -j4 && make test. Write clean C11. Never edit sealed harness files (Makefile, src/evolve.c, src/warden.c, etc.)."
 
 MAX_CONSECUTIVE_REVERTS=5
 SLEEP_BETWEEN=15
