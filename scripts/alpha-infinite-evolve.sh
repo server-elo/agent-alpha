@@ -19,7 +19,7 @@ set +a
 export ALPHA_EVOLVE=1
 
 # Direct Action C Tool Evolution Goal.
-GOAL="Survey include/alpha.h and src/tools.c in Turn 1, then immediately choose ONE impactful capability to build (e.g. regex search, AST parser, fast JSON query, embedded KV index, diff-patching engine, process monitor). Write clean C11 in src/tools.c or src/, create rich unit tests in tests/custom/test_<name>.c, and verify with make -j4 && make test. Always invoke tools directly. Your final diff must be non-empty. Never edit sealed harness files (Makefile, src/evolve.c, src/warden.c, etc.)."
+GOAL="Survey include/alpha.h and src/tools.c in Turn 1, then immediately choose ONE impactful capability to build (e.g. regex search, AST parser, fast JSON query, embedded KV index, diff-patching engine, process monitor). Write clean C11 in src/tools.c or src/, create rich unit tests in tests/custom/test_<name>.c, and verify with make -j4 && make test. Always invoke tools directly. Never draft large file contents in your reply text: put code directly into tool arguments, writing at most ~150 lines per call — for bigger files, write_file the first chunk and append the rest with execute_bash 'cat >> file'. Keep reasoning short. Your final diff must be non-empty. Never edit sealed harness files (Makefile, src/evolve.c, src/warden.c, etc.)."
 
 MAX_CONSECUTIVE_REVERTS=10
 SLEEP_BETWEEN=10

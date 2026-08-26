@@ -441,7 +441,12 @@ static sds build_request_body(const alpha_cfg_t *cfg, cJSON *messages, int with_
     free(msgs_raw);
     sanitize_utf8(msgs_s);
     const char *model = (cfg->model && cfg->model[0]) ? cfg->model : "local";
-    int max_tokens = cfg->max_tokens > 0 ? cfg->max_tokens : 32768;
+    /* 12288, not 32768: vllm-mlx on Metal aborts long streams with
+     * finish_reason "error" ([metal::malloc] resource limit) — observed
+     * repeatedly around ~60KB of generated text. A smaller cap keeps the
+     * server alive; the [TRUNCATED] marker tells the model to continue in
+     * the next turn instead of losing the work. */
+    int max_tokens = cfg->max_tokens > 0 ? cfg->max_tokens : 12288;
     double temp = cfg->temperature > 0.0 ? cfg->temperature : 0.2;
     int stream = cfg->stream;
     sds body;

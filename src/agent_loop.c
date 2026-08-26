@@ -387,6 +387,38 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
             sdsfree(last);
             return content;
         }
+        /* Text-mode tool-call markup ("[Calling tool", "<invoke", "<tool_call>")
+         * is a failed call leaked into prose. Leaving the fragment in the
+         * conversation history teaches the model to imitate it — one leak
+         * becomes a repetition loop (observed in evolution: turns degrade into
+         * endless "[Calling tool" after a single leak). Detect it for the nudge
+         * path below, then cut the fragment so history stays clean whether or
+         * not real tool calls also arrived in the same reply. */
+        int fmt_fail = 0;
+        if (content) {
+            const char *m1 = strstr(content, "[Calling tool");
+            const char *m2 = strstr(content, "<invoke");
+            const char *m3 = strstr(content, "<tool_call");
+            const char *cut = m1;
+            if (m2 && (!cut || m2 < cut)) cut = m2;
+            if (m3 && (!cut || m3 < cut)) cut = m3;
+            if (cut) {
+                fmt_fail = 1;
+                sdssetlen(content, (size_t)(cut - content));
+                if (msg) {
+                    cJSON *mc = cJSON_GetObjectItem(msg, "content");
+                    if (cJSON_IsString(mc) && mc->valuestring) {
+                        const char *k1 = strstr(mc->valuestring, "[Calling tool");
+                        const char *k2 = strstr(mc->valuestring, "<invoke");
+                        const char *k3 = strstr(mc->valuestring, "<tool_call");
+                        const char *kcut = k1;
+                        if (k2 && (!kcut || k2 < kcut)) kcut = k2;
+                        if (k3 && (!kcut || k3 < kcut)) kcut = k3;
+                        if (kcut) mc->valuestring[kcut - mc->valuestring] = '\0';
+                    }
+                }
+            }
+        }
         if (msg) cJSON_AddItemToArray(messages, msg);
         else messages_add_text(messages, "assistant", content);
 
@@ -395,16 +427,11 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
         if (ntools <= 0) {
             /* Two text-only failure modes must not be accepted as a finished
              * answer — in both, nothing was executed:
-             * (a) the model wrote its call as text markup ("[Calling tool",
-             *     "<invoke ...>", "<tool_call>") that neither the server nor the
-             *     salvage parser turned into a structured call;
+             * (a) the model wrote its call as text markup (fmt_fail above);
              * (b) the reply hit the output token cap mid-call (the "[TRUNCATED"
              *     marker llm.c appends), leaving half a call as text.
              * Say the call never ran and let it retry — bounded, so a model
              * that cannot recover still gets to end its turn. */
-            int fmt_fail = content &&
-                (strstr(content, "[Calling tool") || strstr(content, "<invoke") ||
-                 strstr(content, "<tool_call"));
             int truncated = content && strstr(content, "[TRUNCATED:");
             if (fmt_nudges < 3 && (fmt_fail || truncated)) {
                 fmt_nudges++;
@@ -417,10 +444,15 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
                     truncated
                     ? "[FORMAT ERROR] Your reply hit the output token limit and was cut "
                       "off before the tool call completed — nothing was executed. Keep "
-                      "the reasoning SHORT and re-issue the tool call now."
+                      "the reasoning SHORT and re-issue the tool call now. If you are "
+                      "writing a file, split it: write_file the first part, then append "
+                      "the rest with execute_bash 'cat >> file' chunks of at most ~150 "
+                      "lines each."
                     : "[FORMAT ERROR] Your tool call was written as plain text and was "
                       "NOT executed — no tool ran. Re-issue it now as a real tool call "
-                      "using the function-calling mechanism, not as text or markup.");
+                      "using the function-calling mechanism, not as text or markup. Do "
+                      "NOT draft the file contents in your reply first — put them "
+                      "directly in the tool arguments, in at most ~150 lines per call.");
                 sdsfree(content);
                 continue;
             }
