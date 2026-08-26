@@ -2023,30 +2023,24 @@ static edit_t *line_diff(const char **a, size_t n_a,
 static diffline_t *build_difflines(const char **a, size_t n_a,
                                    const char **b, size_t n_b,
                                    edit_t *edits, size_t ne, size_t *out_n) {
-    (void)n_a; (void)n_b;
-    if (!edits || ne == 0) { *out_n = 0; return NULL; }
-    diffline_t *dl = malloc(ne * sizeof(diffline_t));
+    diffline_t *dl = malloc(sizeof(diffline_t) * (ne + 1));
     if (!dl) { *out_n = 0; return NULL; }
-    size_t ai = 0, bi = 0;
-    for (size_t i = 0; i < ne; i++) {
-        if (edits[i].op == OP_KEEP) {
-            dl[i] = (diffline_t){ DL_CONTEXT, (int)ai, (int)bi, a[ai] };
-            ai++; bi++;
-        } else if (edits[i].op == OP_DEL) {
-            dl[i] = (diffline_t){ DL_DELETE, (int)ai, -1, a[ai] };
-            ai++;
-        } else {
-            dl[i] = (diffline_t){ DL_INSERT, -1, (int)bi, b[bi] };
-            bi++;
-        }
+    size_t idx = 0;
+    for (size_t e = 0; e < ne; e++) {
+        if (edits[e].op == OP_KEEP)
+            dl[idx] = (diffline_t){ DL_CONTEXT, (int)edits[e].idx, (int)edits[e].idx, a[edits[e].idx] };
+        else if (edits[e].op == OP_DEL)
+            dl[idx] = (diffline_t){ DL_DELETE, (int)edits[e].idx, -1, a[edits[e].idx] };
+        else
+            dl[idx] = (diffline_t){ DL_INSERT, -1, (int)edits[e].idx, b[edits[e].idx] };
+        idx++;
     }
-    *out_n = ne;
+    *out_n = idx;
     return dl;
 }
 
-/* Emit a single hunk between difflines indices [start, end). */
+/* Emit one hunk covering difflines[start..end) in unified format. */
 static void emit_hunk(sds *out, diffline_t *dl, size_t start, size_t end) {
-    if (start >= end) return;
     int a_count = 0, b_count = 0;
     for (size_t i = start; i < end; i++) {
         if (dl[i].kind == DL_CONTEXT || dl[i].kind == DL_DELETE) a_count++;
@@ -2054,12 +2048,12 @@ static void emit_hunk(sds *out, diffline_t *dl, size_t start, size_t end) {
     }
     int a_start = (a_count == 0) ? 0 : dl[start].a_line + 1;
     int b_start = (b_count == 0) ? 0 : dl[start].b_line + 1;
-    *out = sdscatprintf(*out, "@@ -%d,%d +%d,%d @@\n", a_start, a_count, b_start, b_count);
+    sdscatprintf(out, "@@ -%d,%d +%d,%d @@\n", a_start, a_count, b_start, b_count);
     for (size_t i = start; i < end; i++) {
         char p = ' ';
         if (dl[i].kind == DL_DELETE) p = '-';
         else if (dl[i].kind == DL_INSERT) p = '+';
-        *out = sdscatprintf(*out, "%c%s\n", p, dl[i].text ? dl[i].text : "");
+        sdscatprintf(out, "%c%s\n", p, dl[i].text ? dl[i].text : "");
     }
 }
 
@@ -2100,12 +2094,12 @@ static sds unified_diff(const char *path_a, const char *path_b,
     int had_a = 0, had_b = 0;
     char **a = line_split(old_text, &n_a, &had_a);
     char **b = line_split(new_text, &n_b, &had_b);
-    edit_t *edits = line_diff((const char **)a, n_a, (const char **)b, n_b, &ne);
-    diffline_t *dl = edits ? build_difflines((const char **)a, n_a, (const char **)b, n_b, edits, ne, &nd) : NULL;
+    edit_t *edits = line_diff(a, n_a, b, n_b, &ne);
+    diffline_t *dl = edits ? build_difflines(a, n_a, b, n_b, edits, ne, &nd) : NULL;
 
     sds out = sdsempty();
-    out = sdscatprintf(out, "--- %s\n", path_a ? path_a : "a/file");
-    out = sdscatprintf(out, "+++ %s\n", path_b ? path_b : "b/file");
+    sdscatprintf(&out, "--- %s\n", path_a ? path_a : "a/file");
+    sdscatprintf(&out, "+++ %s\n", path_b ? path_b : "b/file");
     if (dl) emit_hunks(&out, dl, nd, context);
 
     free(edits);
@@ -2549,8 +2543,7 @@ cJSON *tools_schema(void) {
         "{\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"description\":\"Search the web via DuckDuckGo HTML (no API key, no JS). Returns title, URL, and snippet for each result. Fast: one HTTP GET, ~0.5-2s.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Search query\"},\"max_results\":{\"type\":\"integer\",\"description\":\"Max results (1-20, default 10)\"}},\"required\":[\"query\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"todo\",\"description\":\"Manage task list for current session. Omit todos to read, provide todos array to create/update items. Each item: {id, content, status: pending|in_progress|completed|cancelled}. merge=true updates by id.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"todos\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"},\"status\":{\"type\":\"string\"}},\"required\":[\"id\",\"content\",\"status\"]}},\"merge\":{\"type\":\"boolean\"}},\"required\":[]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"memory\",\"description\":\"Persistent curated memory that survives across sessions. Two stores: 'memory' for your notes (environment facts, conventions, lessons) and 'user' for user profile (preferences, style). Entries are §-delimited. Actions: add (append), replace (substring match), remove (substring match). Omit action to read current entries. Character limits: 2200 (memory), 1375 (user).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"add\",\"replace\",\"remove\"]},\"target\":{\"type\":\"string\",\"enum\":[\"memory\",\"user\"],\"description\":\"Which store: 'memory' (default) or 'user'\"},\"content\":{\"type\":\"string\",\"description\":\"Entry content for add/replace\"},\"old_text\":{\"type\":\"string\",\"description\":\"Substring identifying the entry for replace/remove\"}},\"required\":[]}}},"
-        "{\"type\":\"function\",\"function\":{\"name\":\"working_diff\",\"description\":\"Collect a git diff of the working directory. Modes: 'working' (unstaged + untracked, default), 'staged' (git diff --cached), 'all' (everything since HEAD + untracked). Untracked files are shown as new-file diffs via git diff --no-index /dev/null <file>. Returns the diff as text.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"working\",\"staged\",\"all\"],\"description\":\"Diff mode: working (default), staged, or all\"}},\"required\":[]}}},"
-        "{\"type\":\"function\",\"function\":{\"name\":\"patch\",\"description\":\"Pure C unified diff & patch engine. action='diff': compute unified diff between old and new text. action='apply': apply unified diff patch to content text with strict context-line verification.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"diff\",\"apply\"],\"description\":\"Action: 'diff' (default) or 'apply'\"},\"old\":{\"type\":\"string\",\"description\":\"Old text for diff\"},\"new\":{\"type\":\"string\",\"description\":\"New text for diff\"},\"content\":{\"type\":\"string\",\"description\":\"Content text to apply patch to\"},\"patch\":{\"type\":\"string\",\"description\":\"Unified diff patch text to apply\"},\"context\":{\"type\":\"integer\",\"description\":\"Context lines for diff (default 3)\"}},\"required\":[]}}}"
+        "{\"type\":\"function\",\"function\":{\"name\":\"working_diff\",\"description\":\"Collect a git diff of the working directory. Modes: 'working' (unstaged + untracked, default), 'staged' (git diff --cached), 'all' (everything since HEAD + untracked). Untracked files are shown as new-file diffs via git diff --no-index /dev/null <file>. Returns the diff as text.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"working\",\"staged\",\"all\"],\"description\":\"Diff mode: working (default), staged, or all\"}},\"required\":[]}}}"
         "]";
     return cJSON_Parse(json);
 }
