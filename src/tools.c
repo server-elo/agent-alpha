@@ -1966,7 +1966,17 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
     if (strcmp(name, "edit_file") == 0) {
         const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(args, "path"));
         const char *old_s = cJSON_GetStringValue(cJSON_GetObjectItem(args, "old_str"));
+        if (!old_s) old_s = cJSON_GetStringValue(cJSON_GetObjectItem(args, "old_text"));
+        if (!old_s) old_s = cJSON_GetStringValue(cJSON_GetObjectItem(args, "old_string"));
+        if (!old_s) old_s = cJSON_GetStringValue(cJSON_GetObjectItem(args, "find"));
+        if (!old_s) old_s = cJSON_GetStringValue(cJSON_GetObjectItem(args, "target"));
+
         const char *new_s = cJSON_GetStringValue(cJSON_GetObjectItem(args, "new_str"));
+        if (!new_s) new_s = cJSON_GetStringValue(cJSON_GetObjectItem(args, "new_text"));
+        if (!new_s) new_s = cJSON_GetStringValue(cJSON_GetObjectItem(args, "new_string"));
+        if (!new_s) new_s = cJSON_GetStringValue(cJSON_GetObjectItem(args, "replace"));
+        if (!new_s) new_s = cJSON_GetStringValue(cJSON_GetObjectItem(args, "replacement"));
+
         if (!path || !old_s) return sdsnew("ERROR: path + old_str required");
         if (!new_s) new_s = "";
         char full[PATH_MAX];
