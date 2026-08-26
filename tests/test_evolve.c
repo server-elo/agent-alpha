@@ -153,6 +153,37 @@ int main(void) {
           "an edited header is a real change");
     system("rm -rf /tmp/alpha_chg_root /tmp/alpha_chg_sbx");
 
+    /* --- test-coverage gate: feature code must bring a test -----------------
+     * Gen 211 shipped code_search (+501 lines) with zero tests and the gate
+     * passed it — the suite only ever exercises OLD behavior. The coverage
+     * check must reject src/ changes unaccompanied by a tests/custom/test_*.c
+     * and accept them once a test exists. The sandbox path must contain
+     * "/sandbox/" for the check to engage, mirroring production. */
+    system("rm -rf /tmp/alpha_cov_root && "
+           "mkdir -p /tmp/alpha_cov_root/src /tmp/alpha_cov_root/include "
+           "/tmp/alpha_cov_root/tests/custom /tmp/alpha_cov_root/sandbox/gen_t");
+    write_file("/tmp/alpha_cov_root/src/a.c", "int a;\n");
+    write_file("/tmp/alpha_cov_root/include/a.h", "#pragma once\n");
+    system("cp -R /tmp/alpha_cov_root/src /tmp/alpha_cov_root/include "
+           "/tmp/alpha_cov_root/tests /tmp/alpha_cov_root/sandbox/gen_t/");
+    report = NULL;
+    CHECK(evolve_sandbox_test_coverage("/tmp/alpha_cov_root/sandbox/gen_t", &report) == 1,
+          "unchanged trees need no new test");
+    sdsfree(report);
+    write_file("/tmp/alpha_cov_root/sandbox/gen_t/src/b.c", "int b;\n");
+    report = NULL;
+    CHECK(evolve_sandbox_test_coverage("/tmp/alpha_cov_root/sandbox/gen_t", &report) == 0,
+          "src change without a test is rejected");
+    CHECK(report && strstr(report, "no tests/custom/test_") != NULL,
+          "report names the missing test");
+    sdsfree(report);
+    write_file("/tmp/alpha_cov_root/sandbox/gen_t/tests/custom/test_b.c", "int t;\n");
+    report = NULL;
+    CHECK(evolve_sandbox_test_coverage("/tmp/alpha_cov_root/sandbox/gen_t", &report) == 1,
+          "src change with a new custom test is accepted");
+    sdsfree(report);
+    system("rm -rf /tmp/alpha_cov_root");
+
     system("rm -rf " FIX " /tmp/alpha_evolve_log /tmp/alpha_evolve_empty");
     return test_report("test_evolve");
 }

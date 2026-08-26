@@ -441,6 +441,53 @@ static int evolve_sandbox_changed(const char *root, const char *sandbox) {
     return rc != 0;   /* diff exits 0 only when every tree is identical */
 }
 
+/* Feature code without a test is invisible to this gate: build + the existing
+ * suite + benchmarks only ever exercise OLD behavior, so gen 211 shipped
+ * code_search (+501 lines, zero tests) and nothing noticed — a deliberate
+ * sabotage of code_search still printed ALL TESTS PASSED. When src/ or
+ * include/ changed, require a new or updated tests/custom/test_*.c in the
+ * same generation. Called BEFORE run_omega_red_team so Omega's generated
+ * placeholder files can never satisfy the requirement. */
+static int evolve_sandbox_test_coverage(const char *build_dir, sds *report) {
+    const char *mark = strstr(build_dir, "/sandbox/");
+    if (!mark || mark == build_dir) return 1;   /* not a sandbox: nothing to compare */
+
+    size_t n = (size_t)(mark - build_dir);
+    char root[PATH_MAX];
+    if (n >= sizeof(root)) n = sizeof(root) - 1;
+    memcpy(root, build_dir, n);
+    root[n] = 0;
+
+    int rc = -1;
+    char cmd[PATH_MAX * 4 + 256];
+    /* Behavior changed? The seal already verified the protected harness files
+     * byte-identical, so any remaining src/ or include/ diff is agent-written
+     * feature code. */
+    snprintf(cmd, sizeof(cmd),
+        "diff -rq -x '*.o' '%s/src' '%s/src' >/dev/null 2>&1 && "
+        "diff -rq '%s/include' '%s/include' >/dev/null 2>&1",
+        root, build_dir, root, build_dir);
+    sds out = run_capture(root, cmd, 60, &rc);
+    sdsfree(out);
+    if (rc == 0) return 1;   /* no src/include change: tests/docs-only generation */
+
+    /* A new or updated tests/custom/test_*.c in the same generation? */
+    snprintf(cmd, sizeof(cmd),
+        "diff -rq '%s/tests/custom' '%s/tests/custom' 2>/dev/null | "
+        "grep 'test_.*\\.c' >/dev/null 2>&1",
+        root, build_dir);
+    out = run_capture(root, cmd, 60, &rc);
+    sdsfree(out);
+    if (rc != 0) {
+        report_append(report,
+            "FAIL: src/ or include/ changed but no tests/custom/test_*.c was added "
+            "or updated — new behavior must ship with its own test (gen 211 shipped "
+            "code_search untested; the gate cannot see feature regressions otherwise)\n");
+        return 0;
+    }
+    return 1;
+}
+
 static int evolve_warden_smoke(const char *dir, sds *report) {
     warden_limits_t lim = warden_limits_default();
     lim.timeout_ms = 30000;
@@ -509,6 +556,7 @@ static int evolve_gate(const char *build_dir, const char *model, sds *report) {
 
     if (!evolve_git_protected_clean(build_dir, report)) return 0;
     if (!evolve_no_tracked_deletions(build_dir, report)) return 0;
+    if (!evolve_sandbox_test_coverage(build_dir, report)) return 0;
 
     /* Run Omega Adversarial Red-Teaming pass */
     run_omega_red_team(build_dir, model, report);
@@ -926,13 +974,29 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
             if (report) printf("%s\n", report);
             fflush(stdout);
 
-            sds fix_prompt = sdscatprintf(sdsempty(),
-                "Your previous modifications in this sandbox failed the quality gate with the following error:\n\n"
-                "```\n%s\n```\n\n"
-                "You are still in the same sandbox with all your modified files in place. "
-                "Inspect the exact compiler error or test failure above, use read_file and edit_file to FIX the bug, "
-                "and verify with `make -j4 && make test`. Do not start over from scratch — fix the specific error!",
-                report ? report : "Unknown gate error");
+            /* A missing-test failure is not a bug in the feature code — the
+             * repair turn must ORDER a test, not hint at one. Generic "fix the
+             * error" wording let models tweak working code instead of writing
+             * the missing test, burning both repair attempts. */
+            int missing_test = report && strstr(report, "no tests/custom/test_") != NULL;
+            sds fix_prompt = missing_test
+                ? sdscatprintf(sdsempty(),
+                    "Your feature code is in place and the gate accepts it — but new behavior "
+                    "must ship with its own test, and you did not write one.\n\n"
+                    "Your ONLY task now: create `tests/custom/test_<name>.c` with real CHECK "
+                    "assertions certifying the code you just added (pattern: tests/test_tools.c "
+                    "and tests/test_util.h — fixtures created by the test itself, cleaned up after). "
+                    "Any file named tests/custom/test_*.c is compiled and run automatically by "
+                    "`make test`. Verify with `make -j4 && make test` that YOUR new test binary "
+                    "runs and passes.\n\n"
+                    "Do NOT rewrite your feature code unless your test reveals a real bug in it.")
+                : sdscatprintf(sdsempty(),
+                    "Your previous modifications in this sandbox failed the quality gate with the following error:\n\n"
+                    "```\n%s\n```\n\n"
+                    "You are still in the same sandbox with all your modified files in place. "
+                    "Inspect the exact compiler error or test failure above, use read_file and edit_file to FIX the bug, "
+                    "and verify with `make -j4 && make test`. Do not start over from scratch — fix the specific error!",
+                    report ? report : "Unknown gate error");
 
             sdsfree(reply);
             cfg->cwd = sandbox;
