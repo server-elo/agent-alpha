@@ -13,19 +13,20 @@ set -uo pipefail
 ROOT_DIR="/Users/lorenc/projects/agent-alpha"
 STAGING_BASE="/tmp/alpha_harvest"
 HARVEST_LOG="$ROOT_DIR/evolution/harvested_repos.jsonl"
+STREAM_LOG="/tmp/alpha_harvester_stream.log"
 
 mkdir -p "$STAGING_BASE"
 mkdir -p "$ROOT_DIR/evolution"
 touch "$HARVEST_LOG"
+touch "$STREAM_LOG"
 
 LANGUAGES=("c" "cpp" "csharp")
 TIMEFRAMES=("daily" "weekly" "monthly")
 
-# Skip giant multi-gigabyte OS kernels / frameworks
 BLOCKLIST=("torvalds/linux" "microsoft/PowerToys" "tensorflow/tensorflow" "electron/electron" "dotnet/aspnetcore")
 
 log() {
-    echo -e "\033[1;34m[alpha-harvester]\033[0m $*" >&2
+    echo -e "\033[1;34m[alpha-harvester]\033[0m $(date '+%H:%M:%S') $*" | tee -a "$STREAM_LOG"
 }
 
 is_already_harvested() {
@@ -86,17 +87,17 @@ harvest_repo() {
     file_count=$(find "$stage_dir" -type f -not -path '*/.*' | wc -l | tr -d ' ')
     log "Cloned $repo ($file_count files) at $stage_dir"
 
-    # Construct the deep-synthesis goal requiring exhaustive study
-    local goal="Autonomous Harvester Goal: Exhaustively study the cloned $lang repository '$repo' located at $stage_dir ($file_count files). In Turn 1 and 2, thoroughly survey the directory structure using list_dir, grep across key headers/APIs for core data structures, and read_file the central algorithms and utilities. Study the codebase completely: understand how memory, error handling, and state are managed. Then think deeply: identify ONE high-value capability (e.g., lock-free queue, tokenizer/parser, graph solver, cryptographic hashing, circular buffer, or JSONPath query engine) that agent-alpha lacks. Implement a clean, pure-C11 native version in src/tools.c or src/, create rich unit tests in tests/custom/test_<name>.c, and verify with make -j4 && make test. Always invoke tools directly. Write at most ~150 lines per tool call. Your final diff must be non-empty. Never edit sealed harness files."
+    # Construct the deep-synthesis goal
+    local goal="Autonomous Harvester Goal: Exhaustively study the cloned $lang repository '$repo' located at $stage_dir ($file_count files). In Turn 1 and 2, survey the directory structure using list_dir, grep across key headers/APIs for core data structures, and read_file the central algorithms and utilities. Study the codebase completely: understand how memory, error handling, and state are managed. Then think deeply: identify ONE high-value capability (e.g., lock-free queue, tokenizer/parser, graph solver, cryptographic hashing, circular buffer, or JSONPath query engine) that agent-alpha lacks. Implement a clean, pure-C11 native version in src/tools.c or src/, create rich unit tests in tests/custom/test_<name>.c, and verify with make -j4 && make test. Always invoke tools directly. Write at most ~150 lines per tool call. Your final diff must be non-empty. Never edit sealed harness files."
 
     log "Launching self-evolution synthesis for $repo..."
     cd "$ROOT_DIR" || exit 1
 
     local ts
     ts=$(date +%s)
-    local evolve_out
-    evolve_out=$(./alpha --evolve "$goal" --generations 1 2>&1)
-    local rc=$?
+    
+    # Run with live streaming output
+    ./alpha --evolve "$goal" --generations 1 2>&1 | tee -a "$STREAM_LOG"
 
     local outcome="revert"
     local last_log
