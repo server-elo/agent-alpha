@@ -48,7 +48,6 @@ timeframe = sys.argv[2]
 days = 2 if timeframe == 'daily' else (7 if timeframe == 'weekly' else 30)
 d = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).strftime('%Y-%m-%d')
 
-# Filter size < 150000 KB (150 MB) to keep ingestion fast
 url = f"https://api.github.com/search/repositories?q=language:{lang}+pushed:>{d}+size:<150000&sort=stars&order=desc&per_page=8"
 req = urllib.request.Request(url, headers={'User-Agent': 'Agent-Alpha-Harvester'})
 try:
@@ -87,8 +86,8 @@ harvest_repo() {
     file_count=$(find "$stage_dir" -type f -not -path '*/.*' | wc -l | tr -d ' ')
     log "Cloned $repo ($file_count files) at $stage_dir"
 
-    # Construct the deep-synthesis goal
-    local goal="Autonomous Harvester Goal: Deeply survey the cloned $lang repository '$repo' at $stage_dir ($file_count files). Ingest its codebase step-by-step using list_dir, grep, and read_file across all header and source files. Identify ONE high-value capability, algorithm, parser, cryptographic utility, or data structure present in that repo that agent-alpha currently lacks. Implement a clean, pure-C11 native version in src/tools.c or src/, create rich unit tests in tests/custom/test_<name>.c, and verify with make -j4 && make test. Always invoke tools directly. Write at most ~150 lines per tool call. Your final diff must be non-empty. Never edit sealed harness files."
+    # Construct the deep-synthesis goal requiring exhaustive study
+    local goal="Autonomous Harvester Goal: Exhaustively study the cloned $lang repository '$repo' located at $stage_dir ($file_count files). In Turn 1 and 2, thoroughly survey the directory structure using list_dir, grep across key headers/APIs for core data structures, and read_file the central algorithms and utilities. Study the codebase completely: understand how memory, error handling, and state are managed. Then think deeply: identify ONE high-value capability (e.g., lock-free queue, tokenizer/parser, graph solver, cryptographic hashing, circular buffer, or JSONPath query engine) that agent-alpha lacks. Implement a clean, pure-C11 native version in src/tools.c or src/, create rich unit tests in tests/custom/test_<name>.c, and verify with make -j4 && make test. Always invoke tools directly. Write at most ~150 lines per tool call. Your final diff must be non-empty. Never edit sealed harness files."
 
     log "Launching self-evolution synthesis for $repo..."
     cd "$ROOT_DIR" || exit 1
