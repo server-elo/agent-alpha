@@ -21,12 +21,18 @@ touch "$HARVEST_LOG"
 LANGUAGES=("c" "cpp" "csharp")
 TIMEFRAMES=("daily" "weekly" "monthly")
 
+# Skip giant multi-gigabyte OS kernels / frameworks
+BLOCKLIST=("torvalds/linux" "microsoft/PowerToys" "tensorflow/tensorflow" "electron/electron" "dotnet/aspnetcore")
+
 log() {
     echo -e "\033[1;34m[alpha-harvester]\033[0m $*" >&2
 }
 
 is_already_harvested() {
     local repo="$1"
+    for b in "${BLOCKLIST[@]}"; do
+        if [ "$repo" = "$b" ]; then return 0; fi
+    done
     grep -F "\"repo\": \"$repo\"" "$HARVEST_LOG" > /dev/null 2>&1
 }
 
@@ -42,7 +48,8 @@ timeframe = sys.argv[2]
 days = 2 if timeframe == 'daily' else (7 if timeframe == 'weekly' else 30)
 d = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).strftime('%Y-%m-%d')
 
-url = f"https://api.github.com/search/repositories?q=language:{lang}+pushed:>{d}&sort=stars&order=desc&per_page=6"
+# Filter size < 150000 KB (150 MB) to keep ingestion fast
+url = f"https://api.github.com/search/repositories?q=language:{lang}+pushed:>{d}+size:<150000&sort=stars&order=desc&per_page=8"
 req = urllib.request.Request(url, headers={'User-Agent': 'Agent-Alpha-Harvester'})
 try:
     with urllib.request.urlopen(req, timeout=10) as resp:
@@ -65,7 +72,7 @@ harvest_repo() {
     local stage_dir="$STAGING_BASE/$clean_name"
 
     if is_already_harvested "$repo"; then
-        log "Skipping already-harvested repository: $repo"
+        log "Skipping already-harvested or blocklisted repository: $repo"
         return 0
     fi
 
