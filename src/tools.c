@@ -555,11 +555,20 @@ static size_t strip_ansi(char *s) {
 /* /bin/zsh is the macOS default but is frequently absent on Linux, where
  * exec'ing it left every command failing with 127. Take ALPHA_SHELL if set,
  * else the first shell that actually exists. /bin/sh is guaranteed by POSIX,
- * so the list cannot come up empty. */
+ * so the list cannot come up empty. Termux (Android) has no /bin at all —
+ * its tools live under $PREFIX, and the stock fallback is /system/bin/sh. */
 static const char *shell_path(void) {
     const char *env = getenv("ALPHA_SHELL");
     if (env && env[0] && access(env, X_OK) == 0) return env;
-    static const char *candidates[] = { "/bin/zsh", "/bin/bash", "/bin/sh" };
+    const char *prefix = getenv("PREFIX");
+    if (prefix && prefix[0]) {
+        static char tsh[PATH_MAX];
+        snprintf(tsh, sizeof(tsh), "%s/bin/bash", prefix);
+        if (access(tsh, X_OK) == 0) return tsh;
+        snprintf(tsh, sizeof(tsh), "%s/bin/sh", prefix);
+        if (access(tsh, X_OK) == 0) return tsh;
+    }
+    static const char *candidates[] = { "/bin/zsh", "/bin/bash", "/bin/sh", "/system/bin/sh" };
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++)
         if (access(candidates[i], X_OK) == 0) return candidates[i];
     return "/bin/sh";
@@ -577,12 +586,22 @@ static sds shell_quote(const char *s) {
     return sdscatlen(out, "'", 1);
 }
 
+/* Temp files for shell_run: /tmp does not exist on Android/Termux, which
+ * sets $TMPDIR into the app's private storage instead. Honour it anywhere it
+ * is set and writable, fall back to /tmp otherwise. */
+static const char *alpha_tmpdir(void) {
+    const char *td = getenv("TMPDIR");
+    if (td && td[0] && access(td, W_OK) == 0) return td;
+    return "/tmp";
+}
+
 static sds shell_run(const char *cmd, const char *cwd) {
     if (!cmd || !cmd[0]) return sdsnew("ERROR: empty command");
 
     /* Write command to temp script to avoid quoting hell.
      * fdopen the mkstemp fd directly — never reopen by name (symlink race in /tmp). */
-    char script[] = "/tmp/alpha-cmd-XXXXXX";
+    char script[PATH_MAX];
+    snprintf(script, sizeof(script), "%s/alpha-cmd-XXXXXX", alpha_tmpdir());
     int sfd = mkstemp(script);
     if (sfd < 0) return sdsnew("ERROR mkstemp script");
     FILE *sf = fdopen(sfd, "w");
@@ -611,7 +630,8 @@ static sds shell_run(const char *cmd, const char *cwd) {
     fchmod(fileno(sf), 0700);
     fclose(sf);
 
-    char outf[] = "/tmp/alpha-out-XXXXXX";
+    char outf[PATH_MAX];
+    snprintf(outf, sizeof(outf), "%s/alpha-out-XXXXXX", alpha_tmpdir());
     int ofd = mkstemp(outf);
     if (ofd < 0) {
         unlink(script);
@@ -2939,6 +2959,144 @@ static void cg_free_query(cg_query_t *q) {
     free(q);
 }
 
+/* --- phone control via ADB --------------------------------------------------
+ * On the phone itself (Termux): enable wireless debugging and
+ * `adb connect localhost:<port>` (or use Shizuku); also drives any device in
+ * `adb devices` (USB, emulator, LAN). Every action is one adb call through
+ * shell_run, so timeouts and Ctrl-C teardown behave like any other command. */
+
+/* Models frequently send numbers as strings — accept both. */
+static int args_num(cJSON *args, const char *key, int def) {
+    cJSON *v = cJSON_GetObjectItem(args, key);
+    if (cJSON_IsNumber(v)) return v->valueint;
+    const char *s = cJSON_GetStringValue(v);
+    if (s && s[0]) return atoi(s);
+    return def;
+}
+
+static sds adb_run(sds cmd, const char *cwd) {
+    sds wrapped = sdscatprintf(sdsempty(),
+        "command -v adb >/dev/null 2>&1 || { echo 'ERROR: adb not found. "
+        "Termux: pkg install android-tools'; exit 127; }; %s", cmd);
+    sdsfree(cmd);
+    sds out = shell_run(wrapped, cwd);
+    sdsfree(wrapped);
+    return out;
+}
+
+static sds phone_tool_run(cJSON *args, const char *cwd) {
+    const char *action = cJSON_GetStringValue(cJSON_GetObjectItem(args, "action"));
+    if (!action || !action[0])
+        return sdsnew("ERROR: action required (see/shot/tap/swipe/type/key/open/apps)");
+
+    if (strcmp(action, "see") == 0) {
+        sds out = adb_run(sdscatprintf(sdsempty(),
+            "adb shell uiautomator dump /sdcard/alpha-ui.xml >/dev/null && "
+            "adb shell cat /sdcard/alpha-ui.xml"), cwd);
+        /* UI trees on busy screens run to hundreds of KB — more than any model
+         * can usefully read. Keep the head, say it was cut. */
+        if (sdslen(out) > 60000) {
+            sds head = sdsnewlen(out, 60000);
+            sdsfree(out);
+            out = sdscat(head, "\n...[UI tree truncated at 60000 bytes]");
+        }
+        return out;
+    }
+    if (strcmp(action, "shot") == 0) {
+        sds path = sdscatprintf(sdsempty(), "%s/alpha-screen.png", alpha_tmpdir());
+        sds out = adb_run(sdscatprintf(sdsempty(),
+            "adb exec-out screencap -p > %s", shell_quote(path)), cwd);
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_size > 0)
+            out = sdscatprintf(out, "\nOK screenshot saved: %s (%lld bytes)",
+                               path, (long long)st.st_size);
+        sdsfree(path);
+        return out;
+    }
+    if (strcmp(action, "tap") == 0) {
+        int x = args_num(args, "x", -1), y = args_num(args, "y", -1);
+        if (x < 0 || y < 0)
+            return sdsnew("ERROR: tap needs numeric x and y (take them from the bounds in 'see')");
+        return adb_run(sdscatprintf(sdsempty(), "adb shell input tap %d %d", x, y), cwd);
+    }
+    if (strcmp(action, "swipe") == 0) {
+        int x1 = args_num(args, "x1", -1), y1 = args_num(args, "y1", -1);
+        int x2 = args_num(args, "x2", -1), y2 = args_num(args, "y2", -1);
+        int ms = args_num(args, "ms", 300);
+        if (x1 < 0 || y1 < 0 || x2 < 0 || y2 < 0)
+            return sdsnew("ERROR: swipe needs x1 y1 x2 y2 (screen centre out to the edge scrolls)");
+        return adb_run(sdscatprintf(sdsempty(),
+            "adb shell input swipe %d %d %d %d %d", x1, y1, x2, y2, ms), cwd);
+    }
+    if (strcmp(action, "type") == 0) {
+        const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(args, "text"));
+        if (!text) return sdsnew("ERROR: text required");
+        /* `input text` has no space character — %s stands in for it, so a
+         * literal % must be encoded first (%25). Newlines are sent as ENTER
+         * key events between text segments. */
+        sds cmd = sdsempty();
+        int first = 1;
+        for (const char *p = text;;) {
+            const char *nl = strchr(p, '\n');
+            size_t seglen = nl ? (size_t)(nl - p) : strlen(p);
+            sds seg = sdsempty();
+            for (size_t i = 0; i < seglen; i++) {
+                if (p[i] == '%') seg = sdscat(seg, "%25");
+                else if (p[i] == ' ') seg = sdscat(seg, "%s");
+                else seg = sdscatlen(seg, p + i, 1);
+            }
+            if (seglen)
+                cmd = sdscatprintf(cmd, "%sadb shell input text %s",
+                                   first ? "" : " && ", shell_quote(seg));
+            sdsfree(seg);
+            first = 0;
+            if (!nl) break;
+            cmd = sdscat(cmd, " && adb shell input keyevent KEYCODE_ENTER");
+            p = nl + 1;
+        }
+        if (!cmd[0]) return sdsnew("ERROR: text is empty");
+        return adb_run(cmd, cwd);
+    }
+    if (strcmp(action, "key") == 0) {
+        const char *k = cJSON_GetStringValue(cJSON_GetObjectItem(args, "key"));
+        if (!k) k = cJSON_GetStringValue(cJSON_GetObjectItem(args, "name"));
+        if (!k || !k[0])
+            return sdsnew("ERROR: key required (back/home/enter/recents/tab/del/power, or a raw KEYCODE_* name)");
+        if (strcmp(k, "recents") == 0) k = "APP_SWITCH";
+        /* Accept a friendly name or a raw KEYCODE_* name; allow only
+         * [A-Za-z0-9_] so the shell command stays inert on junk input. */
+        char code[80];
+        int n = 0;
+        const char *prefix = strncmp(k, "KEYCODE_", 8) == 0 ? "" : "KEYCODE_";
+        for (const char *p = prefix; *p && n < (int)sizeof(code) - 1; p++) code[n++] = *p;
+        for (const char *p = k; *p && n < (int)sizeof(code) - 1; p++) {
+            char c = *p;
+            if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+            if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'))
+                return sdscatprintf(sdsempty(), "ERROR: invalid key name '%s'", k);
+            code[n++] = c;
+        }
+        code[n] = 0;
+        return adb_run(sdscatprintf(sdsempty(), "adb shell input keyevent %s", code), cwd);
+    }
+    if (strcmp(action, "open") == 0) {
+        const char *pkg = cJSON_GetStringValue(cJSON_GetObjectItem(args, "package"));
+        if (!pkg) pkg = cJSON_GetStringValue(cJSON_GetObjectItem(args, "text"));
+        if (!pkg || !pkg[0]) return sdsnew("ERROR: package required (see action 'apps')");
+        for (const char *p = pkg; *p; p++)
+            if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                  (*p >= '0' && *p <= '9') || *p == '.' || *p == '_'))
+                return sdscatprintf(sdsempty(), "ERROR: invalid package name '%s'", pkg);
+        return adb_run(sdscatprintf(sdsempty(),
+            "adb shell monkey -p %s -c android.intent.category.LAUNCHER 1", pkg), cwd);
+    }
+    if (strcmp(action, "apps") == 0) {
+        return adb_run(sdsnew(
+            "adb shell pm list packages -3 | sed 's/^package://' | sort"), cwd);
+    }
+    return sdscatprintf(sdsempty(), "ERROR: unknown phone action '%s'", action);
+}
+
 sds tools_run(const char *name, cJSON *args, const char *cwd) {
     if (!name) return sdsnew("ERROR: no tool name");
     if (!args) args = cJSON_CreateObject();
@@ -3138,6 +3296,9 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         if (cJSON_IsNumber(mr)) max_results = mr->valueint;
         return web_search(query, max_results);
     }
+    if (strcmp(name, "phone") == 0) {
+        return phone_tool_run(args, cwd);
+    }
     if (strcmp(name, "memory") == 0) {
         return memory_tool_run(args);
     }
@@ -3205,6 +3366,7 @@ cJSON *tools_schema(void) {
         "\"description\":\"List directory entries (any path).\",\"parameters\":{\"type\":\"object\",\"properties\":{"
         "\"path\":{\"type\":\"string\"}}}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"browser\",\"description\":\"Pure-C browser. ONE sticky CDP tab. Loop: status/tabs -> open/navigate -> snapshot -> click/type/press/eval. close_others cleans junk. NEVER bash for click. Login/OAuth: snapshot+one click then stop. PROOF required.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\"},\"url\":{\"type\":\"string\"},\"selector\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"expression\":{\"type\":\"string\"},\"tab_id\":{\"type\":\"string\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"}},\"required\":[]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"phone\",\"description\":\"Control an Android phone over ADB (Termux: adb connect localhost:<port> after enabling wireless debugging). Loop: see -> tap/type/swipe -> see again. 'see' returns the screen's UI tree as XML — pick tap coordinates from the centre of an element's bounds=\\\"[l,t][r,b]\\\". Actions: see, shot (PNG screenshot, returns path), tap x y, swipe x1 y1 x2 y2 [ms], type text (newlines = ENTER), key back|home|enter|recents|tab|del|power, open package, apps (list user apps).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"package\":{\"type\":\"string\"},\"key\":{\"type\":\"string\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"x1\":{\"type\":\"number\"},\"y1\":{\"type\":\"number\"},\"x2\":{\"type\":\"number\"},\"y2\":{\"type\":\"number\"},\"ms\":{\"type\":\"number\"}},\"required\":[\"action\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"description\":\"Search the web via DuckDuckGo HTML (no API key, no JS). Returns title, URL, and snippet for each result. Fast: one HTTP GET, ~0.5-2s.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Search query\"},\"max_results\":{\"type\":\"integer\",\"description\":\"Max results (1-20, default 10)\"}},\"required\":[\"query\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"todo\",\"description\":\"Manage task list for current session. Omit todos to read, provide todos array to create/update items. Each item: {id, content, status: pending|in_progress|completed|cancelled}. merge=true updates by id.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"todos\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"},\"status\":{\"type\":\"string\"}},\"required\":[\"id\",\"content\",\"status\"]}},\"merge\":{\"type\":\"boolean\"}},\"required\":[]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"memory\",\"description\":\"Persistent curated memory that survives across sessions. Two stores: 'memory' for your notes (environment facts, conventions, lessons) and 'user' for user profile (preferences, style). Entries are §-delimited. Actions: add (append), replace (substring match), remove (substring match). Omit action to read current entries. Character limits: 2200 (memory), 1375 (user).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"add\",\"replace\",\"remove\"]},\"target\":{\"type\":\"string\",\"enum\":[\"memory\",\"user\"],\"description\":\"Which store: 'memory' (default) or 'user'\"},\"content\":{\"type\":\"string\",\"description\":\"Entry content for add/replace\"},\"old_text\":{\"type\":\"string\",\"description\":\"Substring identifying the entry for replace/remove\"}},\"required\":[]}}},"
