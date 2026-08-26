@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <regex.h>
+#include <fnmatch.h>
 #include <curl/curl.h>
 #include <sys/file.h>
 
@@ -2278,6 +2279,171 @@ static sds unified_apply(const char *content, const char *patch) {
     free(plines);
     line_free(clines, n_content);
     return result;
+}
+
+/* ======================================================================
+ * grep: shell-free recursive regex search
+ *
+ * A self-contained recursive regex search over files and directories, using
+ * POSIX regex(3) so it is fast, free of shell-injection risk, and returns
+ * structured "path:line:text" results. The agent already has execute_bash to
+ * call grep(1), but shelling out for every search is slow and cannot be
+ * reasoned about when the pattern or path contains shell metacharacters.
+ *
+ * Supported args (JSON object):
+ *   pattern      (required) POSIX extended regex to search for
+ *   path         (optional) file or directory to search; default "."
+ *   recursive    (optional) recurse into directories when path is one
+ *   max_results  (optional) cap reported matches (default 1000)
+ *   file_pattern (optional) only search files whose name matches this glob,
+ *                            e.g. "*.c" or "test_*"
+ *
+ * Returns a text report: one "path:line_no:line" per match, or an ERROR.
+ * ======================================================================
+ */
+
+#define ALPHA_GREP_DEFAULT_MAX 1000
+#define ALPHA_GREP_MAX_LINE    (1u << 20)   /* 1 MiB cap on a single line */
+#define ALPHA_GREP_BINARY_SNAP 8192         /* bytes sniffed to detect binary */
+#define ALPHA_GREP_MAX_DEPTH   40
+
+/* True if the first `snap` bytes of the file contain a NUL. A NUL means the
+ * text cannot survive the cJSON round trip, so the file is treated as binary
+ * and skipped rather than reported as a (truncated) match. */
+static int file_has_nul(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char buf[ALPHA_GREP_BINARY_SNAP];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    return memchr(buf, 0, n) != NULL;
+}
+
+/* A file is binary if it has a known-binary extension or a NUL in its head. */
+static int file_is_binary(const char *path) {
+    if (has_binary_extension(path)) return 1;
+    return file_has_nul(path);
+}
+
+/* Search one file for lines matching `re`. Each match is appended to *out as
+ * "path:line_no:line\n". Returns 0 on success, -1 if the file could not be
+ * opened. `count` is incremented per match and capped by `max_results`. */
+static int grep_file(const char *path, regex_t *re, sds *out, long *count,
+                     long max_results) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    char *line = NULL;
+    size_t linecap = 0;
+    ssize_t linelen;
+    long lineno = 0;
+
+    while ((linelen = getline(&line, &linecap, f)) != -1) {
+        if (*count >= max_results) break;
+        lineno++;
+        /* Strip a single trailing newline for clean output. */
+        if (linelen > 0 && line[linelen - 1] == '\n') line[linelen - 1] = 0;
+        /* A line longer than the cap is skipped rather than matched: it is
+         * almost always binary noise and would waste memory in a growable
+         * getline buffer. lineno still advances so line numbers stay correct. */
+        if ((size_t)linelen <= ALPHA_GREP_MAX_LINE &&
+            regexec(re, line, 0, NULL, 0) == 0) {
+            *out = sdscatprintf(out, "%s:%ld:%s\n", path, lineno, line);
+            (*count)++;
+        }
+    }
+
+    free(line);
+    fclose(f);
+    return 0;
+}
+
+/* Recursively search a directory. `depth` guards against pathological trees. */
+static void grep_walk(const char *dir, regex_t *re, sds *out, long *count,
+                      long max_results, const char *file_pattern, int depth) {
+    if (depth > ALPHA_GREP_MAX_DEPTH) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        char full[PATH_MAX];
+        snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
+
+        struct stat st;
+        if (stat(full, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            grep_walk(full, re, out, count, max_results, file_pattern, depth + 1);
+            continue;
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+
+        /* Optional name filter (glob against the basename). */
+        if (file_pattern && file_pattern[0] &&
+            fnmatch(file_pattern, de->d_name, 0) != 0)
+            continue;
+
+        if (file_is_binary(full)) continue;
+        grep_file(full, re, out, count, max_results);
+    }
+    closedir(d);
+}
+
+sds grep_tool_run(cJSON *args, const char *cwd) {
+    const char *pattern = cJSON_GetStringValue(cJSON_GetObjectItem(args, "pattern"));
+    if (!pattern || !pattern[0])
+        return sdsnew("ERROR: pattern is required");
+
+    regex_t re;
+    int rc = regcomp(&re, pattern, REG_EXTENDED | REG_NOSUB);
+    if (rc != 0) {
+        char msg[256];
+        regerror(rc, &re, msg, sizeof(msg));
+        return sdscatprintf(sdsempty(), "ERROR: invalid regex '%s': %s", pattern, msg);
+    }
+
+    const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(args, "path"));
+    if (!path || !path[0]) path = ".";
+
+    long max_results = ALPHA_GREP_DEFAULT_MAX;
+    cJSON *mr = cJSON_GetObjectItem(args, "max_results");
+    if (cJSON_IsNumber(mr)) {
+        max_results = (long)mr->valuedouble;
+        if (max_results <= 0) max_results = ALPHA_GREP_DEFAULT_MAX;
+    }
+
+    int recursive = 1;
+    cJSON *rec = cJSON_GetObjectItem(args, "recursive");
+    if (cJSON_IsBool(rec)) recursive = cJSON_IsTrue(rec);
+
+    const char *file_pattern = cJSON_GetStringValue(cJSON_GetObjectItem(args, "file_pattern"));
+
+    char resolved[PATH_MAX];
+    resolve_path(resolved, path, cwd);
+
+    sds out = sdsempty();
+    long count = 0;
+    struct stat st;
+    if (stat(resolved, &st) == 0 && S_ISREG(st.st_mode)) {
+        /* A single file: search it directly, bypassing the name filter. */
+        if (!file_is_binary(resolved))
+            grep_file(resolved, &re, &out, &count, max_results);
+    } else {
+        grep_walk(resolved, &re, &out, &count, max_results, file_pattern, 0);
+    }
+
+    regfree(&re);
+
+    if (count == 0) {
+        sdsfree(out);
+        return sdscatprintf(sdsempty(), "No matches for '%s' in %s\n", pattern, resolved);
+    }
+
+    if (count >= max_results) {
+        out = sdscatprintf(out, "\n... truncated at %ld results (use max_results to see more)\n", count);
+    }
+    return out;
 }
 
 sds tools_run(const char *name, cJSON *args, const char *cwd) {
