@@ -917,6 +917,42 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
         }
         if (ok) ok = evolve_gate(sandbox, cfg->model, &report);
 
+        /* Iterative Repair Gate: If real code was written but failed compilation or tests,
+         * feed the exact compiler / test feedback back into the sandbox for up to 2 repair turns! */
+        int repair_attempts = 0;
+        while (!ok && !alpha_cancel && repair_attempts < 2 && evolve_sandbox_changed(root, sandbox)) {
+            repair_attempts++;
+            printf("\n[evolve] Gate failed (attempt %d/2) — launching targeted repair with feedback...\n", repair_attempts);
+            if (report) printf("%s\n", report);
+            fflush(stdout);
+
+            sds fix_prompt = sdscatprintf(sdsempty(),
+                "Your previous modifications in this sandbox failed the quality gate with the following error:\n\n"
+                "```\n%s\n```\n\n"
+                "You are still in the same sandbox with all your modified files in place. "
+                "Inspect the exact compiler error or test failure above, use read_file and edit_file to FIX the bug, "
+                "and verify with `make -j4 && make test`. Do not start over from scratch — fix the specific error!",
+                report ? report : "Unknown gate error");
+
+            sdsfree(reply);
+            cfg->cwd = sandbox;
+            reply = agent_run(cfg, fix_prompt);
+            cfg->cwd = orig_cwd;
+            sdsfree(fix_prompt);
+
+            sdsfree(report);
+            report = NULL;
+            ok = !alpha_cancel && reply && reply[0]
+                 && strcmp(reply, "ERROR: empty response from LLM") != 0;
+
+            if (ok) {
+                if (!evolve_seal_verify(sandbox, &seal_before, &report)) ok = 0;
+                else if (!evolve_git_protected_clean(sandbox, &report)) ok = 0;
+                else if (!evolve_sandbox_changed(root, sandbox)) ok = 0;
+            }
+            if (ok) ok = evolve_gate(sandbox, cfg->model, &report);
+        }
+
         /* AFTER benchmark in sandbox */
         if (ok) {
             sds safe_bm2 = shell_escape(bm);
