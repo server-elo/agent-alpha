@@ -87,8 +87,8 @@ harvest_repo() {
     file_count=$(find "$stage_dir" -type f -not -path '*/.*' | wc -l | tr -d ' ')
     log "Cloned $repo ($file_count files) at $stage_dir"
 
-    # Construct the deep-synthesis goal
-    local goal="Autonomous Harvester Goal: Exhaustively study the cloned $lang repository '$repo' located at $stage_dir ($file_count files). In Turn 1 and 2, survey the directory structure using list_dir, grep across key headers/APIs for core data structures, and read_file the central algorithms and utilities. Study the codebase completely: understand how memory, error handling, and state are managed. Then think deeply: identify ONE high-value capability (e.g., lock-free queue, tokenizer/parser, graph solver, cryptographic hashing, circular buffer, or JSONPath query engine) that agent-alpha lacks. Implement a clean, pure-C11 native version in src/tools.c or src/, create rich unit tests in tests/custom/test_<name>.c, and verify with make -j4 && make test. Always invoke tools directly. Write at most ~150 lines per tool call. Your final diff must be non-empty. Never edit sealed harness files."
+    # Targeted whole-codebase study avoiding context blowups
+    local goal="Autonomous Harvester Goal: Study the cloned $lang repository '$repo' at $stage_dir ($file_count files). In Turn 1, survey the directory structure using list_dir and grep key headers. In Turn 2, read_file the 1-2 primary header/algorithm files for your chosen capability (do not read more than 2 full files per turn). Identify ONE high-value capability (e.g., lock-free queue, tokenizer/parser, graph solver, cryptographic hashing, circular buffer, format expander, or JSONPath query engine) that agent-alpha lacks. Implement a clean, pure-C11 native version in src/tools.c or src/, create rich unit tests in tests/custom/test_<name>.c, and verify with make -j4 && make test. Always invoke tools directly. Write at most ~150 lines per tool call. Your final diff must be non-empty. Never edit sealed harness files."
 
     log "Launching self-evolution synthesis for $repo..."
     cd "$ROOT_DIR" || exit 1
@@ -96,7 +96,6 @@ harvest_repo() {
     local ts
     ts=$(date +%s)
     
-    # Run with live streaming output
     ./alpha --evolve "$goal" --generations 1 2>&1 | tee -a "$STREAM_LOG"
 
     local outcome="revert"
