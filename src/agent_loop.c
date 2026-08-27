@@ -373,6 +373,7 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
                          || strstr(content, "HTTP 504") != NULL
                          || strstr(content, "cannot reach") != NULL
                          || strstr(content, "timed out") != NULL
+                         || strstr(content, "empty response") != NULL
                          || strstr(content, "server aborted generation") != NULL;
             if (!transient) break;
             int backoff = 2 * (attempt + 1);
