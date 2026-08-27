@@ -111,9 +111,11 @@ Your final diff must be non-empty and must include real working code + real test
     log "Launching self-evolution synthesis for $repo..."
     cd "$ROOT_DIR" || exit 1
 
+    local ts
+    ts=$(date +%s)
     export ALPHA_BASE_URL="http://127.0.0.1:8125/v1"
     export ALPHA_MODEL="opencode-go/glm-5.3-flash"
-    ./alpha --base-url "http://127.0.0.1:8125/v1" -m "opencode-go/glm-5.3-flash" --evolve "$goal" --generations 1 2>&1 | tee -a "$STREAM_LOG"
+    ./alpha -m "opencode-go/glm-5.3-flash" --evolve "$goal" --generations 1 2>&1 | tee -a "$STREAM_LOG"
 
     local outcome="revert"
     local last_log
