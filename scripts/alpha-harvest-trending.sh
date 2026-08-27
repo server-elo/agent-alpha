@@ -46,20 +46,31 @@ import sys, urllib.request, json, datetime
 
 lang = sys.argv[1]
 timeframe = sys.argv[2]
-days = 2 if timeframe == 'daily' else (7 if timeframe == 'weekly' else 30)
+days = 3 if timeframe == 'daily' else (14 if timeframe == 'weekly' else 90)
 d = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).strftime('%Y-%m-%d')
 
-url = f"https://api.github.com/search/repositories?q=language:{lang}+pushed:>{d}+size:<150000&sort=stars&order=desc&per_page=8"
-req = urllib.request.Request(url, headers={'User-Agent': 'Agent-Alpha-Harvester'})
-try:
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read().decode())
-        for item in data.get('items', []):
-            name = item.get('full_name', '')
-            if name:
-                print(name)
-except Exception:
-    pass
+queries = [
+    f"language:{lang}+pushed:>{d}+stars:>50&sort=stars&order=desc&per_page=30",
+    f"language:{lang}+stars:>200+topic:parser&sort=updated&order=desc&per_page=15",
+    f"language:{lang}+stars:>200+topic:graphics&sort=updated&order=desc&per_page=15",
+    f"language:{lang}+stars:>200+topic:compression&sort=updated&order=desc&per_page=15",
+    f"language:{lang}+stars:>200+topic:cli&sort=updated&order=desc&per_page=15"
+]
+
+seen = set()
+for q in queries:
+    url = f"https://api.github.com/search/repositories?q={q}"
+    req = urllib.request.Request(url, headers={'User-Agent': 'Agent-Alpha-Harvester'})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            for item in data.get('items', []):
+                name = item.get('full_name', '')
+                if name and name not in seen:
+                    seen.add(name)
+                    print(name)
+    except Exception:
+        pass
 PY
 }
 
@@ -118,7 +129,7 @@ Your final diff must be non-empty and must include real working code + real test
     return 0
 }
 
-# Main continuous harvesting loop
+# Main continuous harvesting loop (Runs 24/7 with zero artificial pauses)
 log "Starting Autonomous Cross-Repository Codebase Harvester..."
 while true; do
     for tf in "${TIMEFRAMES[@]}"; do
@@ -127,11 +138,11 @@ while true; do
             while IFS= read -r repo; do
                 if [ -n "$repo" ]; then
                     harvest_repo "$repo" "$lang" "$tf"
-                    sleep 3
+                    sleep 2
                 fi
             done < <(fetch_trending_repos "$lang" "$tf")
         done
     done
-    log "Completed full sweep across daily, weekly, monthly for C/C++/C#. Pausing 30 minutes before next sweep..."
-    sleep 1800
+    log "Completed full sweep across daily, weekly, monthly for C/C++/C#. Cycling immediately into next sweep..."
+    sleep 5
 done
