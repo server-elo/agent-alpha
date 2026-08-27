@@ -87,13 +87,14 @@ harvest_repo() {
     file_count=$(find "$stage_dir" -type f -not -path '*/.*' | wc -l | tr -d ' ')
     log "Cloned $repo ($file_count files) at $stage_dir"
 
-    # Strict 3-Phase Execution Blueprint guaranteeing code + test generation
-    local goal="Autonomous Harvester Goal for '$repo' ($file_count files staged at $stage_dir):
-Follow this exact 3-Phase Blueprint:
-[Phase 1 - Survey (Turns 1-2)]: Use list_dir and grep to survey the repository. Read at most 1-2 core algorithm files. Immediately select ONE high-value capability (e.g. data structure, parser, fast hashing, circular buffer, AST tokenization, hex inspector, or algorithm) that agent-alpha lacks.
-[Phase 2 - Implement (Turns 3-6)]: Write clean pure-C11 code in src/tools.c in chunks of ~120 lines. Register your tool in tools_run() dispatcher and tools_schema(). ONLY edit src/tools.c or add src/ files. NEVER touch src/evolve.c, Makefile, or warden files.
-[Phase 3 - Test & Verify (Turns 7-10)]: MANDATORY: Create a dedicated unit test suite in tests/custom/test_<feature_name>.c covering all edge cases. Run execute_bash with 'make -j4 && make test'. If compiler errors occur, fix them immediately.
-Your final diff must be non-empty and must include a new test in tests/custom/."
+    # Exact Generation 211 Gold-Standard Blueprint
+    local goal="Autonomous Harvester Goal for '$repo' ($file_count files at $stage_dir):
+Replicate the exact winning rhythm of Generation 211 (which shipped +501 lines of code_search):
+1. [Turn 1 - Quick Survey]: Use list_dir and grep. Read 1 core algorithm file. Immediately pick ONE missing capability (e.g. data structure, parser, fast hashing, ring buffer, network packet queue, AST tokenizer, or binary inspector).
+2. [Turn 2 - Plan with todo]: Call the todo tool with 4-6 small chunked tasks.
+3. [Turns 3-6 - Chunked Pure-C11 Synthesis]: Write code in src/tools.c in small ~100-line chunks. Wire tools_run() dispatch and tools_schema(). NEVER touch src/evolve.c, Makefile, or warden files.
+4. [Turns 7-9 - Dedicated Unit Test & Gate]: Write tests/custom/test_<name>.c with 6+ assertions. Run execute_bash with 'make -j4 && make test'. If compiler errors occur, fix them in the sandbox immediately.
+Your final diff must be non-empty and must include tests/custom/test_<name>.c."
 
     log "Launching self-evolution synthesis for $repo..."
     cd "$ROOT_DIR" || exit 1
