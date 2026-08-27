@@ -3395,6 +3395,68 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         out = sdscat(out, "]}");
         return out;
     }
+    if (strcmp(name, "hex_pattern_search") == 0) {
+        const char *data_hex = cJSON_GetStringValue(cJSON_GetObjectItem(args, "data"));
+        const char *pattern = cJSON_GetStringValue(cJSON_GetObjectItem(args, "pattern"));
+        if (!data_hex || !pattern)
+            return sdsnew("ERROR: data and pattern parameters required for hex_pattern_search");
+
+        /* Parse raw data bytes from hex */
+        size_t dlen = strlen(data_hex);
+        uint8_t *dbuf = malloc(dlen / 2 + 1);
+        size_t dcount = 0;
+        for (size_t i = 0; i + 1 < dlen; i += 2) {
+            char byte_str[3] = { data_hex[i], data_hex[i+1], '\0' };
+            char *endptr = NULL;
+            unsigned long val = strtoul(byte_str, &endptr, 16);
+            if (endptr && *endptr == '\0') dbuf[dcount++] = (uint8_t)val;
+        }
+
+        /* Parse pattern tokens: handles spaces and ?? wildcards */
+        typedef struct { uint8_t byte; uint8_t is_wildcard; } hex_pat_t;
+        hex_pat_t pat[128];
+        size_t pcount = 0;
+        const char *p = pattern;
+        while (*p && pcount < 128) {
+            while (*p == ' ') p++;
+            if (!*p) break;
+            if (p[0] == '?' && p[1] == '?') {
+                pat[pcount].byte = 0;
+                pat[pcount].is_wildcard = 1;
+                pcount++;
+                p += 2;
+            } else if (isxdigit(p[0]) && isxdigit(p[1])) {
+                char byte_str[3] = { p[0], p[1], '\0' };
+                pat[pcount].byte = (uint8_t)strtoul(byte_str, NULL, 16);
+                pat[pcount].is_wildcard = 0;
+                pcount++;
+                p += 2;
+            } else {
+                p++;
+            }
+        }
+
+        sds out = sdscatprintf(sdsempty(), "{\"action\":\"hex_pattern_search\",\"pattern_length\":%zu,\"matches\":[", pcount);
+        int matches = 0;
+        if (pcount > 0 && dcount >= pcount) {
+            for (size_t i = 0; i <= dcount - pcount; i++) {
+                int ok = 1;
+                for (size_t j = 0; j < pcount; j++) {
+                    if (!pat[j].is_wildcard && dbuf[i + j] != pat[j].byte) {
+                        ok = 0;
+                        break;
+                    }
+                }
+                if (ok) {
+                    out = sdscatprintf(out, "%s%zu", matches > 0 ? "," : "", i);
+                    matches++;
+                }
+            }
+        }
+        out = sdscatprintf(out, "],\"total_matches\":%d}", matches);
+        free(dbuf);
+        return out;
+    }
     return sdscatprintf(sdsempty(), "ERROR: unknown tool %s", name);
 }
 
@@ -3430,6 +3492,7 @@ cJSON *tools_schema(void) {
         "{\"type\":\"function\",\"function\":{\"name\":\"memory\",\"description\":\"Persistent curated memory that survives across sessions. Two stores: 'memory' for your notes (environment facts, conventions, lessons) and 'user' for user profile (preferences, style). Entries are §-delimited. Actions: add (append), replace (substring match), remove (substring match). Omit action to read current entries. Character limits: 2200 (memory), 1375 (user).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"add\",\"replace\",\"remove\"]},\"target\":{\"type\":\"string\",\"enum\":[\"memory\",\"user\"],\"description\":\"Which store: 'memory' (default) or 'user'\"},\"content\":{\"type\":\"string\",\"description\":\"Entry content for add/replace\"},\"old_text\":{\"type\":\"string\",\"description\":\"Substring identifying the entry for replace/remove\"}},\"required\":[]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"code_search\",\"description\":\"Field-qualified code search. Query like kind:function name:auth path:src/api authenticate splits into structured filters plus free text. Args: query (required), path, recursive, max_results.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Field-qualified query, e.g. kind:function name:auth\"},\"path\":{\"type\":\"string\",\"description\":\"File or directory to search (default .)\"},\"recursive\":{\"type\":\"boolean\"},\"max_results\":{\"type\":\"integer\",\"description\":\"Max results (default 1000)\"}},\"required\":[\"query\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"layout_solver\",\"description\":\"Dynamic 2D Vector Geometry & Binary Space Partitioning (BSP) Tree Layout Solver from Hyprland. Actions: 'bsp' (computes non-overlapping tiled rectangular bounding boxes for canvas width/height/count), 'bezier' (computes cubic Bézier easing curves for animation keyframes).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"bsp\",\"bezier\"]},\"width\":{\"type\":\"integer\"},\"height\":{\"type\":\"integer\"},\"count\":{\"type\":\"integer\"},\"t\":{\"type\":\"number\"},\"p1x\":{\"type\":\"number\"},\"p1y\":{\"type\":\"number\"},\"p2x\":{\"type\":\"number\"},\"p2y\":{\"type\":\"number\"}},\"required\":[]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"hex_pattern_search\",\"description\":\"Fast In-Memory Byte Signature & Wildcard Hex Pattern Scanner from RevokeMsgPatcher. Scans raw hex byte buffers with exact and ?? wildcard masks (e.g. '55 8B ?? 83 EC ??'). Returns matching offset indexes.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"data\":{\"type\":\"string\",\"description\":\"Hex-encoded binary buffer string\"},\"pattern\":{\"type\":\"string\",\"description\":\"Hex pattern with optional ?? wildcards (e.g. '48 89 ?? 55')\"}},\"required\":[\"data\",\"pattern\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"working_diff\",\"description\":\"Collect a git diff of the working directory. Modes: 'working' (unstaged + untracked, default), 'staged' (git diff --cached), 'all' (everything since HEAD + untracked). Untracked files are shown as new-file diffs via git diff --no-index /dev/null <file>. Returns the diff as text.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"working\",\"staged\",\"all\"],\"description\":\"Diff mode: working (default), staged, or all\"}},\"required\":[]}}}"
         "]";
     return cJSON_Parse(json);
