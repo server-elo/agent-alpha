@@ -3586,6 +3586,106 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         out = sdscatprintf(out, "],\"total_matches\":%d}", matches);
         return out;
     }
+    if (strcmp(name, "multi_hex_edit") == 0) {
+        const char *data_hex = cJSON_GetStringValue(cJSON_GetObjectItem(args, "data"));
+        cJSON *changes = cJSON_GetObjectItem(args, "changes");
+        if (!data_hex || !changes || !cJSON_IsArray(changes))
+            return sdsnew("ERROR: data and changes array required for multi_hex_edit");
+
+        size_t dlen = strlen(data_hex);
+        if (dlen % 2 != 0)
+            return sdsnew("ERROR: hex data length must be an even number of characters");
+
+        size_t dcount = dlen / 2;
+        uint8_t *dbuf = malloc(dcount);
+        for (size_t i = 0; i < dcount; i++) {
+            if (!isxdigit(data_hex[i*2]) || !isxdigit(data_hex[i*2+1])) {
+                free(dbuf);
+                return sdsnew("ERROR: invalid non-hex character in data buffer");
+            }
+            char byte_str[3] = { data_hex[i*2], data_hex[i*2+1], '\0' };
+            dbuf[i] = (uint8_t)strtoul(byte_str, NULL, 16);
+        }
+
+        /* Validate all changes before applying any */
+        int n_changes = cJSON_GetArrayItem(changes, 0) ? cJSON_GetArraySize(changes) : 0;
+        if (n_changes == 0) {
+            free(dbuf);
+            return sdsnew("ERROR: changes array must not be empty");
+        }
+
+        for (int c = 0; c < n_changes; c++) {
+            cJSON *item = cJSON_GetArrayItem(changes, c);
+            cJSON *off_item = cJSON_GetObjectItem(item, "offset");
+            const char *patch_hex = cJSON_GetStringValue(cJSON_GetObjectItem(item, "patch"));
+            if (!off_item || !cJSON_IsNumber(off_item) || !patch_hex) {
+                free(dbuf);
+                return sdsnew("ERROR: each change item must contain numeric offset and string patch");
+            }
+            if (off_item->valueint < 0) {
+                free(dbuf);
+                return sdsnew("ERROR: offset must be non-negative");
+            }
+            size_t off = (size_t)off_item->valueint;
+            size_t plen = strlen(patch_hex);
+            if (plen % 2 != 0) {
+                free(dbuf);
+                return sdsnew("ERROR: patch hex length must be even");
+            }
+            size_t pcount = plen / 2;
+            if (off > dcount || pcount > dcount - off) {
+                free(dbuf);
+                return sdsnew("ERROR: patch bounds exceed data buffer size");
+            }
+            for (size_t i = 0; i < plen; i++) {
+                if (!isxdigit(patch_hex[i])) {
+                    free(dbuf);
+                    return sdsnew("ERROR: invalid non-hex character in patch");
+                }
+            }
+        }
+
+        /* Apply changes atomically and record rollbacks */
+        cJSON *rollbacks = cJSON_CreateArray();
+        for (int c = 0; c < n_changes; c++) {
+            cJSON *item = cJSON_GetArrayItem(changes, c);
+            size_t off = (size_t)cJSON_GetObjectItem(item, "offset")->valueint;
+            const char *patch_hex = cJSON_GetStringValue(cJSON_GetObjectItem(item, "patch"));
+            size_t pcount = strlen(patch_hex) / 2;
+
+            sds orig_chunk = sdsempty();
+            for (size_t i = 0; i < pcount; i++) {
+                char byte_str[3] = { patch_hex[i*2], patch_hex[i*2+1], '\0' };
+                uint8_t pbyte = (uint8_t)strtoul(byte_str, NULL, 16);
+                orig_chunk = sdscatprintf(orig_chunk, "%02x", dbuf[off + i]);
+                dbuf[off + i] = pbyte;
+            }
+            cJSON *rb = cJSON_CreateObject();
+            cJSON_AddNumberToObject(rb, "offset", (double)off);
+            cJSON_AddStringToObject(rb, "original", orig_chunk);
+            sdsfree(orig_chunk);
+            cJSON_AddItemToArray(rollbacks, rb);
+        }
+
+        sds patched_hex = sdsempty();
+        for (size_t i = 0; i < dcount; i++) {
+            patched_hex = sdscatprintf(patched_hex, "%02x", dbuf[i]);
+        }
+        free(dbuf);
+
+        cJSON *res_obj = cJSON_CreateObject();
+        cJSON_AddStringToObject(res_obj, "action", "multi_hex_edit");
+        cJSON_AddNumberToObject(res_obj, "applied_changes", n_changes);
+        cJSON_AddItemToObject(res_obj, "rollbacks", rollbacks);
+        cJSON_AddStringToObject(res_obj, "patched", patched_hex);
+        sdsfree(patched_hex);
+
+        char *json_str = cJSON_PrintUnformatted(res_obj);
+        cJSON_Delete(res_obj);
+        sds out = sdsnew(json_str);
+        free(json_str);
+        return out;
+    }
     return sdscatprintf(sdsempty(), "ERROR: unknown tool %s", name);
 }
 
@@ -3624,6 +3724,7 @@ cJSON *tools_schema(void) {
         "{\"type\":\"function\",\"function\":{\"name\":\"hex_pattern_search\",\"description\":\"Fast In-Memory Byte Signature & Wildcard Hex Pattern Scanner from RevokeMsgPatcher. Scans raw hex byte buffers with exact and ?? wildcard masks (e.g. '55 8B ?? 83 EC ??'). Returns matching offset indexes.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"data\":{\"type\":\"string\",\"description\":\"Hex-encoded binary buffer string\"},\"pattern\":{\"type\":\"string\",\"description\":\"Hex pattern with optional ?? wildcards (e.g. '48 89 ?? 55')\"}},\"required\":[\"data\",\"pattern\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"binary_patch_apply\",\"description\":\"Safe In-Memory Binary Byte Patcher from RevokeMsgPatcher. Applies replacement byte hex sequences at specified offsets with bounds checking and original byte rollback capture.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"data\":{\"type\":\"string\",\"description\":\"Original hex-encoded binary buffer\"},\"offset\":{\"type\":\"integer\",\"description\":\"Byte offset where patch should be applied\"},\"patch\":{\"type\":\"string\",\"description\":\"Hex replacement bytes to write at offset\"}},\"required\":[\"data\",\"offset\",\"patch\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"boyer_moore_search\",\"description\":\"High-Performance Boyer-Moore Substring Search Algorithm with Bad Character and Good Suffix Shift Heuristics from RevokeMsgPatcher. Scans large text buffers in sublinear O(N/M) time complexity.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\",\"description\":\"Target haystack text to search within\"},\"pattern\":{\"type\":\"string\",\"description\":\"Needle substring to match\"}},\"required\":[\"text\",\"pattern\"]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"multi_hex_edit\",\"description\":\"Atomic Multi-Location Binary Hex Patching Engine from RevokeMsgPatcher. Applies an array of multiple offset modifications transactionally with all-or-nothing validation and structured per-patch rollback logs.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"data\":{\"type\":\"string\",\"description\":\"Original hex-encoded binary buffer\"},\"changes\":{\"type\":\"array\",\"description\":\"Array of change objects: [{'offset': 0, 'patch': '9090'}]\"}},\"required\":[\"data\",\"changes\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"working_diff\",\"description\":\"Collect a git diff of the working directory. Modes: 'working' (unstaged + untracked, default), 'staged' (git diff --cached), 'all' (everything since HEAD + untracked). Untracked files are shown as new-file diffs via git diff --no-index /dev/null <file>. Returns the diff as text.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"working\",\"staged\",\"all\"],\"description\":\"Diff mode: working (default), staged, or all\"}},\"required\":[]}}}"
         "]";
     return cJSON_Parse(json);
