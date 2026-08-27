@@ -1175,6 +1175,16 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
             }
         } else {
             printf("[evolve] generation %d REVERTED:%s\n", gen, report ? report : "(no report)");
+            /* Save failed sandbox snapshot to /tmp/alpha_revert_sandbox/ for Antigravity audit */
+            char snapcmd[PATH_MAX * 2 + 128];
+            snprintf(snapcmd, sizeof(snapcmd),
+                "rm -rf /tmp/alpha_revert_sandbox; cp -R '%s' /tmp/alpha_revert_sandbox 2>/dev/null; "
+                "echo 'GEN=%d\nREPORT=%s' > /tmp/alpha_revert_sandbox/.revert_report.txt; true",
+                sandbox, gen, report ? report : "no report");
+            int snap_rc = -1;
+            sds snapout = run_capture(root, snapcmd, 60, &snap_rc);
+            sdsfree(snapout);
+
             int r_rc = -1;
             sds r = run_capture(root, "git reset --hard -q HEAD", 60, &r_rc);
             sdsfree(r);
