@@ -456,6 +456,21 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
                 sdsfree(content);
                 continue;
             }
+            /* In self-evolution mode (ALPHA_EVOLVE=1), an evolutionary goal requires real code diff
+             * and tests. If the model emits plain text without tools and diff is still empty, do NOT
+             * terminate early — nudge the model to execute its tool call immediately! */
+            const char *evolve_env = getenv("ALPHA_EVOLVE");
+            if (evolve_env && evolve_env[0] && fmt_nudges < 4 && turn < cfg->max_turns - 2) {
+                fmt_nudges++;
+                if (!cfg->quiet)
+                    fprintf(stderr, "[alpha] text-only reply in evolution mode without tools, prompting model to execute tools (turn %d)\n", turn);
+                messages_add_text(messages, "user",
+                    "[ACTION REQUIRED] You replied with conversational text, but you have NOT modified `src/tools.c` "
+                    "or created `tests/custom/test_<name>.c` yet. Evolution requires real code + test diffs. "
+                    "Do NOT reply with text alone. Invoke your tool calls NOW (`write_file`, `edit_file`, or `execute_bash`)!");
+                sdsfree(content);
+                continue;
+            }
             sdsfree(last);
             last = content;
             break;
