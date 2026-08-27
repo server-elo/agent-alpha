@@ -255,7 +255,7 @@ static void notes_append(sds *notes, const char *name, const char *result) {
  * are already digested into tool_notes.
  *
  * The system prompt (index 0) and the most recent exchanges are never dropped. */
-#define ALPHA_LIVE_MAX_BYTES 400000
+#define ALPHA_LIVE_MAX_BYTES 1000000
 
 /* Size of one message as it will appear on the wire. "content" is not the only
  * field that carries bulk: an assistant turn that calls write_file puts the
