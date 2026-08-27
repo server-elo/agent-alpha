@@ -30,7 +30,7 @@ static void test_multi_hex_edit_basic(void) {
     CHECK(strstr(res, "\"applied_changes\":2") != NULL, "applied 2 changes");
     CHECK(strstr(res, "\"original\":\"558b\"") != NULL, "rollback 1 captured");
     CHECK(strstr(res, "\"original\":\"83\"") != NULL, "rollback 2 captured");
-    CHECK(strstr(res, "\"patched\":\"9090ecc2048895c2410\"") != NULL, "correct patched string");
+    CHECK(strstr(res, "\"patched\":\"9090ecccec2048895c2410\"") != NULL, "correct patched string");
 
     cJSON *parsed = cJSON_Parse(res);
     sdsfree(res);
