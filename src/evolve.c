@@ -950,6 +950,9 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
         sds report = NULL;
         int ok = !alpha_cancel && reply && reply[0]
                  && strcmp(reply, "ERROR: empty response from LLM") != 0;
+        if (!ok && !report) {
+            report = reply && reply[0] ? sdsnew(reply) : sdsnew("FAIL: generation finished without output or empty reply\n");
+        }
 
         if (ok) {
             if (!evolve_seal_verify(sandbox, &seal_before, &report)) ok = 0;
