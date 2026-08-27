@@ -3517,6 +3517,75 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         free(dbuf);
         return out;
     }
+    if (strcmp(name, "boyer_moore_search") == 0) {
+        const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(args, "text"));
+        const char *pattern = cJSON_GetStringValue(cJSON_GetObjectItem(args, "pattern"));
+        if (!text || !pattern)
+            return sdsnew("ERROR: text and pattern required for boyer_moore_search");
+
+        size_t n = strlen(text);
+        size_t m = strlen(pattern);
+        if (m == 0)
+            return sdsnew("ERROR: pattern must not be empty");
+
+        /* Build Bad Character Shift Heuristic */
+        int bad_char[256];
+        for (int i = 0; i < 256; i++) bad_char[i] = (int)m;
+        for (size_t i = 0; i < m; i++) bad_char[(unsigned char)pattern[i]] = (int)(m - 1 - i);
+
+        /* Build Good Suffix Shift Heuristic */
+        int *good_suffix = malloc(m * sizeof(int));
+        int *suff = malloc(m * sizeof(int));
+        for (size_t i = 0; i < m; i++) good_suffix[i] = (int)m;
+
+        suff[m - 1] = (int)m;
+        int g = (int)m - 1, f = 0;
+        for (int i = (int)m - 2; i >= 0; --i) {
+            if (i > g && suff[i + (int)m - 1 - f] < i - g) {
+                suff[i] = suff[i + (int)m - 1 - f];
+            } else {
+                if (i < g) g = i;
+                f = i;
+                while (g >= 0 && pattern[g] == pattern[g + (int)m - 1 - f]) --g;
+                suff[i] = f - g;
+            }
+        }
+
+        int j = 0;
+        for (int i = (int)m - 1; i >= -1; --i) {
+            if (i == -1 || suff[i] == i + 1) {
+                for (; j < (int)m - 1 - i; ++j) {
+                    if (good_suffix[j] == (int)m) good_suffix[j] = (int)m - 1 - i;
+                }
+            }
+        }
+        for (size_t i = 0; i < m - 1; ++i) {
+            good_suffix[m - 1 - suff[i]] = (int)(m - 1 - i);
+        }
+        free(suff);
+
+        /* Execute Boyer-Moore Search */
+        sds out = sdscatprintf(sdsempty(), "{\"action\":\"boyer_moore_search\",\"pattern_length\":%zu,\"matches\":[", m);
+        int matches = 0;
+        int s = 0;
+        while (s <= (int)(n - m)) {
+            int k = (int)m - 1;
+            while (k >= 0 && pattern[k] == text[s + k]) k--;
+            if (k < 0) {
+                out = sdscatprintf(out, "%s%d", matches > 0 ? "," : "", s);
+                matches++;
+                s += good_suffix[0];
+            } else {
+                int bc_shift = bad_char[(unsigned char)text[s + k]] - ((int)m - 1) + k;
+                int gs_shift = good_suffix[k];
+                int max_shift = gs_shift > bc_shift ? gs_shift : bc_shift;
+                s += max_shift > 0 ? max_shift : 1;
+            }
+        }
+        free(good_suffix);
+        out = sdscatprintf(out, "],\"total_matches\":%d}", matches);
+        return out;
+    }
     return sdscatprintf(sdsempty(), "ERROR: unknown tool %s", name);
 }
 
@@ -3554,6 +3623,7 @@ cJSON *tools_schema(void) {
         "{\"type\":\"function\",\"function\":{\"name\":\"layout_solver\",\"description\":\"Dynamic 2D Vector Geometry & Binary Space Partitioning (BSP) Tree Layout Solver from Hyprland. Actions: 'bsp' (computes non-overlapping tiled rectangular bounding boxes for canvas width/height/count), 'bezier' (computes cubic Bézier easing curves for animation keyframes).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"bsp\",\"bezier\"]},\"width\":{\"type\":\"integer\"},\"height\":{\"type\":\"integer\"},\"count\":{\"type\":\"integer\"},\"t\":{\"type\":\"number\"},\"p1x\":{\"type\":\"number\"},\"p1y\":{\"type\":\"number\"},\"p2x\":{\"type\":\"number\"},\"p2y\":{\"type\":\"number\"}},\"required\":[]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"hex_pattern_search\",\"description\":\"Fast In-Memory Byte Signature & Wildcard Hex Pattern Scanner from RevokeMsgPatcher. Scans raw hex byte buffers with exact and ?? wildcard masks (e.g. '55 8B ?? 83 EC ??'). Returns matching offset indexes.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"data\":{\"type\":\"string\",\"description\":\"Hex-encoded binary buffer string\"},\"pattern\":{\"type\":\"string\",\"description\":\"Hex pattern with optional ?? wildcards (e.g. '48 89 ?? 55')\"}},\"required\":[\"data\",\"pattern\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"binary_patch_apply\",\"description\":\"Safe In-Memory Binary Byte Patcher from RevokeMsgPatcher. Applies replacement byte hex sequences at specified offsets with bounds checking and original byte rollback capture.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"data\":{\"type\":\"string\",\"description\":\"Original hex-encoded binary buffer\"},\"offset\":{\"type\":\"integer\",\"description\":\"Byte offset where patch should be applied\"},\"patch\":{\"type\":\"string\",\"description\":\"Hex replacement bytes to write at offset\"}},\"required\":[\"data\",\"offset\",\"patch\"]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"boyer_moore_search\",\"description\":\"High-Performance Boyer-Moore Substring Search Algorithm with Bad Character and Good Suffix Shift Heuristics from RevokeMsgPatcher. Scans large text buffers in sublinear O(N/M) time complexity.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\",\"description\":\"Target haystack text to search within\"},\"pattern\":{\"type\":\"string\",\"description\":\"Needle substring to match\"}},\"required\":[\"text\",\"pattern\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"working_diff\",\"description\":\"Collect a git diff of the working directory. Modes: 'working' (unstaged + untracked, default), 'staged' (git diff --cached), 'all' (everything since HEAD + untracked). Untracked files are shown as new-file diffs via git diff --no-index /dev/null <file>. Returns the diff as text.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"working\",\"staged\",\"all\"],\"description\":\"Diff mode: working (default), staged, or all\"}},\"required\":[]}}}"
         "]";
     return cJSON_Parse(json);
