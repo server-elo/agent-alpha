@@ -1,0 +1,7 @@
+---
+name: agent-alpha
+description: Benchmark values and work state for the agent-alpha project (bench_before baseline)
+sources: [chat]
+---
+
+- [stated] bench_before=val_before
