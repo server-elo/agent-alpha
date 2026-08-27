@@ -3337,6 +3337,64 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         }
         return sdsnew("ERROR: unknown patch action — use diff or apply");
     }
+    if (strcmp(name, "layout_solver") == 0) {
+        const char *action = cJSON_GetStringValue(cJSON_GetObjectItem(args, "action"));
+        if (!action) action = "bsp";
+        if (strcmp(action, "bezier") == 0) {
+            double p1x = 0.25, p1y = 0.1, p2x = 0.25, p2y = 1.0, t = 0.5;
+            cJSON *item = cJSON_GetObjectItem(args, "t");
+            if (cJSON_IsNumber(item)) t = item->valuedouble;
+            item = cJSON_GetObjectItem(args, "p1x");
+            if (cJSON_IsNumber(item)) p1x = item->valuedouble;
+            item = cJSON_GetObjectItem(args, "p1y");
+            if (cJSON_IsNumber(item)) p1y = item->valuedouble;
+            item = cJSON_GetObjectItem(args, "p2x");
+            if (cJSON_IsNumber(item)) p2x = item->valuedouble;
+            item = cJSON_GetObjectItem(args, "p2y");
+            if (cJSON_IsNumber(item)) p2y = item->valuedouble;
+
+            double inv = 1.0 - t;
+            double y = 3.0 * inv * inv * t * p1y + 3.0 * inv * t * t * p2y + t * t * t;
+            double x = 3.0 * inv * inv * t * p1x + 3.0 * inv * t * t * p2x + t * t * t;
+            return sdscatprintf(sdsempty(), "{\"action\":\"bezier\",\"t\":%.4f,\"x\":%.4f,\"y\":%.4f}", t, x, y);
+        }
+        /* BSP Tiling & Partitioning */
+        int width = 1920, height = 1080, count = 2;
+        cJSON *item = cJSON_GetObjectItem(args, "width");
+        if (cJSON_IsNumber(item)) width = item->valueint;
+        item = cJSON_GetObjectItem(args, "height");
+        if (cJSON_IsNumber(item)) height = item->valueint;
+        item = cJSON_GetObjectItem(args, "count");
+        if (cJSON_IsNumber(item)) count = item->valueint;
+        if (count <= 0) count = 1;
+        if (count > 32) count = 32;
+
+        sds out = sdscatprintf(sdsempty(), "{\"action\":\"bsp\",\"canvas\":{\"w\":%d,\"h\":%d},\"nodes\":[", width, height);
+        int cur_x = 0, cur_y = 0, cur_w = width, cur_h = height;
+        for (int i = 0; i < count; i++) {
+            int node_w = cur_w, node_h = cur_h;
+            if (i < count - 1) {
+                if (cur_w >= cur_h) {
+                    node_w = cur_w / 2;
+                    out = sdscatprintf(out, "%s{\"id\":%d,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d}",
+                                       i > 0 ? "," : "", i + 1, cur_x, cur_y, node_w, node_h);
+                    cur_x += node_w;
+                    cur_w -= node_w;
+                } else {
+                    node_h = cur_h / 2;
+                    out = sdscatprintf(out, "%s{\"id\":%d,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d}",
+                                       i > 0 ? "," : "", i + 1, cur_x, cur_y, node_w, node_h);
+                    cur_y += node_h;
+                    cur_h -= node_h;
+                }
+            } else {
+                out = sdscatprintf(out, "%s{\"id\":%d,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d}",
+                                   i > 0 ? "," : "", i + 1, cur_x, cur_y, cur_w, cur_h);
+            }
+        }
+        out = sdscat(out, "]}");
+        return out;
+    }
     return sdscatprintf(sdsempty(), "ERROR: unknown tool %s", name);
 }
 
@@ -3370,7 +3428,9 @@ cJSON *tools_schema(void) {
         "{\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"description\":\"Search the web via DuckDuckGo HTML (no API key, no JS). Returns title, URL, and snippet for each result. Fast: one HTTP GET, ~0.5-2s.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Search query\"},\"max_results\":{\"type\":\"integer\",\"description\":\"Max results (1-20, default 10)\"}},\"required\":[\"query\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"todo\",\"description\":\"Manage task list for current session. Omit todos to read, provide todos array to create/update items. Each item: {id, content, status: pending|in_progress|completed|cancelled}. merge=true updates by id.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"todos\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"},\"status\":{\"type\":\"string\"}},\"required\":[\"id\",\"content\",\"status\"]}},\"merge\":{\"type\":\"boolean\"}},\"required\":[]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"memory\",\"description\":\"Persistent curated memory that survives across sessions. Two stores: 'memory' for your notes (environment facts, conventions, lessons) and 'user' for user profile (preferences, style). Entries are §-delimited. Actions: add (append), replace (substring match), remove (substring match). Omit action to read current entries. Character limits: 2200 (memory), 1375 (user).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"add\",\"replace\",\"remove\"]},\"target\":{\"type\":\"string\",\"enum\":[\"memory\",\"user\"],\"description\":\"Which store: 'memory' (default) or 'user'\"},\"content\":{\"type\":\"string\",\"description\":\"Entry content for add/replace\"},\"old_text\":{\"type\":\"string\",\"description\":\"Substring identifying the entry for replace/remove\"}},\"required\":[]}}},"
-        "{\"type\":\"function\",\"function\":{\"name\":\"code_search\",\"description\":\"Field-qualified code search. Query like kind:function name:auth path:src/api authenticate splits into structured filters plus free text. Args: query (required), path, recursive, max_results.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Field-qualified query, e.g. kind:function name:auth\"},\"path\":{\"type\":\"string\",\"description\":\"File or directory to search (default .)\"},\"recursive\":{\"type\":\"boolean\"},\"max_results\":{\"type\":\"integer\",\"description\":\"Max results (default 1000)\"}},\"required\":[\"query\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"working_diff\",\"description\":\"Collect a git diff of the working directory. Modes: 'working' (unstaged + untracked, default), 'staged' (git diff --cached), 'all' (everything since HEAD + untracked). Untracked files are shown as new-file diffs via git diff --no-index /dev/null <file>. Returns the diff as text.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"working\",\"staged\",\"all\"],\"description\":\"Diff mode: working (default), staged, or all\"}},\"required\":[]}}}"
+        "{\"type\":\"function\",\"function\":{\"name\":\"code_search\",\"description\":\"Field-qualified code search. Query like kind:function name:auth path:src/api authenticate splits into structured filters plus free text. Args: query (required), path, recursive, max_results.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Field-qualified query, e.g. kind:function name:auth\"},\"path\":{\"type\":\"string\",\"description\":\"File or directory to search (default .)\"},\"recursive\":{\"type\":\"boolean\"},\"max_results\":{\"type\":\"integer\",\"description\":\"Max results (default 1000)\"}},\"required\":[\"query\"]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"layout_solver\",\"description\":\"Dynamic 2D Vector Geometry & Binary Space Partitioning (BSP) Tree Layout Solver from Hyprland. Actions: 'bsp' (computes non-overlapping tiled rectangular bounding boxes for canvas width/height/count), 'bezier' (computes cubic Bézier easing curves for animation keyframes).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"bsp\",\"bezier\"]},\"width\":{\"type\":\"integer\"},\"height\":{\"type\":\"integer\"},\"count\":{\"type\":\"integer\"},\"t\":{\"type\":\"number\"},\"p1x\":{\"type\":\"number\"},\"p1y\":{\"type\":\"number\"},\"p2x\":{\"type\":\"number\"},\"p2y\":{\"type\":\"number\"}},\"required\":[]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"working_diff\",\"description\":\"Collect a git diff of the working directory. Modes: 'working' (unstaged + untracked, default), 'staged' (git diff --cached), 'all' (everything since HEAD + untracked). Untracked files are shown as new-file diffs via git diff --no-index /dev/null <file>. Returns the diff as text.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"working\",\"staged\",\"all\"],\"description\":\"Diff mode: working (default), staged, or all\"}},\"required\":[]}}}"
         "]";
     return cJSON_Parse(json);
 }

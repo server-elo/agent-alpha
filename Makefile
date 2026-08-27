@@ -108,12 +108,13 @@ tests/bin:
 	mkdir -p tests/bin
 
 test:
-	@rm -rf tests/bin
-	@rm -f $(TARGET) $(OBJ)
+	@$(MAKE) --no-print-directory clean
+	@$(MAKE) --no-print-directory all
+	@$(MAKE) --no-print-directory $(ALL_TEST_BINS)
 	@$(MAKE) --no-print-directory run-tests
 
 .PHONY: run-tests
-run-tests: $(TARGET) $(ALL_TEST_BINS)
+run-tests: $(ALL_TEST_BINS)
 	@fail=0; for t in $(ALL_TEST_BINS); do \
 		echo "=== $$t ==="; ./$$t || fail=1; \
 	done; \
