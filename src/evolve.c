@@ -965,38 +965,44 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
         }
         if (ok) ok = evolve_gate(sandbox, cfg->model, &report);
 
-        /* Iterative Repair Gate: If real code was written but failed compilation or tests,
-         * feed the exact compiler / test feedback back into the sandbox for up to 2 repair turns! */
+        /* Iterative Repair Gate: If gate failed for ANY reason (compiler error, test failure,
+         * missing test fixture, or empty generation), feed feedback into the sandbox for up to 2 repair turns! */
         int repair_attempts = 0;
-        while (!ok && !alpha_cancel && repair_attempts < 2 && evolve_sandbox_changed(root, sandbox)) {
+        while (!ok && !alpha_cancel && repair_attempts < 2) {
             repair_attempts++;
-            printf("\n[evolve] Gate failed (attempt %d/2) — launching targeted repair with feedback...\n", repair_attempts);
+            printf("\n[evolve] Gate failed (repair attempt %d/2) — launching targeted repair with feedback...\n", repair_attempts);
             if (report) printf("%s\n", report);
             fflush(stdout);
 
-            /* A missing-test failure is not a bug in the feature code — the
-             * repair turn must ORDER a test, not hint at one. Generic "fix the
-             * error" wording let models tweak working code instead of writing
-             * the missing test, burning both repair attempts. */
             int missing_test = report && strstr(report, "no tests/custom/test_") != NULL;
-            sds fix_prompt = missing_test
-                ? sdscatprintf(sdsempty(),
-                    "Your feature code is in place and the gate accepts it — but new behavior "
-                    "must ship with its own test, and you did not write one.\n\n"
-                    "Your ONLY task now: create `tests/custom/test_<name>.c` with real CHECK "
-                    "assertions certifying the code you just added (pattern: tests/test_tools.c "
-                    "and tests/test_util.h — fixtures created by the test itself, cleaned up after). "
+            int empty_gen = report && strstr(report, "empty generation") != NULL;
+
+            sds fix_prompt = NULL;
+            if (missing_test) {
+                fix_prompt = sdscatprintf(sdsempty(),
+                    "Your feature code is in place and compiles cleanly — but new behavior "
+                    "MUST ship with its own test, and you did not write one.\n\n"
+                    "Your task now: create `tests/custom/test_<name>.c` with at least 6 real CHECK "
+                    "assertions certifying the code you just added. "
                     "Any file named tests/custom/test_*.c is compiled and run automatically by "
                     "`make test`. Verify with `make -j4 && make test` that YOUR new test binary "
                     "runs and passes.\n\n"
-                    "Do NOT rewrite your feature code unless your test reveals a real bug in it.")
-                : sdscatprintf(sdsempty(),
+                    "Do NOT rewrite your feature code unless your test reveals a real bug in it.");
+            } else if (empty_gen) {
+                fix_prompt = sdscatprintf(sdsempty(),
+                    "You surveyed the repository but have NOT written any code or test files yet (empty generation).\n\n"
+                    "You have a repair attempt now: immediately implement your chosen capability in `src/tools.c`, "
+                    "wire it in `tools_run()` and `tools_schema()`, and create `tests/custom/test_<name>.c`. "
+                    "Then verify with `make -j4 && make test`!");
+            } else {
+                fix_prompt = sdscatprintf(sdsempty(),
                     "Your previous modifications in this sandbox failed the quality gate with the following error:\n\n"
                     "```\n%s\n```\n\n"
                     "You are still in the same sandbox with all your modified files in place. "
                     "Inspect the exact compiler error or test failure above, use read_file and edit_file to FIX the bug, "
                     "and verify with `make -j4 && make test`. Do not start over from scratch — fix the specific error!",
                     report ? report : "Unknown gate error");
+            }
 
             sdsfree(reply);
             cfg->cwd = sandbox;
