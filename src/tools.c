@@ -3464,6 +3464,9 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         if (!data_hex || !patch_hex || !cJSON_IsNumber(off_item))
             return sdsnew("ERROR: data, patch, and numeric offset required for binary_patch_apply");
 
+        if (off_item->valueint < 0)
+            return sdsnew("ERROR: offset must be non-negative for binary_patch_apply");
+
         size_t offset = (size_t)off_item->valueint;
         size_t dlen = strlen(data_hex);
         size_t plen = strlen(patch_hex);
@@ -3472,12 +3475,16 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
 
         size_t dcount = dlen / 2;
         size_t pcount = plen / 2;
-        if (offset + pcount > dcount)
+        if (offset > dcount || pcount > dcount - offset)
             return sdsnew("ERROR: patch bounds exceed data buffer size");
 
-        /* Decode binary data */
+        /* Decode binary data with strict hex validation */
         uint8_t *dbuf = malloc(dcount);
         for (size_t i = 0; i < dcount; i++) {
+            if (!isxdigit(data_hex[i*2]) || !isxdigit(data_hex[i*2+1])) {
+                free(dbuf);
+                return sdsnew("ERROR: invalid non-hex character in data buffer");
+            }
             char byte_str[3] = { data_hex[i*2], data_hex[i*2+1], '\0' };
             dbuf[i] = (uint8_t)strtoul(byte_str, NULL, 16);
         }
@@ -3485,6 +3492,11 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         /* Decode patch and capture original bytes for rollback */
         sds orig_hex = sdsempty();
         for (size_t i = 0; i < pcount; i++) {
+            if (!isxdigit(patch_hex[i*2]) || !isxdigit(patch_hex[i*2+1])) {
+                sdsfree(orig_hex);
+                free(dbuf);
+                return sdsnew("ERROR: invalid non-hex character in patch string");
+            }
             char byte_str[3] = { patch_hex[i*2], patch_hex[i*2+1], '\0' };
             uint8_t pbyte = (uint8_t)strtoul(byte_str, NULL, 16);
             orig_hex = sdscatprintf(orig_hex, "%02x", dbuf[offset + i]);

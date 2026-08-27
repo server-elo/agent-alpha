@@ -43,8 +43,42 @@ static void test_binary_patch_bounds(void) {
     sdsfree(res);
 }
 
+static void test_binary_patch_negative_offset(void) {
+    TEST_BEGIN("binary_patch_apply: negative offset rejection check");
+
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "data", "558bec83ec20");
+    cJSON_AddNumberToObject(args, "offset", -1);
+    cJSON_AddStringToObject(args, "patch", "9090");
+
+    sds res = tools_run("binary_patch_apply", args, ".");
+    cJSON_Delete(args);
+
+    CHECK(res != NULL, "negative offset response returned");
+    CHECK(strstr(res, "ERROR: offset must be non-negative") != NULL, "negative offset safely rejected");
+    sdsfree(res);
+}
+
+static void test_binary_patch_invalid_hex(void) {
+    TEST_BEGIN("binary_patch_apply: invalid non-hex rejection check");
+
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "data", "558bZZ");
+    cJSON_AddNumberToObject(args, "offset", 0);
+    cJSON_AddStringToObject(args, "patch", "9090");
+
+    sds res = tools_run("binary_patch_apply", args, ".");
+    cJSON_Delete(args);
+
+    CHECK(res != NULL, "invalid hex response returned");
+    CHECK(strstr(res, "ERROR: invalid non-hex character") != NULL, "non-hex data safely rejected");
+    sdsfree(res);
+}
+
 int main(void) {
     test_binary_patch_basic();
     test_binary_patch_bounds();
+    test_binary_patch_negative_offset();
+    test_binary_patch_invalid_hex();
     return test_report("test_binary_patch");
 }
