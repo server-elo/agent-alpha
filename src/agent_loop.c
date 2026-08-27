@@ -365,7 +365,7 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
             msg = NULL;
             content = llm_chat_ex(cfg, messages, &msg,
                                   1 /* always tools available */, &failed);
-            if (!failed || attempt >= 2) break;
+            if (!failed || attempt >= 3) break;
             int transient = strstr(content, "HTTP 429") != NULL
                          || strstr(content, "HTTP 500") != NULL
                          || strstr(content, "HTTP 502") != NULL

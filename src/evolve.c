@@ -966,11 +966,11 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
         if (ok) ok = evolve_gate(sandbox, cfg->model, &report);
 
         /* Iterative Repair Gate: If gate failed for ANY reason (compiler error, test failure,
-         * missing test fixture, or empty generation), feed feedback into the sandbox for up to 2 repair turns! */
+         * missing test fixture, or empty generation), feed feedback into the sandbox for up to 3 repair turns! */
         int repair_attempts = 0;
-        while (!ok && !alpha_cancel && repair_attempts < 2) {
+        while (!ok && !alpha_cancel && repair_attempts < 3) {
             repair_attempts++;
-            printf("\n[evolve] Gate failed (repair attempt %d/2) — launching targeted repair with feedback...\n", repair_attempts);
+            printf("\n[evolve] Gate failed (repair attempt %d/3) — launching targeted repair with feedback...\n", repair_attempts);
             if (report) printf("%s\n", report);
             fflush(stdout);
 
