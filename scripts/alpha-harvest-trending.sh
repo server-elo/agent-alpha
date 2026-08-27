@@ -87,14 +87,15 @@ harvest_repo() {
     file_count=$(find "$stage_dir" -type f -not -path '*/.*' | wc -l | tr -d ' ')
     log "Cloned $repo ($file_count files) at $stage_dir"
 
-    # Exact Generation 211 Gold-Standard Blueprint
-    local goal="Autonomous Harvester Goal for '$repo' ($file_count files at $stage_dir):
-Replicate the exact winning rhythm of Generation 211 (which shipped +501 lines of code_search):
-1. [Turn 1 - Quick Survey]: Use list_dir and grep. Read 1 core algorithm file. Immediately pick ONE missing capability (e.g. data structure, parser, fast hashing, ring buffer, network packet queue, AST tokenizer, or binary inspector).
+    # Airtight non-cheating 3-phase execution blueprint
+    local goal="Autonomous Harvester Goal for '$repo' ($file_count files staged at $stage_dir):
+CRITICAL: You MUST call tools natively using the function-calling mechanism. NEVER write tool calls as plain text or pseudo-xml.
+Follow the exact Generation 211 blueprint:
+1. [Turn 1 - Quick Survey]: Use list_dir and grep. Read 1 core algorithm file. Immediately choose ONE missing capability (e.g. data structure, parser, fast hashing, ring buffer, network packet queue, AST tokenizer, or binary inspector).
 2. [Turn 2 - Plan with todo]: Call the todo tool with 4-6 small chunked tasks.
 3. [Turns 3-6 - Chunked Pure-C11 Synthesis]: Write code in src/tools.c in small ~100-line chunks. Wire tools_run() dispatch and tools_schema(). NEVER touch src/evolve.c, Makefile, or warden files.
-4. [Turns 7-9 - Dedicated Unit Test & Gate]: Write tests/custom/test_<name>.c with 6+ assertions. Run execute_bash with 'make -j4 && make test'. If compiler errors occur, fix them in the sandbox immediately.
-Your final diff must be non-empty and must include tests/custom/test_<name>.c."
+4. [Turns 7-9 - Real Unit Test & Verification]: Write a genuine unit test suite in tests/custom/test_<name>.c with 6+ rigorous assertions testing real edge cases. Run execute_bash with 'make -j4 && make test'. If any compiler warning or test fails, fix it immediately.
+Your final diff must be non-empty and must include real working code + real tests."
 
     log "Launching self-evolution synthesis for $repo..."
     cd "$ROOT_DIR" || exit 1
