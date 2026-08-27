@@ -255,7 +255,7 @@ static void notes_append(sds *notes, const char *name, const char *result) {
  * are already digested into tool_notes.
  *
  * The system prompt (index 0) and the most recent exchanges are never dropped. */
-#define ALPHA_LIVE_MAX_BYTES 400000
+#define ALPHA_LIVE_MAX_BYTES 120000
 
 /* Size of one message as it will appear on the wire. "content" is not the only
  * field that carries bulk: an assistant turn that calls write_file puts the
@@ -291,19 +291,19 @@ static void trim_live_messages(cJSON *messages) {
      * oversized tool results with a stub. A tool message must stay present so
      * its tool_call_id still pairs with the assistant turn that requested it. */
     int n = cJSON_GetArraySize(messages);
-    for (int i = 1; i < n - 6 && messages_bytes(messages) > ALPHA_LIVE_MAX_BYTES; i++) {
+    for (int i = 1; i < n - 4 && messages_bytes(messages) > ALPHA_LIVE_MAX_BYTES; i++) {
         cJSON *m = cJSON_GetArrayItem(messages, i);
         const char *role = cJSON_GetStringValue(cJSON_GetObjectItem(m, "role"));
         if (!role) continue;
         int is_tool = (strcmp(role, "tool") == 0);
         int is_asst = (strcmp(role, "assistant") == 0);
         if (!is_tool && !is_asst) continue;
-        if (message_bytes(m) < 2000) continue;
+        if (message_bytes(m) < 800) continue;
 
         /* An assistant turn carrying tool_calls must keep its structure; only
          * its prose is replaced, never the message itself. */
         const char *s = cJSON_GetStringValue(cJSON_GetObjectItem(m, "content"));
-        if (s && strlen(s) >= 2000)
+        if (s && strlen(s) >= 800)
             cJSON_ReplaceItemInObject(m, "content", cJSON_CreateString(
                 is_tool
                   ? "[earlier tool output dropped to stay within the context budget — "
@@ -320,7 +320,7 @@ static void trim_live_messages(cJSON *messages) {
                 cJSON *fn = cJSON_GetObjectItem(tc, "function");
                 if (!fn) continue;
                 const char *a = cJSON_GetStringValue(cJSON_GetObjectItem(fn, "arguments"));
-                if (!a || strlen(a) < 2000) continue;
+                if (!a || strlen(a) < 800) continue;
                 cJSON_ReplaceItemInObject(fn, "arguments", cJSON_CreateString(
                     "{\"note\":\"arguments dropped to stay within the context budget\"}"));
             }
