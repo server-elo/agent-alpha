@@ -87,8 +87,13 @@ harvest_repo() {
     file_count=$(find "$stage_dir" -type f -not -path '*/.*' | wc -l | tr -d ' ')
     log "Cloned $repo ($file_count files) at $stage_dir"
 
-    # Targeted whole-codebase study avoiding context blowups
-    local goal="Autonomous Harvester Goal: Study the cloned $lang repository '$repo' at $stage_dir ($file_count files). In Turn 1, survey the directory structure using list_dir and grep key headers. In Turn 2, read_file the 1-2 primary header/algorithm files for your chosen capability (do not read more than 2 full files per turn). Identify ONE high-value capability (e.g., lock-free queue, tokenizer/parser, graph solver, cryptographic hashing, circular buffer, format expander, or JSONPath query engine) that agent-alpha lacks. Implement a clean, pure-C11 native version in src/tools.c or src/, create rich unit tests in tests/custom/test_<name>.c, and verify with make -j4 && make test. Always invoke tools directly. Write at most ~150 lines per tool call. Your final diff must be non-empty. Never edit sealed harness files."
+    # Strict 3-Phase Execution Blueprint guaranteeing code + test generation
+    local goal="Autonomous Harvester Goal for '$repo' ($file_count files staged at $stage_dir):
+Follow this exact 3-Phase Blueprint:
+[Phase 1 - Survey (Turns 1-2)]: Use list_dir and grep to survey the repository. Read at most 1-2 core algorithm files. Immediately select ONE high-value capability (e.g. data structure, parser, fast hashing, circular buffer, AST tokenization, hex inspector, or algorithm) that agent-alpha lacks.
+[Phase 2 - Implement (Turns 3-6)]: Write clean pure-C11 code in src/tools.c in chunks of ~120 lines. Register your tool in tools_run() dispatcher and tools_schema(). ONLY edit src/tools.c or add src/ files. NEVER touch src/evolve.c, Makefile, or warden files.
+[Phase 3 - Test & Verify (Turns 7-10)]: MANDATORY: Create a dedicated unit test suite in tests/custom/test_<feature_name>.c covering all edge cases. Run execute_bash with 'make -j4 && make test'. If compiler errors occur, fix them immediately.
+Your final diff must be non-empty and must include a new test in tests/custom/."
 
     log "Launching self-evolution synthesis for $repo..."
     cd "$ROOT_DIR" || exit 1
