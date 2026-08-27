@@ -3457,6 +3457,54 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         free(dbuf);
         return out;
     }
+    if (strcmp(name, "binary_patch_apply") == 0) {
+        const char *data_hex = cJSON_GetStringValue(cJSON_GetObjectItem(args, "data"));
+        const char *patch_hex = cJSON_GetStringValue(cJSON_GetObjectItem(args, "patch"));
+        cJSON *off_item = cJSON_GetObjectItem(args, "offset");
+        if (!data_hex || !patch_hex || !cJSON_IsNumber(off_item))
+            return sdsnew("ERROR: data, patch, and numeric offset required for binary_patch_apply");
+
+        size_t offset = (size_t)off_item->valueint;
+        size_t dlen = strlen(data_hex);
+        size_t plen = strlen(patch_hex);
+        if (dlen % 2 != 0 || plen % 2 != 0)
+            return sdsnew("ERROR: hex data and patch length must be even numbers of characters");
+
+        size_t dcount = dlen / 2;
+        size_t pcount = plen / 2;
+        if (offset + pcount > dcount)
+            return sdsnew("ERROR: patch bounds exceed data buffer size");
+
+        /* Decode binary data */
+        uint8_t *dbuf = malloc(dcount);
+        for (size_t i = 0; i < dcount; i++) {
+            char byte_str[3] = { data_hex[i*2], data_hex[i*2+1], '\0' };
+            dbuf[i] = (uint8_t)strtoul(byte_str, NULL, 16);
+        }
+
+        /* Decode patch and capture original bytes for rollback */
+        sds orig_hex = sdsempty();
+        for (size_t i = 0; i < pcount; i++) {
+            char byte_str[3] = { patch_hex[i*2], patch_hex[i*2+1], '\0' };
+            uint8_t pbyte = (uint8_t)strtoul(byte_str, NULL, 16);
+            orig_hex = sdscatprintf(orig_hex, "%02x", dbuf[offset + i]);
+            dbuf[offset + i] = pbyte;
+        }
+
+        /* Re-encode modified buffer */
+        sds patched_hex = sdsempty();
+        for (size_t i = 0; i < dcount; i++) {
+            patched_hex = sdscatprintf(patched_hex, "%02x", dbuf[i]);
+        }
+
+        sds out = sdscatprintf(sdsempty(),
+            "{\"action\":\"binary_patch_apply\",\"offset\":%zu,\"patch_bytes\":%zu,\"original\":\"%s\",\"patched\":\"%s\"}",
+            offset, pcount, orig_hex, patched_hex);
+        sdsfree(orig_hex);
+        sdsfree(patched_hex);
+        free(dbuf);
+        return out;
+    }
     return sdscatprintf(sdsempty(), "ERROR: unknown tool %s", name);
 }
 
@@ -3493,6 +3541,7 @@ cJSON *tools_schema(void) {
         "{\"type\":\"function\",\"function\":{\"name\":\"code_search\",\"description\":\"Field-qualified code search. Query like kind:function name:auth path:src/api authenticate splits into structured filters plus free text. Args: query (required), path, recursive, max_results.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Field-qualified query, e.g. kind:function name:auth\"},\"path\":{\"type\":\"string\",\"description\":\"File or directory to search (default .)\"},\"recursive\":{\"type\":\"boolean\"},\"max_results\":{\"type\":\"integer\",\"description\":\"Max results (default 1000)\"}},\"required\":[\"query\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"layout_solver\",\"description\":\"Dynamic 2D Vector Geometry & Binary Space Partitioning (BSP) Tree Layout Solver from Hyprland. Actions: 'bsp' (computes non-overlapping tiled rectangular bounding boxes for canvas width/height/count), 'bezier' (computes cubic Bézier easing curves for animation keyframes).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"bsp\",\"bezier\"]},\"width\":{\"type\":\"integer\"},\"height\":{\"type\":\"integer\"},\"count\":{\"type\":\"integer\"},\"t\":{\"type\":\"number\"},\"p1x\":{\"type\":\"number\"},\"p1y\":{\"type\":\"number\"},\"p2x\":{\"type\":\"number\"},\"p2y\":{\"type\":\"number\"}},\"required\":[]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"hex_pattern_search\",\"description\":\"Fast In-Memory Byte Signature & Wildcard Hex Pattern Scanner from RevokeMsgPatcher. Scans raw hex byte buffers with exact and ?? wildcard masks (e.g. '55 8B ?? 83 EC ??'). Returns matching offset indexes.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"data\":{\"type\":\"string\",\"description\":\"Hex-encoded binary buffer string\"},\"pattern\":{\"type\":\"string\",\"description\":\"Hex pattern with optional ?? wildcards (e.g. '48 89 ?? 55')\"}},\"required\":[\"data\",\"pattern\"]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"binary_patch_apply\",\"description\":\"Safe In-Memory Binary Byte Patcher from RevokeMsgPatcher. Applies replacement byte hex sequences at specified offsets with bounds checking and original byte rollback capture.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"data\":{\"type\":\"string\",\"description\":\"Original hex-encoded binary buffer\"},\"offset\":{\"type\":\"integer\",\"description\":\"Byte offset where patch should be applied\"},\"patch\":{\"type\":\"string\",\"description\":\"Hex replacement bytes to write at offset\"}},\"required\":[\"data\",\"offset\",\"patch\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"working_diff\",\"description\":\"Collect a git diff of the working directory. Modes: 'working' (unstaged + untracked, default), 'staged' (git diff --cached), 'all' (everything since HEAD + untracked). Untracked files are shown as new-file diffs via git diff --no-index /dev/null <file>. Returns the diff as text.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"working\",\"staged\",\"all\"],\"description\":\"Diff mode: working (default), staged, or all\"}},\"required\":[]}}}"
         "]";
     return cJSON_Parse(json);
