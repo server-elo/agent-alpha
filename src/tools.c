@@ -3447,6 +3447,223 @@ static int peg_match_node(peg_node_t *n, const char *inp, size_t ilen, size_t *p
 }
 static void peg_free_lits(peg_parser_t *pp){ for(int i=0;i<pp->used;i++) if(pp->pool[i].kind==PEG_LIT && pp->pool[i].lit && pp->pool[i].lit_len>0) free(pp->pool[i].lit); }
 
+/* ===== TinyExpr-inspired Math & Logic Evaluator (pure C11) ===== */
+typedef struct {
+    const char *expr;
+    size_t len;
+    size_t pos;
+    cJSON *vars;
+    int has_err;
+    char err[128];
+    int validate_mode;
+} ExprState;
+
+static void expr_skip_ws(ExprState *s) {
+    while (s->pos < s->len && (s->expr[s->pos] == ' ' || s->expr[s->pos] == '\t' || s->expr[s->pos] == '\r' || s->expr[s->pos] == '\n'))
+        s->pos++;
+}
+
+static double expr_parse_expression(ExprState *s);
+
+static double expr_parse_primary(ExprState *s) {
+    expr_skip_ws(s);
+    if (s->has_err || s->pos >= s->len) {
+        if (!s->has_err) {
+            s->has_err = 1;
+            snprintf(s->err, sizeof(s->err), "unexpected end of expression at pos %zu", s->pos);
+        }
+        return 0.0;
+    }
+
+    /* Parentheses */
+    if (s->expr[s->pos] == '(') {
+        s->pos++;
+        double v = expr_parse_expression(s);
+        expr_skip_ws(s);
+        if (s->pos >= s->len || s->expr[s->pos] != ')') {
+            s->has_err = 1;
+            snprintf(s->err, sizeof(s->err), "missing closing parenthesis at pos %zu", s->pos);
+            return 0.0;
+        }
+        s->pos++;
+        return v;
+    }
+
+    /* Unary + / - */
+    if (s->expr[s->pos] == '+') {
+        s->pos++;
+        return expr_parse_primary(s);
+    }
+    if (s->expr[s->pos] == '-') {
+        s->pos++;
+        return -expr_parse_primary(s);
+    }
+
+    /* Numbers (integer or floating point) */
+    if ((s->expr[s->pos] >= '0' && s->expr[s->pos] <= '9') || s->expr[s->pos] == '.') {
+        char *endptr = NULL;
+        double v = strtod(&s->expr[s->pos], &endptr);
+        if (endptr == &s->expr[s->pos]) {
+            s->has_err = 1;
+            snprintf(s->err, sizeof(s->err), "invalid number format at pos %zu", s->pos);
+            return 0.0;
+        }
+        s->pos = (size_t)(endptr - s->expr);
+        return v;
+    }
+
+    /* Identifiers (constants, functions, variables) */
+    if ((s->expr[s->pos] >= 'a' && s->expr[s->pos] <= 'z') || (s->expr[s->pos] >= 'A' && s->expr[s->pos] <= 'Z') || s->expr[s->pos] == '_') {
+        size_t start = s->pos;
+        while (s->pos < s->len && ((s->expr[s->pos] >= 'a' && s->expr[s->pos] <= 'z') ||
+                                   (s->expr[s->pos] >= 'A' && s->expr[s->pos] <= 'Z') ||
+                                   (s->expr[s->pos] >= '0' && s->expr[s->pos] <= '9') ||
+                                   s->expr[s->pos] == '_')) {
+            s->pos++;
+        }
+        size_t id_len = s->pos - start;
+        char id[64];
+        if (id_len >= sizeof(id)) id_len = sizeof(id) - 1;
+        memcpy(id, &s->expr[start], id_len);
+        id[id_len] = '\0';
+
+        expr_skip_ws(s);
+        /* Function call */
+        if (s->pos < s->len && s->expr[s->pos] == '(') {
+            s->pos++;
+            double a1 = expr_parse_expression(s);
+            expr_skip_ws(s);
+            double a2 = 0.0, a3 = 0.0;
+            if (s->pos < s->len && s->expr[s->pos] == ',') {
+                s->pos++;
+                a2 = expr_parse_expression(s);
+                expr_skip_ws(s);
+            }
+            if (s->pos < s->len && s->expr[s->pos] == ',') {
+                s->pos++;
+                a3 = expr_parse_expression(s);
+                expr_skip_ws(s);
+            }
+            if (s->pos >= s->len || s->expr[s->pos] != ')') {
+                s->has_err = 1;
+                snprintf(s->err, sizeof(s->err), "missing ')' in function '%s' at pos %zu", id, s->pos);
+                return 0.0;
+            }
+            s->pos++;
+
+            if (strcmp(id, "sqrt") == 0) return a1 >= 0 ? sqrt(a1) : 0.0;
+            if (strcmp(id, "cbrt") == 0) return cbrt(a1);
+            if (strcmp(id, "sin") == 0) return sin(a1);
+            if (strcmp(id, "cos") == 0) return cos(a1);
+            if (strcmp(id, "tan") == 0) return tan(a1);
+            if (strcmp(id, "asin") == 0) return asin(a1);
+            if (strcmp(id, "acos") == 0) return acos(a1);
+            if (strcmp(id, "atan") == 0) return atan(a1);
+            if (strcmp(id, "atan2") == 0) return atan2(a1, a2);
+            if (strcmp(id, "abs") == 0 || strcmp(id, "fabs") == 0) return fabs(a1);
+            if (strcmp(id, "floor") == 0) return floor(a1);
+            if (strcmp(id, "ceil") == 0) return ceil(a1);
+            if (strcmp(id, "round") == 0) return round(a1);
+            if (strcmp(id, "exp") == 0) return exp(a1);
+            if (strcmp(id, "log") == 0 || strcmp(id, "ln") == 0) return a1 > 0 ? log(a1) : 0.0;
+            if (strcmp(id, "log10") == 0) return a1 > 0 ? log10(a1) : 0.0;
+            if (strcmp(id, "pow") == 0) return pow(a1, a2);
+            if (strcmp(id, "min") == 0) return a1 < a2 ? a1 : a2;
+            if (strcmp(id, "max") == 0) return a1 > a2 ? a1 : a2;
+            if (strcmp(id, "hypot") == 0) return hypot(a1, a2);
+            if (strcmp(id, "clamp") == 0) {
+                if (a1 < a2) return a2;
+                if (a1 > a3) return a3;
+                return a1;
+            }
+
+            s->has_err = 1;
+            snprintf(s->err, sizeof(s->err), "unknown function '%s'", id);
+            return 0.0;
+        }
+
+        /* Builtin constants */
+        if (strcasecmp(id, "pi") == 0) return 3.14159265358979323846;
+        if (strcasecmp(id, "e") == 0) return 2.71828182845904523536;
+        if (strcasecmp(id, "true") == 0) return 1.0;
+        if (strcasecmp(id, "false") == 0) return 0.0;
+
+        /* Variable lookup */
+        if (s->vars && cJSON_IsObject(s->vars)) {
+            cJSON *v = cJSON_GetObjectItem(s->vars, id);
+            if (v && cJSON_IsNumber(v)) return v->valuedouble;
+        }
+
+        if (s->validate_mode) {
+            return 1.0; /* In syntax validation mode, accept unknown variables */
+        }
+
+        s->has_err = 1;
+        snprintf(s->err, sizeof(s->err), "unknown variable or identifier '%s' at pos %zu", id, start);
+        return 0.0;
+    }
+
+    s->has_err = 1;
+    snprintf(s->err, sizeof(s->err), "unexpected character '%c' (0x%02X) at pos %zu", s->expr[s->pos], (unsigned char)s->expr[s->pos], s->pos);
+    return 0.0;
+}
+
+static double expr_parse_power(ExprState *s) {
+    double base = expr_parse_primary(s);
+    expr_skip_ws(s);
+    if (s->pos < s->len && s->expr[s->pos] == '^') {
+        s->pos++;
+        double exponent = expr_parse_power(s); /* Right-associative */
+        return pow(base, exponent);
+    }
+    return base;
+}
+
+static double expr_parse_term(ExprState *s) {
+    double left = expr_parse_power(s);
+    while (1) {
+        expr_skip_ws(s);
+        if (s->pos >= s->len) break;
+        char op = s->expr[s->pos];
+        if (op != '*' && op != '/' && op != '%') break;
+        s->pos++;
+        double right = expr_parse_power(s);
+        if (op == '*') {
+            left *= right;
+        } else if (op == '/') {
+            if (fabs(right) < 1e-15) {
+                s->has_err = 1;
+                snprintf(s->err, sizeof(s->err), "division by zero");
+                return 0.0;
+            }
+            left /= right;
+        } else if (op == '%') {
+            if (fabs(right) < 1e-15) {
+                s->has_err = 1;
+                snprintf(s->err, sizeof(s->err), "modulo by zero");
+                return 0.0;
+            }
+            left = fmod(left, right);
+        }
+    }
+    return left;
+}
+
+static double expr_parse_expression(ExprState *s) {
+    double left = expr_parse_term(s);
+    while (1) {
+        expr_skip_ws(s);
+        if (s->pos >= s->len) break;
+        char op = s->expr[s->pos];
+        if (op != '+' && op != '-') break;
+        s->pos++;
+        double right = expr_parse_term(s);
+        if (op == '+') left += right;
+        else left -= right;
+    }
+    return left;
+}
+
 sds tools_run(const char *name, cJSON *args, const char *cwd) {
 
     if (!name) return sdsnew("ERROR: no tool name");
