@@ -543,6 +543,7 @@ static int evolve_warden_model_bench(const char *dir, const char *model, sds *re
 
     warden_limits_t lim = warden_limits_default();
     lim.timeout_ms = 300000; /* 5 minutes (300s) to allow reasoning models sufficient time */
+    lim.cpu_sec = 120; /* 2 minutes CPU time */
     char out[8192];
 
     char *argv[16];
