@@ -5475,6 +5475,231 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         return sdscatprintf(sdsempty(), "ERROR: unknown geom_spatial_2d3d action '%s'", action);
     }
 
+    /* ======================================================================
+     * json_query — embedded JSON query, filter, project, and aggregate.
+     *
+     * A self-contained JSON query engine using the already-linked cJSON
+     * parser. Supports dot-separated path navigation (including array
+     * indices), numeric-range filtering, field projection, and basic
+     * aggregation (count, sum, avg, min, max). No shelling out to jq.
+     *
+     * Actions:
+     *   query     — extract a value by dot-separated path
+     *   filter    — filter array of objects by numeric range on a key
+     *   project   — select a subset of fields from each object in an array
+     *   aggregate — compute count/sum/avg/min/max over a numeric key
+     * ====================================================================== */
+    if (strcmp(name, "json_query") == 0 || strcmp(name, "jq") == 0) {
+        const char *action = cJSON_GetStringValue(cJSON_GetObjectItem(args, "action"));
+        if (!action || !action[0]) action = "query";
+
+        const char *data_str = cJSON_GetStringValue(cJSON_GetObjectItem(args, "data"));
+        if (!data_str || !data_str[0])
+            return sdsnew("ERROR: 'data' parameter (JSON string) required for json_query");
+
+        cJSON *data = cJSON_Parse(data_str);
+        if (!data)
+            return sdscatprintf(sdsempty(), "ERROR: invalid JSON: %s", cJSON_GetErrorPtr() ? cJSON_GetErrorPtr() : "parse error");
+
+        sds result = NULL;
+
+        if (strcmp(action, "query") == 0) {
+            /* Extract a value by dot-separated path, e.g. "user.profile.name" or "items.0.title" */
+            const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(args, "path"));
+            if (!path || !path[0]) {
+                /* No path: return the whole JSON pretty-printed */
+                char *s = cJSON_Print(data);
+                result = sdsnew(s ? s : "{}");
+                free(s);
+                cJSON_Delete(data);
+                return result;
+            }
+
+            cJSON *cur = data;
+            char *path_copy = strdup(path);
+            if (!path_copy) { cJSON_Delete(data); return sdsnew("ERROR: allocation failed"); }
+
+            char *save = NULL;
+            char *tok = strtok_r(path_copy, ".", &save);
+            while (tok && cur) {
+                /* Check if token is a numeric array index */
+                char *end = NULL;
+                long idx = strtol(tok, &end, 10);
+                if (end && *end == 0 && cJSON_IsArray(cur)) {
+                    cur = cJSON_GetArrayItem(cur, (int)idx);
+                } else {
+                    cur = cJSON_GetObjectItem(cur, tok);
+                }
+                tok = strtok_r(NULL, ".", &save);
+            }
+            free(path_copy);
+
+            if (!cur) {
+                cJSON_Delete(data);
+                return sdscatprintf(sdsempty(), "ERROR: path '%s' not found in JSON", path);
+            }
+
+            char *val_str = cJSON_PrintUnformatted(cur);
+            result = sdscatprintf(sdsempty(),
+                "{\"action\":\"query\",\"path\":\"%s\",\"value\":%s}",
+                path, val_str ? val_str : "null");
+            free(val_str);
+            cJSON_Delete(data);
+            return result;
+        }
+
+        if (strcmp(action, "filter") == 0) {
+            /* Filter an array of objects by numeric range on a key */
+            const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(args, "path"));
+            const char *filter_key = cJSON_GetStringValue(cJSON_GetObjectItem(args, "filter_key"));
+            if (!filter_key) filter_key = cJSON_GetStringValue(cJSON_GetObjectItem(args, "key"));
+
+            cJSON *arr = data;
+            if (path && path[0]) {
+                cJSON *cur = data;
+                char *pc = strdup(path);
+                char *sv = NULL;
+                char *tk = strtok_r(pc, ".", &sv);
+                while (tk && cur) {
+                    char *ep = NULL;
+                    long ix = strtol(tk, &ep, 10);
+                    if (ep && *ep == 0 && cJSON_IsArray(cur)) cur = cJSON_GetArrayItem(cur, (int)ix);
+                    else cur = cJSON_GetObjectItem(cur, tk);
+                    tk = strtok_r(NULL, ".", &sv);
+                }
+                free(pc);
+                arr = cur;
+            }
+
+            if (!arr || !cJSON_IsArray(arr)) {
+                cJSON_Delete(data);
+                return sdsnew("ERROR: filter target must be a JSON array");
+            }
+
+            double filter_min = -1e100, filter_max = 1e100;
+            cJSON *fm = cJSON_GetObjectItem(args, "filter_min");
+            if (cJSON_IsNumber(fm)) filter_min = fm->valuedouble;
+            cJSON *fx = cJSON_GetObjectItem(args, "filter_max");
+            if (cJSON_IsNumber(fx)) filter_max = fx->valuedouble;
+
+            cJSON *out_arr = cJSON_CreateArray();
+            int n = cJSON_GetArraySize(arr);
+            for (int i = 0; i < n; i++) {
+                cJSON *obj = cJSON_GetArrayItem(arr, i);
+                if (!cJSON_IsObject(obj)) continue;
+                cJSON *val_item = cJSON_GetObjectItem(obj, filter_key);
+                if (!val_item || !cJSON_IsNumber(val_item)) continue;
+                double v = val_item->valuedouble;
+                if (v >= filter_min && v <= filter_max)
+                    cJSON_AddItemToArray(out_arr, cJSON_Duplicate(obj, 1));
+            }
+
+            char *s = cJSON_PrintUnformatted(out_arr);
+            result = sdscatprintf(sdsempty(),
+                "{\"action\":\"filter\",\"key\":\"%s\",\"min\":%.2f,\"max\":%.2f,\"matched\":%d,\"data\":%s}",
+                filter_key, filter_min, filter_max, cJSON_GetArraySize(out_arr), s ? s : "[]");
+            free(s);
+            cJSON_Delete(out_arr);
+            cJSON_Delete(data);
+            return result;
+        }
+
+        if (strcmp(action, "project") == 0) {
+            /* Select a subset of fields from each object in an array */
+            const char *fields_str = cJSON_GetStringValue(cJSON_GetObjectItem(args, "fields"));
+            if (!fields_str || !fields_str[0]) {
+                cJSON_Delete(data);
+                return sdsnew("ERROR: 'fields' parameter (comma-separated) required for project");
+            }
+
+            if (!cJSON_IsArray(data)) {
+                cJSON_Delete(data);
+                return sdsnew("ERROR: project target must be a JSON array");
+            }
+
+            /* Parse field names */
+            char *fields_copy = strdup(fields_str);
+            if (!fields_copy) { cJSON_Delete(data); return sdsnew("ERROR: allocation failed"); }
+            char *field_names[64];
+            int nf = 0;
+            char *sv = NULL;
+            char *tk = strtok_r(fields_copy, ",", &sv);
+            while (tk && nf < 64) {
+                while (*tk == ' ' || *tk == '\t') tk++;
+                char *end = tk + strlen(tk);
+                while (end > tk && (end[-1] == ' ' || end[-1] == '\t')) end--;
+                *end = 0;
+                if (tk[0]) field_names[nf++] = tk;
+                tk = strtok_r(NULL, ",", &sv);
+            }
+
+            cJSON *out_arr = cJSON_CreateArray();
+            int n = cJSON_GetArraySize(data);
+            for (int i = 0; i < n; i++) {
+                cJSON *obj = cJSON_GetArrayItem(data, i);
+                if (!cJSON_IsObject(obj)) continue;
+                cJSON *proj = cJSON_CreateObject();
+                for (int f = 0; f < nf; f++) {
+                    cJSON *val = cJSON_GetObjectItem(obj, field_names[f]);
+                    if (val) {
+                        cJSON_AddItemToObject(proj, field_names[f], cJSON_Duplicate(val, 1));
+                    }
+                }
+                cJSON_AddItemToArray(out_arr, proj);
+            }
+            free(fields_copy);
+
+            char *s = cJSON_PrintUnformatted(out_arr);
+            result = sdscatprintf(sdsempty(),
+                "{\"action\":\"project\",\"fields\":\"%s\",\"count\":%d,\"data\":%s}",
+                fields_str, cJSON_GetArraySize(out_arr), s ? s : "[]");
+            free(s);
+            cJSON_Delete(out_arr);
+            cJSON_Delete(data);
+            return result;
+        }
+
+        if (strcmp(action, "aggregate") == 0) {
+            /* Compute count/sum/avg/min/max over a numeric key */
+            const char *value_key = cJSON_GetStringValue(cJSON_GetObjectItem(args, "value_key"));
+            if (!value_key) value_key = cJSON_GetStringValue(cJSON_GetObjectItem(args, "key"));
+            if (!value_key || !value_key[0]) {
+                cJSON_Delete(data);
+                return sdsnew("ERROR: 'value_key' parameter required for aggregate");
+            }
+
+            if (!cJSON_IsArray(data)) {
+                cJSON_Delete(data);
+                return sdsnew("ERROR: aggregate target must be a JSON array");
+            }
+
+            int count = 0;
+            double sum = 0.0, min_val = 1e100, max_val = -1e100;
+            int n = cJSON_GetArraySize(data);
+            for (int i = 0; i < n; i++) {
+                cJSON *obj = cJSON_GetArrayItem(data, i);
+                if (!cJSON_IsObject(obj)) continue;
+                cJSON *val_item = cJSON_GetObjectItem(obj, value_key);
+                if (!val_item || !cJSON_IsNumber(val_item)) continue;
+                double v = val_item->valuedouble;
+                count++;
+                sum += v;
+                if (v < min_val) min_val = v;
+                if (v > max_val) max_val = v;
+            }
+
+            double avg = count > 0 ? sum / count : 0.0;
+            result = sdscatprintf(sdsempty(),
+                "{\"action\":\"aggregate\",\"key\":\"%s\",\"count\":%d,\"sum\":%.2f,\"avg\":%.2f,\"min\":%.2f,\"max\":%.2f}",
+                value_key, count, sum, avg, min_val, max_val);
+            cJSON_Delete(data);
+            return result;
+        }
+
+        cJSON_Delete(data);
+        return sdscatprintf(sdsempty(), "ERROR: unknown json_query action '%s' (use query/filter/project/aggregate)", action);
+    }
+
     return sdscatprintf(sdsempty(), "ERROR: unknown tool %s", name);
 }
 
@@ -5509,7 +5734,7 @@ cJSON *tools_schema(void) {
         "{\"type\":\"function\",\"function\":{\"name\":\"todo\",\"description\":\"Manage task list for current session. Omit todos to read, provide todos array to create/update items. Each item: {id, content, status: pending|in_progress|completed|cancelled}. merge=true updates by id.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"todos\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"},\"status\":{\"type\":\"string\"}},\"required\":[\"id\",\"content\",\"status\"]}},\"merge\":{\"type\":\"boolean\"}},\"required\":[]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"memory\",\"description\":\"Persistent curated memory that survives across sessions. Two stores: 'memory' for your notes (environment facts, conventions, lessons) and 'user' for user profile (preferences, style). Entries are §-delimited. Actions: add (append), replace (substring match), remove (substring match). Omit action to read current entries. Character limits: 2200 (memory), 1375 (user).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"add\",\"replace\",\"remove\"]},\"target\":{\"type\":\"string\",\"enum\":[\"memory\",\"user\"],\"description\":\"Which store: 'memory' (default) or 'user'\"},\"content\":{\"type\":\"string\",\"description\":\"Entry content for add/replace\"},\"old_text\":{\"type\":\"string\",\"description\":\"Substring identifying the entry for replace/remove\"}},\"required\":[]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"code_search\",\"description\":\"Field-qualified code search. Query like kind:function name:auth path:src/api authenticate splits into structured filters plus free text. Args: query (required), path, recursive, max_results.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Field-qualified query, e.g. kind:function name:auth\"},\"path\":{\"type\":\"string\",\"description\":\"File or directory to search (default .)\"},\"recursive\":{\"type\":\"boolean\"},\"max_results\":{\"type\":\"integer\",\"description\":\"Max results (default 1000)\"}},\"required\":[\"query\"]}}},"
-        "{\"type\":\"function\",\"function\":{\"name\":\"layout_solver\",\"description\":\"Dynamic 2D Vector Geometry & Binary Space Partitioning (BSP) Tree Layout Solver from Hyprland. Actions: 'bsp' (computes non-overlapping tiled rectangular bounding boxes for canvas width/height/count), 'bezier' (computes cubic Bézier easing curves for animation keyframes).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"bsp\",\"bezier\"]},\"width\":{\"type\":\"integer\"},\"height\":{\"type\":\"integer\"},\"count\":{\"type\":\"integer\"},\"t\":{\"type\":\"number\"},\"p1x\":{\"type\":\"number\"},\"p1y\":{\"type\":\"number\"},\"p2x\":{\"type\":\"number\"},\"p2y\":{\"type\":\"number\"}},\"required\":[]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"json_query\",\"description\":\"Embedded JSON query engine. Actions: 'query' (extract value by dot-separated path, e.g. 'user.profile.name' or 'items.0.title'), 'filter' (filter array of objects by numeric range on a key), 'project' (select subset of fields from each object in an array), 'aggregate' (count/sum/avg/min/max over a numeric key). Uses cJSON — no shelling out to jq.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"query\",\"filter\",\"project\",\"aggregate\"]},\"data\":{\"type\":\"string\",\"description\":\"JSON string to query\"},\"path\":{\"type\":\"string\",\"description\":\"Dot-separated path for query/filter\"},\"fields\":{\"type\":\"string\",\"description\":\"Comma-separated field names for project\"},\"filter_key\":{\"type\":\"string\",\"description\":\"Key name for filter/aggregate\"},\"filter_min\":{\"type\":\"number\"},\"filter_max\":{\"type\":\"number\"},\"value_key\":{\"type\":\"string\",\"description\":\"Numeric key for aggregate\"}},\"required\":[\"action\",\"data\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"hex_pattern_search\",\"description\":\"Fast In-Memory Byte Signature & Wildcard Hex Pattern Scanner from RevokeMsgPatcher. Scans raw hex byte buffers with exact and ?? wildcard masks (e.g. '55 8B ?? 83 EC ?? '). Returns matching offset indexes.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"data\":{\"type\":\"string\",\"description\":\"Hex-encoded binary buffer string\"},\"pattern\":{\"type\":\"string\",\"description\":\"Hex pattern with optional ?? wildcards (e.g. '48 89 ?? 55')\"}},\"required\":[\"data\",\"pattern\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"binary_patch_apply\",\"description\":\"Safe In-Memory Binary Byte Patcher from RevokeMsgPatcher. Applies replacement byte hex sequences at specified offsets with bounds checking and original byte rollback capture.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"data\":{\"type\":\"string\",\"description\":\"Original hex-encoded binary buffer\"},\"offset\":{\"type\":\"integer\",\"description\":\"Byte offset where patch should be applied\"},\"patch\":{\"type\":\"string\",\"description\":\"Hex replacement bytes to write at offset\"}},\"required\":[\"data\",\"offset\",\"patch\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"boyer_moore_search\",\"description\":\"High-Performance Boyer-Moore Substring Search Algorithm with Bad Character and Good Suffix Shift Heuristics from RevokeMsgPatcher. Scans large text buffers in sublinear O(N/M) time complexity.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\",\"description\":\"Target haystack text to search within\"},\"pattern\":{\"type\":\"string\",\"description\":\"Needle substring to match\"}},\"required\":[\"text\",\"pattern\"]}}},"
