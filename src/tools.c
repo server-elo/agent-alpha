@@ -6307,6 +6307,131 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         return res;
     }
 
+    if (strcmp(name, "math_expr_eval") == 0 || strcmp(name, "tinyexpr") == 0 || strcmp(name, "calc") == 0) {
+        const char *expr = cJSON_GetStringValue(cJSON_GetObjectItem(args, "expression"));
+        if (!expr) expr = cJSON_GetStringValue(cJSON_GetObjectItem(args, "expr"));
+        if (!expr) expr = cJSON_GetStringValue(cJSON_GetObjectItem(args, "text"));
+        if (!expr) return sdsnew("ERROR: expression string required for math_expr_eval");
+
+        const char *action = cJSON_GetStringValue(cJSON_GetObjectItem(args, "action"));
+        if (!action) action = "eval";
+
+        cJSON *vars = cJSON_GetObjectItem(args, "variables");
+        if (!vars) vars = cJSON_GetObjectItem(args, "vars");
+
+        if (strcmp(action, "tokenize") == 0) {
+            cJSON *resp = cJSON_CreateObject();
+            cJSON_AddStringToObject(resp, "action", "tokenize");
+            cJSON_AddStringToObject(resp, "expression", expr);
+            cJSON *tokens = cJSON_CreateArray();
+            size_t elen = strlen(expr);
+            size_t p = 0;
+            while (p < elen) {
+                while (p < elen && (expr[p] == ' ' || expr[p] == '\t' || expr[p] == '\r' || expr[p] == '\n')) p++;
+                if (p >= elen) break;
+                cJSON *tok = cJSON_CreateObject();
+                size_t start = p;
+                if ((expr[p] >= '0' && expr[p] <= '9') || expr[p] == '.') {
+                    while (p < elen && ((expr[p] >= '0' && expr[p] <= '9') || expr[p] == '.' || expr[p] == 'e' || expr[p] == 'E' || (p > start && (expr[p-1] == 'e' || expr[p-1] == 'E') && (expr[p] == '+' || expr[p] == '-'))))
+                        p++;
+                    char buf[64];
+                    size_t n = p - start;
+                    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+                    memcpy(buf, &expr[start], n);
+                    buf[n] = '\0';
+                    cJSON_AddStringToObject(tok, "type", "number");
+                    cJSON_AddStringToObject(tok, "value", buf);
+                } else if ((expr[p] >= 'a' && expr[p] <= 'z') || (expr[p] >= 'A' && expr[p] <= 'Z') || expr[p] == '_') {
+                    while (p < elen && ((expr[p] >= 'a' && expr[p] <= 'z') || (expr[p] >= 'A' && expr[p] <= 'Z') || (expr[p] >= '0' && expr[p] <= '9') || expr[p] == '_'))
+                        p++;
+                    char buf[64];
+                    size_t n = p - start;
+                    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+                    memcpy(buf, &expr[start], n);
+                    buf[n] = '\0';
+                    cJSON_AddStringToObject(tok, "type", "identifier");
+                    cJSON_AddStringToObject(tok, "value", buf);
+                } else {
+                    char buf[4];
+                    buf[0] = expr[p++];
+                    buf[1] = '\0';
+                    cJSON_AddStringToObject(tok, "type", "symbol");
+                    cJSON_AddStringToObject(tok, "value", buf);
+                }
+                cJSON_AddNumberToObject(tok, "offset", (double)start);
+                cJSON_AddItemToArray(tokens, tok);
+            }
+            cJSON_AddItemToObject(resp, "tokens", tokens);
+            char *rendered = cJSON_PrintUnformatted(resp);
+            sds out = sdsnew(rendered ? rendered : "{}");
+            free(rendered);
+            cJSON_Delete(resp);
+            return out;
+        }
+
+        if (strcmp(action, "validate") == 0) {
+            ExprState state;
+            memset(&state, 0, sizeof(state));
+            state.expr = expr;
+            state.len = strlen(expr);
+            state.pos = 0;
+            state.vars = vars;
+            state.validate_mode = 1;
+            expr_parse_expression(&state);
+            expr_skip_ws(&state);
+            if (!state.has_err && state.pos < state.len) {
+                state.has_err = 1;
+                snprintf(state.err, sizeof(state.err), "unexpected trailing characters at pos %zu", state.pos);
+            }
+
+            cJSON *resp = cJSON_CreateObject();
+            cJSON_AddStringToObject(resp, "action", "validate");
+            cJSON_AddStringToObject(resp, "expression", expr);
+            cJSON_AddBoolToObject(resp, "valid", !state.has_err);
+            if (state.has_err) {
+                cJSON_AddStringToObject(resp, "error", state.err);
+                cJSON_AddNumberToObject(resp, "error_offset", (double)state.pos);
+            }
+            char *rendered = cJSON_PrintUnformatted(resp);
+            sds out = sdsnew(rendered ? rendered : "{}");
+            free(rendered);
+            cJSON_Delete(resp);
+            return out;
+        }
+
+        /* Default action: "eval" */
+        ExprState state;
+        memset(&state, 0, sizeof(state));
+        state.expr = expr;
+        state.len = strlen(expr);
+        state.pos = 0;
+        state.vars = vars;
+        state.validate_mode = 0;
+
+        double val = expr_parse_expression(&state);
+        expr_skip_ws(&state);
+        if (!state.has_err && state.pos < state.len) {
+            state.has_err = 1;
+            snprintf(state.err, sizeof(state.err), "unexpected trailing characters '%c' at pos %zu", state.expr[state.pos], state.pos);
+        }
+
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddStringToObject(resp, "action", "eval");
+        cJSON_AddStringToObject(resp, "expression", expr);
+        cJSON_AddBoolToObject(resp, "success", !state.has_err);
+        if (!state.has_err) {
+            cJSON_AddNumberToObject(resp, "value", val);
+        } else {
+            cJSON_AddStringToObject(resp, "error", state.err);
+            cJSON_AddNumberToObject(resp, "error_offset", (double)state.pos);
+        }
+        char *rendered = cJSON_PrintUnformatted(resp);
+        sds out = sdsnew(rendered ? rendered : "{}");
+        free(rendered);
+        cJSON_Delete(resp);
+        return out;
+    }
+
     return sdscatprintf(sdsempty(), "ERROR: unknown tool %s", name);
 
 }
@@ -6356,7 +6481,9 @@ cJSON *tools_schema(void) {
         "{\"type\":\"function\",\"function\":{\"name\":\"code_clone_detector\",\"description\":\"Fast MinHash Fingerprinting & Locality-Sensitive Hashing (LSH) for Code Clones & Near-Duplicate Detection from DeusData/codebase-memory-mcp. Computes K=64 MinHash vector (512-hex chars), Jaccard similarity estimation, and 32-band LSH candidate retrieval.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"fingerprint\",\"jaccard\",\"lsh_match\"]},\"text\":{\"type\":\"string\",\"description\":\"Source code text to fingerprint\"},\"a\":{\"type\":\"string\",\"description\":\"First signature or text for Jaccard compare\"},\"b\":{\"type\":\"string\",\"description\":\"Second signature or text for Jaccard compare\"},\"query\":{\"type\":\"string\",\"description\":\"Query text or fingerprint for LSH search\"},\"corpus\":{\"type\":\"array\",\"description\":\"Corpus array of {id, text} items to match against\"},\"threshold\":{\"type\":\"number\",\"description\":\"Similarity threshold [0.0..1.0] (default 0.8)\"}},\"required\":[]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"url_codec_parser\",\"description\":\"RFC 3986 URL & Query String Parser, Percent Codec, and Levenshtein Distance Matrix from php/php-src. Actions: 'parse' (extracts scheme/user/pass/host/port/path/query/fragment/params), 'build' (constructs canonical URL), 'encode'/'decode' (percent codec), 'levenshtein' (weighted edit distance & similarity).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"parse\",\"build\",\"encode\",\"decode\",\"levenshtein\"]},\"url\":{\"type\":\"string\",\"description\":\"URL string to parse\"},\"text\":{\"type\":\"string\",\"description\":\"Text to encode or decode\"},\"scheme\":{\"type\":\"string\"},\"host\":{\"type\":\"string\"},\"port\":{\"type\":\"integer\"},\"path\":{\"type\":\"string\"},\"query\":{\"type\":\"string\"},\"fragment\":{\"type\":\"string\"},\"a\":{\"type\":\"string\",\"description\":\"First string for levenshtein\"},\"b\":{\"type\":\"string\",\"description\":\"Second string for levenshtein\"},\"cost_ins\":{\"type\":\"integer\"},\"cost_rep\":{\"type\":\"integer\"},\"cost_del\":{\"type\":\"integer\"}},\"required\":[]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"geom_spatial_2d3d\",\"description\":\"3D Vector/Quaternion Transformations, 2D Geometric Collisions, Color RGBA/HSV/Hex Codec & Penner Easing Curves from raysan5/raylib. Actions: 'vector' (dot/cross/dist/lerp/angle/reflect), 'quaternion' (from_euler/rotate_vector), 'collision_2d' (rect_rect/circle_circle), 'color' (RGB/HSV/Hex), 'easing' (bounce/sine/expo/elastic).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"vector\",\"quaternion\",\"collision_2d\",\"color\",\"easing\"]},\"op\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\"},\"type\":{\"type\":\"string\"},\"x1\":{\"type\":\"number\"},\"y1\":{\"type\":\"number\"},\"z1\":{\"type\":\"number\"},\"x2\":{\"type\":\"number\"},\"y2\":{\"type\":\"number\"},\"z2\":{\"type\":\"number\"},\"r\":{\"type\":\"integer\"},\"g\":{\"type\":\"integer\"},\"b\":{\"type\":\"integer\"},\"a\":{\"type\":\"integer\"},\"hex\":{\"type\":\"string\"},\"t\":{\"type\":\"number\"}},\"required\":[]}}},"
-        "{\"type\":\"function\",\"function\":{\"name\":\"peg_match\",\"description\":\"PackCC-inspired PEG pattern matcher (pure C). PEG ops: quoted string literals, [a-z] and [^...] char classes, . any char, / ordered choice, adjacency sequence, * + ? repetition, ! and & predicates, () grouping. Returns matched, length, text, end.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"description\":\"PEG expression\"},\"input\":{\"type\":\"string\"},\"start\":{\"type\":\"integer\"}},\"required\":[\"pattern\",\"input\"]}}},""{\"type\":\"function\",\"function\":{\"name\":\"base64_codec\",\"description\":\"RFC 4648 Base64 & Base64URL + Hex codec (pure C). Actions: encode (std), decode, encode_url, decode_url, hex_encode, hex_decode. Handles padding, whitespace-tolerant decode, and binary-safe output.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"encode\",\"decode\",\"encode_url\",\"decode_url\",\"hex_encode\",\"hex_decode\"]},\"data\":{\"type\":\"string\",\"description\":\"Input string to encode/decode\"},\"text\":{\"type\":\"string\"},\"input\":{\"type\":\"string\"}},\"required\":[]}}}"
+        "{\"type\":\"function\",\"function\":{\"name\":\"peg_match\",\"description\":\"PackCC-inspired PEG pattern matcher (pure C). PEG ops: quoted string literals, [a-z] and [^...] char classes, . any char, / ordered choice, adjacency sequence, * + ? repetition, ! and & predicates, () grouping. Returns matched, length, text, end.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"description\":\"PEG expression\"},\"input\":{\"type\":\"string\"},\"start\":{\"type\":\"integer\"}},\"required\":[\"pattern\",\"input\"]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"math_expr_eval\",\"description\":\"Fast Recursive-Descent Math & Logic Expression Evaluator from codeplea/tinyexpr. Supports arithmetic (+, -, *, /, %, ^), scientific functions (sqrt, cbrt, sin, cos, tan, abs, floor, ceil, round, exp, log, pow, min, max, hypot, clamp), constants (pi, e), variables bindings map, tokenization, and syntax validation.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"eval\",\"validate\",\"tokenize\"],\"description\":\"Action to perform (default eval)\"},\"expression\":{\"type\":\"string\",\"description\":\"Math expression string to evaluate, validate or tokenize\"},\"variables\":{\"type\":\"object\",\"description\":\"Optional key-value map of variable numeric bindings, e.g. {'x': 3, 'y': 4}\"}},\"required\":[\"expression\"]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"base64_codec\",\"description\":\"RFC 4648 Base64 & Base64URL + Hex codec (pure C). Actions: encode (std), decode, encode_url, decode_url, hex_encode, hex_decode. Handles padding, whitespace-tolerant decode, and binary-safe output.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"encode\",\"decode\",\"encode_url\",\"decode_url\",\"hex_encode\",\"hex_decode\"]},\"data\":{\"type\":\"string\",\"description\":\"Input string to encode/decode\"},\"text\":{\"type\":\"string\"},\"input\":{\"type\":\"string\"}},\"required\":[]}}}"
         "]";
     return cJSON_Parse(json);
 }
