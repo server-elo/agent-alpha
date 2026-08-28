@@ -104,7 +104,7 @@ CRITICAL: You MUST call tools natively using the function-calling mechanism. NEV
 Follow the exact Generation 211 blueprint:
 1. [Turn 1 - Quick Survey]: Use list_dir and grep. Read 1 core algorithm file. Immediately choose ONE missing capability (e.g. data structure, parser, fast hashing, ring buffer, network packet queue, AST tokenizer, or binary inspector).
 2. [Turn 2 - Plan with todo]: Call the todo tool with 4-6 small chunked tasks.
-3. [Turns 3-6 - Chunked Pure-C11 Synthesis]: Write code in src/tools.c in small ~100-line chunks. Wire tools_run() dispatch and tools_schema(). Enforce strict input validation (check for negative values on signed integers, validate character sets, and use overflow-safe bounds subtraction). NEVER touch src/evolve.c, Makefile, or warden files.
+3. [Turns 3-6 - Chunked Pure-C11 Synthesis]: Create a clean, self-contained tool file in 'src/tools/tool_<name>.c' using alpha_tool_t. Include it in src/tools.c and register in g_registered_tools[]. Enforce strict input validation (check for negative values on signed integers, validate character sets, and use overflow-safe bounds subtraction). NEVER touch src/evolve.c, Makefile, or warden files.
 4. [Turns 7-9 - Real Unit Test & Verification]: Write a genuine unit test suite in tests/custom/test_<name>.c with 8+ rigorous assertions testing real edge cases AND mandatory adversarial negative tests (e.g. negative integers, invalid/corrupted strings, out-of-bounds checks). Run execute_bash with 'make -j4 && make test'. If any compiler warning or test fails, fix it immediately.
 Your final diff must be non-empty and must include real working code + real tests."
 
