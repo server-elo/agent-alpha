@@ -2044,6 +2044,8 @@ static edit_t *line_diff(const char **a, size_t n_a,
 static diffline_t *build_difflines(const char **a, size_t n_a,
                                    const char **b, size_t n_b,
                                    edit_t *edits, size_t ne, size_t *out_n) {
+    (void)n_a;
+    (void)n_b;
     diffline_t *dl = malloc(sizeof(diffline_t) * (ne + 1));
     if (!dl) { *out_n = 0; return NULL; }
     size_t idx = 0;
@@ -2069,12 +2071,12 @@ static void emit_hunk(sds *out, diffline_t *dl, size_t start, size_t end) {
     }
     int a_start = (a_count == 0) ? 0 : dl[start].a_line + 1;
     int b_start = (b_count == 0) ? 0 : dl[start].b_line + 1;
-    sdscatprintf(out, "@@ -%d,%d +%d,%d @@\n", a_start, a_count, b_start, b_count);
+    *out = sdscatprintf(*out, "@@ -%d,%d +%d,%d @@\n", a_start, a_count, b_start, b_count);
     for (size_t i = start; i < end; i++) {
         char p = ' ';
         if (dl[i].kind == DL_DELETE) p = '-';
         else if (dl[i].kind == DL_INSERT) p = '+';
-        sdscatprintf(out, "%c%s\n", p, dl[i].text ? dl[i].text : "");
+        *out = sdscatprintf(*out, "%c%s\n", p, dl[i].text ? dl[i].text : "");
     }
 }
 
@@ -2115,12 +2117,12 @@ static sds unified_diff(const char *path_a, const char *path_b,
     int had_a = 0, had_b = 0;
     char **a = line_split(old_text, &n_a, &had_a);
     char **b = line_split(new_text, &n_b, &had_b);
-    edit_t *edits = line_diff(a, n_a, b, n_b, &ne);
-    diffline_t *dl = edits ? build_difflines(a, n_a, b, n_b, edits, ne, &nd) : NULL;
+    edit_t *edits = line_diff((const char **)a, n_a, (const char **)b, n_b, &ne);
+    diffline_t *dl = edits ? build_difflines((const char **)a, n_a, (const char **)b, n_b, edits, ne, &nd) : NULL;
 
     sds out = sdsempty();
-    sdscatprintf(&out, "--- %s\n", path_a ? path_a : "a/file");
-    sdscatprintf(&out, "+++ %s\n", path_b ? path_b : "b/file");
+    out = sdscatprintf(out, "--- %s\n", path_a ? path_a : "a/file");
+    out = sdscatprintf(out, "+++ %s\n", path_b ? path_b : "b/file");
     if (dl) emit_hunks(&out, dl, nd, context);
 
     free(edits);
@@ -2412,41 +2414,7 @@ static void grep_walk(const char *dir, regex_t *re, sds *out, long *count,
 
 /* ----------------------------------------------------------------------
  * code_search helpers (ported from codegraph).
- *
- * cg_bounded_edit_distance mirrors codegraph's fuzzy fallback: a bounded
- * Damerau-Levenshtein that returns maxDist+1 the moment the true distance is
- * known to exceed maxDist, so it stays cheap over large name lists. O(min(a,b))
- * memory via two rolling rows.
  * ---------------------------------------------------------------------- */
-
-static int cg_bounded_edit_distance(const char *a, const char *b, int maxDist) {
-    if (!a) a = "";
-    if (!b) b = "";
-    if (strcmp(a, b) == 0) return 0;
-    size_t al = strlen(a), bl = strlen(b);
-    if (al > bl) { const char *t = a; a = b; b = t; size_t ta = al; al = bl; bl = ta; }
-    if (bl - al > (size_t)maxDist) return maxDist + 1;
-    if (al == 0) return (int)bl;
-    int *prev = malloc(sizeof(int) * (bl + 1));
-    int *cur  = malloc(sizeof(int) * (bl + 1));
-    if (!prev || !cur) { free(prev); free(cur); return maxDist + 1; }
-    for (size_t j = 0; j <= bl; j++) prev[j] = (int)j;
-    for (size_t i = 1; i <= al; i++) {
-        cur[0] = (int)i;
-        for (size_t j = 1; j <= bl; j++) {
-            int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
-            int ins = cur[j - 1] + 1;
-            int del = prev[j] + 1;
-            int sub = prev[j - 1] + cost;
-            int m = ins; if (del < m) m = del; if (sub < m) m = sub;
-            cur[j] = m;
-        }
-        int *tmp = prev; prev = cur; cur = tmp;
-    }
-    int r = prev[bl];
-    free(prev); free(cur);
-    return r;
-}
 
 /* Case-insensitive substring test. Empty needle matches everything. */
 static int cg_ci_contains(const char *hay, const char *needle) {
@@ -2595,13 +2563,10 @@ static int cg_line_matches(cg_query_t *q, regex_t *re, const char *line_lower, c
 static cg_query_t *cg_parse_query(const char *raw);
 static void cg_free_query(cg_query_t *q);
 
-static void cg_lower(char *s) {
-    for (; *s; s++) *s = (char)tolower((unsigned char)*s);
-}
-
 static void cg_search_file(const char *path, cg_query_t *q, regex_t *re,
                            sds *out, long *count, long max_results) {
     if (!cg_lang_filter_ok(path, q)) return;
+    if (!cg_path_filter_ok(path, q)) return;
     FILE *f = fopen(path, "r");
     if (!f) return;
     char *line = NULL;
@@ -2780,6 +2745,7 @@ sds grep_tool_run(cJSON *args, const char *cwd) {
     int recursive = 1;
     cJSON *rec = cJSON_GetObjectItem(args, "recursive");
     if (cJSON_IsBool(rec)) recursive = cJSON_IsTrue(rec);
+    (void)recursive;
 
     const char *file_pattern = cJSON_GetStringValue(cJSON_GetObjectItem(args, "file_pattern"));
 
@@ -2892,7 +2858,7 @@ static char **cg_tokenize(const char *raw, int *out_n) {
             if (!tokens) { free(t); break; }
         } else if (*out_n >= (int)cap) {
             size_t nc = cap * 2;
-            char *nt = realloc(tokens, nc * sizeof(*nt));
+            char **nt = realloc(tokens, nc * sizeof(*nt));
             if (!nt) { free(t); free(tokens); *out_n = 0; return NULL; }
             tokens = nt; cap = nc;
         }
@@ -4779,7 +4745,7 @@ cJSON *tools_schema(void) {
         "{\"type\":\"function\",\"function\":{\"name\":\"memory\",\"description\":\"Persistent curated memory that survives across sessions. Two stores: 'memory' for your notes (environment facts, conventions, lessons) and 'user' for user profile (preferences, style). Entries are §-delimited. Actions: add (append), replace (substring match), remove (substring match). Omit action to read current entries. Character limits: 2200 (memory), 1375 (user).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"add\",\"replace\",\"remove\"]},\"target\":{\"type\":\"string\",\"enum\":[\"memory\",\"user\"],\"description\":\"Which store: 'memory' (default) or 'user'\"},\"content\":{\"type\":\"string\",\"description\":\"Entry content for add/replace\"},\"old_text\":{\"type\":\"string\",\"description\":\"Substring identifying the entry for replace/remove\"}},\"required\":[]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"code_search\",\"description\":\"Field-qualified code search. Query like kind:function name:auth path:src/api authenticate splits into structured filters plus free text. Args: query (required), path, recursive, max_results.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Field-qualified query, e.g. kind:function name:auth\"},\"path\":{\"type\":\"string\",\"description\":\"File or directory to search (default .)\"},\"recursive\":{\"type\":\"boolean\"},\"max_results\":{\"type\":\"integer\",\"description\":\"Max results (default 1000)\"}},\"required\":[\"query\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"layout_solver\",\"description\":\"Dynamic 2D Vector Geometry & Binary Space Partitioning (BSP) Tree Layout Solver from Hyprland. Actions: 'bsp' (computes non-overlapping tiled rectangular bounding boxes for canvas width/height/count), 'bezier' (computes cubic Bézier easing curves for animation keyframes).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"bsp\",\"bezier\"]},\"width\":{\"type\":\"integer\"},\"height\":{\"type\":\"integer\"},\"count\":{\"type\":\"integer\"},\"t\":{\"type\":\"number\"},\"p1x\":{\"type\":\"number\"},\"p1y\":{\"type\":\"number\"},\"p2x\":{\"type\":\"number\"},\"p2y\":{\"type\":\"number\"}},\"required\":[]}}},"
-        "{\"type\":\"function\",\"function\":{\"name\":\"hex_pattern_search\",\"description\":\"Fast In-Memory Byte Signature & Wildcard Hex Pattern Scanner from RevokeMsgPatcher. Scans raw hex byte buffers with exact and ?? wildcard masks (e.g. '55 8B ?? 83 EC ??'). Returns matching offset indexes.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"data\":{\"type\":\"string\",\"description\":\"Hex-encoded binary buffer string\"},\"pattern\":{\"type\":\"string\",\"description\":\"Hex pattern with optional ?? wildcards (e.g. '48 89 ?? 55')\"}},\"required\":[\"data\",\"pattern\"]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"hex_pattern_search\",\"description\":\"Fast In-Memory Byte Signature & Wildcard Hex Pattern Scanner from RevokeMsgPatcher. Scans raw hex byte buffers with exact and ?? wildcard masks (e.g. '55 8B ?? 83 EC ?? '). Returns matching offset indexes.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"data\":{\"type\":\"string\",\"description\":\"Hex-encoded binary buffer string\"},\"pattern\":{\"type\":\"string\",\"description\":\"Hex pattern with optional ?? wildcards (e.g. '48 89 ?? 55')\"}},\"required\":[\"data\",\"pattern\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"binary_patch_apply\",\"description\":\"Safe In-Memory Binary Byte Patcher from RevokeMsgPatcher. Applies replacement byte hex sequences at specified offsets with bounds checking and original byte rollback capture.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"data\":{\"type\":\"string\",\"description\":\"Original hex-encoded binary buffer\"},\"offset\":{\"type\":\"integer\",\"description\":\"Byte offset where patch should be applied\"},\"patch\":{\"type\":\"string\",\"description\":\"Hex replacement bytes to write at offset\"}},\"required\":[\"data\",\"offset\",\"patch\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"boyer_moore_search\",\"description\":\"High-Performance Boyer-Moore Substring Search Algorithm with Bad Character and Good Suffix Shift Heuristics from RevokeMsgPatcher. Scans large text buffers in sublinear O(N/M) time complexity.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\",\"description\":\"Target haystack text to search within\"},\"pattern\":{\"type\":\"string\",\"description\":\"Needle substring to match\"}},\"required\":[\"text\",\"pattern\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"multi_hex_edit\",\"description\":\"Atomic Multi-Location Binary Hex Patching Engine from RevokeMsgPatcher. Applies an array of multiple offset modifications transactionally with all-or-nothing validation and structured per-patch rollback logs.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"data\":{\"type\":\"string\",\"description\":\"Original hex-encoded binary buffer\"},\"changes\":{\"type\":\"array\",\"description\":\"Array of change objects: [{'offset': 0, 'patch': '9090'}]\"}},\"required\":[\"data\",\"changes\"]}}},"
