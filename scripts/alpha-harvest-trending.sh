@@ -113,11 +113,9 @@ Your final diff must be non-empty and must include real working code + real test
 
     local ts
     ts=$(date +%s)
-    export ALPHA_BASE_URL="${ALPHA_BASE_URL:-https://ark.ap-southeast.bytepluses.com/api/coding/v3}"
-    export ALPHA_MODEL="${ALPHA_MODEL:-ark-code-latest}"
-    if [ -z "${ALPHA_API_KEY:-}" ] && [ -f "$HOME/.openclaw/openclaw.json" ]; then
-        ALPHA_API_KEY=$(grep -o '"apiKey": *"[^"]*"' "$HOME/.openclaw/openclaw.json" | head -n 1 | cut -d'"' -f4)
-    fi
+    export ALPHA_BASE_URL="${ALPHA_BASE_URL:-http://127.0.0.1:8125/v1}"
+    export ALPHA_MODEL="${ALPHA_MODEL:-opencode/muse-spark-1.2-contributor-free}"
+    export ALPHA_API_KEY="${ALPHA_API_KEY:-none}"
     "$ROOT_DIR/alpha" -u "$ALPHA_BASE_URL" -m "$ALPHA_MODEL" -k "$ALPHA_API_KEY" --evolve "$goal" --generations 1 2>&1 | tee -a "$STREAM_LOG"
 
     local outcome="revert"
