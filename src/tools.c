@@ -920,6 +920,7 @@ static void resolve_path(char out[PATH_MAX], const char *path, const char *cwd) 
 #include "tools/tool_string_distance.c"
 #include "tools/tool_stats.c"
 #include "tools/tool_csv.c"
+#include "tools/tool_ebnf.c"
 
 /* Master Registry Table for all modular C11 tools */
 static const alpha_tool_t *g_registered_tools[] = {
@@ -959,6 +960,7 @@ static const alpha_tool_t *g_registered_tools[] = {
     &tool_string_distance,
     &tool_stats,
     &tool_csv,
+    &tool_ebnf,
     NULL
 };
 
