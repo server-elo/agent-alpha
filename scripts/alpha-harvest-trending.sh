@@ -108,7 +108,7 @@ Follow the exact Generation 211 blueprint:
 4. [Turns 7-9 - Real Unit Test & Verification]: Write a genuine unit test suite in tests/custom/test_<name>.c with 8+ rigorous assertions testing real edge cases AND mandatory adversarial negative tests (e.g. negative integers, invalid/corrupted strings, out-of-bounds checks). Run execute_bash with 'make -j4 && make test'. If any compiler warning or test fails, fix it immediately.
 Your final diff must be non-empty and must include real working code + real tests."
 
-    log "Launching self-evolution synthesis for $repo with BytePlus Ark Coding..."
+    log "Launching self-evolution synthesis for $repo with OpenCode Muse-Spark-1.2 Free..."
     cd "$ROOT_DIR" || exit 1
 
     local ts

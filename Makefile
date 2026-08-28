@@ -68,7 +68,7 @@ tests/bin/test_llm: tests/test_llm.c src/llm.c src/tools.o $(TEST_DEPS) $(TEST_H
 	@codesign -s - -f $@ 2>/dev/null || true
 
 # Includes provider.c and ui.c directly, so it must not also link them.
-tests/bin/test_provider: tests/test_provider.c src/provider.c src/ui.c src/ui.h $(TEST_HDRS) | tests/bin
+tests/bin/test_provider: tests/test_provider.c src/provider.c src/ui.c src/ui.h deps/cJSON.o deps/sds.o $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< deps/cJSON.o deps/sds.o $(LDFLAGS)
 	@codesign -s - -f $@ 2>/dev/null || true
 
@@ -87,7 +87,7 @@ tests/bin/test_config: tests/test_config.c src/main.c src/ui.o src/provider.o $(
 
 # Includes browser.c directly to reach the static WebSocket client, so it must
 # not also link src/browser.o.
-tests/bin/test_browser: tests/test_browser.c src/browser.c $(TEST_HDRS) | tests/bin
+tests/bin/test_browser: tests/test_browser.c src/browser.c src/provider.o deps/cJSON.o deps/sds.o $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -o $@ $< src/provider.o deps/cJSON.o deps/sds.o $(LDFLAGS)
 	@codesign -s - -f $@ 2>/dev/null || true
 
@@ -100,7 +100,7 @@ tests/bin/test_evolve: tests/test_evolve.c src/evolve.c src/agent_loop.o src/llm
 
 # Dynamic Custom & Adversarial Red-Team Tests
 # -Itests so custom tests can include test_util.h like the core suite does.
-tests/bin/%: tests/custom/%.c $(TEST_DEPS) $(TEST_HDRS) | tests/bin
+tests/bin/%: tests/custom/%.c src/tools.o src/agent_loop.o src/llm.o src/warden.o $(TEST_DEPS) $(TEST_HDRS) | tests/bin
 	$(CC) $(CFLAGS) -Itests -o $@ $< src/agent_loop.o src/llm.o src/tools.o src/warden.o $(TEST_DEPS) $(LDFLAGS)
 	@codesign -s - -f $@ 2>/dev/null || true
 

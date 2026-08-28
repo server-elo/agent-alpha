@@ -137,8 +137,19 @@ sds llm_chat_ex(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message,
                 int with_tools, int *out_failed);
 sds llm_chat(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message, int with_tools);
 
+/* Unified Tool Registry interface for 100+ native tools */
+typedef struct alpha_tool_s {
+    const char *name;
+    const char *aliases[4];
+    const char *category;
+    const char *description;
+    const char *schema_json;
+    sds (*run)(cJSON *args, const char *cwd);
+} alpha_tool_t;
+
 /* Tool dispatch: name + args JSON object → result text (caller frees with sdsfree). */
 sds tools_run(const char *name, cJSON *args, const char *cwd);
+cJSON *tools_schema(void);
 
 /* Persistent memory: load from disk at startup, format for system prompt. */
 void memory_init(void);
