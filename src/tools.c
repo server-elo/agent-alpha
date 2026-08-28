@@ -918,6 +918,7 @@ static void resolve_path(char out[PATH_MAX], const char *path, const char *cwd) 
 #include "tools/tool_benchmark.c"
 #include "tools/tool_mqtt.c"
 #include "tools/tool_string_distance.c"
+#include "tools/tool_stats.c"
 
 /* Master Registry Table for all modular C11 tools */
 static const alpha_tool_t *g_registered_tools[] = {
@@ -955,6 +956,7 @@ static const alpha_tool_t *g_registered_tools[] = {
     &tool_benchmark,
     &tool_mqtt,
     &tool_string_distance,
+    &tool_stats,
     NULL
 };
 
