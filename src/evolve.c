@@ -505,7 +505,7 @@ static int evolve_warden_smoke(const char *dir, sds *report) {
 static int evolve_warden_model_bench(const char *dir, const char *model, sds *report) {
     const char *m = (model && model[0]) ? model : "local";
     warden_limits_t lim = warden_limits_default();
-    lim.timeout_ms = 60000;
+    lim.timeout_ms = 300000; /* 5 minutes (300s) to allow reasoning models sufficient time */
     char out[8192];
 
     char *const argv[] = {
