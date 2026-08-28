@@ -118,8 +118,7 @@ Your final diff must be non-empty and must include real working code + real test
     if [ -z "${ALPHA_API_KEY:-}" ] && [ -f "$HOME/.openclaw/openclaw.json" ]; then
         ALPHA_API_KEY=$(grep -o '"apiKey": *"[^"]*"' "$HOME/.openclaw/openclaw.json" | head -n 1 | cut -d'"' -f4)
     fi
-    export ALPHA_API_KEY
-    ./alpha -u "$ALPHA_BASE_URL" -m "$ALPHA_MODEL" -k "$ALPHA_API_KEY" --evolve "$goal" --generations 1 2>&1 | tee -a "$STREAM_LOG"
+    "$ROOT_DIR/alpha" -u "$ALPHA_BASE_URL" -m "$ALPHA_MODEL" -k "$ALPHA_API_KEY" --evolve "$goal" --generations 1 2>&1 | tee -a "$STREAM_LOG"
 
     local outcome="revert"
     local last_log
