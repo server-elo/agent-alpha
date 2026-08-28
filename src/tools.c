@@ -3284,7 +3284,171 @@ static int ist_arg_int(const cJSON *item, int64_t *out) {
     return 0;
 }
 
+/* ===== PackCC-inspired PEG engine (pure C11) ===== */
+#define PEG_MAX_NODES 512
+#define PEG_MAX_PAT 4096
+typedef enum { PEG_LIT, PEG_DOT, PEG_CLASS, PEG_SEQ, PEG_CHOICE, PEG_STAR, PEG_PLUS, PEG_QUESTION, PEG_AND, PEG_NOT } peg_kind_t;
+typedef struct peg_node { peg_kind_t kind; char *lit; size_t lit_len; unsigned char cls[32]; int cls_neg; struct peg_node *child; struct peg_node *next; } peg_node_t;
+typedef struct { peg_node_t pool[PEG_MAX_NODES]; int used; const char *pat; size_t pat_len; size_t pos; char err[128]; } peg_parser_t;
+static peg_node_t *peg_new(peg_parser_t *p, peg_kind_t k){ if(p->used>=PEG_MAX_NODES){ snprintf(p->err,sizeof(p->err),"pattern too complex"); return NULL; } peg_node_t *n=&p->pool[p->used++]; memset(n,0,sizeof(*n)); n->kind=k; return n; }
+static void peg_skip(peg_parser_t *p){ while(p->pos<p->pat_len && (p->pat[p->pos]==' '||p->pat[p->pos]=='\t'||p->pat[p->pos]=='\n'||p->pat[p->pos]=='\r')) p->pos++; }
+static peg_node_t *peg_parse_choice(peg_parser_t *p);
+static peg_node_t *peg_parse_seq(peg_parser_t *p);
+static peg_node_t *peg_parse_repeat(peg_parser_t *p);
+static peg_node_t *peg_parse_prefix(peg_parser_t *p);
+static peg_node_t *peg_parse_primary(peg_parser_t *p);
+static peg_node_t *peg_parse_choice(peg_parser_t *pp){
+    peg_node_t *first=peg_parse_seq(pp); if(!first) return NULL;
+    if(pp->pos>=pp->pat_len || pp->pat[pp->pos]!='/') return first;
+    peg_node_t *ch=peg_new(pp,PEG_CHOICE); if(!ch) return NULL;
+    ch->child=first; peg_node_t *tail=first;
+    // Build choice as linked list via next on alternatives; first alt is child, rest via child->next chain
+    // Simpler: CHOICE node holds first alt in child, alternatives linked via next
+    while(pp->pos<pp->pat_len && pp->pat[pp->pos]=='/'){
+        pp->pos++; peg_skip(pp);
+        peg_node_t *alt=peg_parse_seq(pp); if(!alt) return NULL;
+        tail->next=alt; tail=alt;
+    }
+    return ch;
+}
+static peg_node_t *peg_parse_seq(peg_parser_t *pp){
+    peg_skip(pp);
+    if(pp->pos>=pp->pat_len) return NULL;
+    // empty seq check: if next is '/' or ')' then empty
+    if(pp->pat[pp->pos]=='/' || pp->pat[pp->pos]==')') return NULL;
+    peg_node_t *first=peg_parse_repeat(pp); if(!first) return NULL;
+    peg_skip(pp);
+    if(pp->pos>=pp->pat_len || pp->pat[pp->pos]=='/' || pp->pat[pp->pos]==')'){
+        return first;
+    }
+    // need to collect sequence
+    peg_node_t *seq=peg_new(pp,PEG_SEQ); if(!seq) return NULL;
+    seq->child=first;
+    peg_node_t *tail=first;
+    while(pp->pos<pp->pat_len){
+        if(pp->pat[pp->pos]=='/' || pp->pat[pp->pos]==')') break;
+        // lookahead: if we can't parse repeat, break
+        size_t save=pp->pos;
+        peg_node_t *n=peg_parse_repeat(pp);
+        if(!n){ pp->pos=save; break; }
+        tail->next=n; tail=n;
+        peg_skip(pp);
+    }
+    // if only one element, unwrap? keep SEQ for uniformity but single is fine
+    if(seq->child && !seq->child->next){
+        // single element seq -> return child directly to simplify matching (optional)
+        peg_node_t *c=seq->child; pp->used--; // reclaim seq node (hack: just leak, fine)
+        return c;
+    }
+    return seq;
+}
+static peg_node_t *peg_parse_repeat(peg_parser_t *pp){
+    peg_skip(pp);
+    peg_node_t *pre=peg_parse_prefix(pp); if(!pre) return NULL;
+    if(pp->pos<pp->pat_len){
+        char c=pp->pat[pp->pos];
+        if(c=='*'||c=='+'||c=='?'){
+            pp->pos++;
+            peg_kind_t k=c=='*'?PEG_STAR:c=='+'?PEG_PLUS:PEG_QUESTION;
+            peg_node_t *n=peg_new(pp,k); if(!n) return NULL;
+            n->child=pre; return n;
+        }
+    }
+    return pre;
+}
+static peg_node_t *peg_parse_prefix(peg_parser_t *pp){
+    peg_skip(pp);
+    if(pp->pos<pp->pat_len && (pp->pat[pp->pos]=='!' || pp->pat[pp->pos]=='&')){
+        char c=pp->pat[pp->pos++]; peg_skip(pp);
+        peg_node_t *inner=peg_parse_prefix(pp); if(!inner) return NULL;
+        peg_node_t *n=peg_new(pp,c=='!'?PEG_NOT:PEG_AND); if(!n) return NULL;
+        n->child=inner; return n;
+    }
+    return peg_parse_primary(pp);
+}
+static peg_node_t *peg_parse_primary(peg_parser_t *pp){
+    peg_skip(pp);
+    if(pp->pos>=pp->pat_len){ snprintf(pp->err,sizeof(pp->err),"unexpected end"); return NULL; }
+    char c=pp->pat[pp->pos];
+    if(c=='('){
+        pp->pos++; peg_node_t *inner=peg_parse_choice(pp); peg_skip(pp);
+        if(pp->pos>=pp->pat_len || pp->pat[pp->pos]!=')'){ snprintf(pp->err,sizeof(pp->err),"missing ')'"); return NULL; }
+        pp->pos++;
+        if(!inner){
+            // empty group -> empty literal that matches empty
+            peg_node_t *e=peg_new(pp,PEG_LIT); if(!e) return NULL; e->lit=(char*)""; e->lit_len=0; return e;
+        }
+        return inner;
+    }
+    if(c=='\''||c=='"'){
+        char q=c; pp->pos++; size_t start=pp->pos;
+        while(pp->pos<pp->pat_len && pp->pat[pp->pos]!=q) pp->pos++;
+        if(pp->pos>=pp->pat_len){ snprintf(pp->err,sizeof(pp->err),"unterminated string"); return NULL; }
+        size_t len=pp->pos-start;
+        peg_node_t *n=peg_new(pp,PEG_LIT); if(!n) return NULL;
+        char *s=(char*)malloc(len+1); if(!s) return NULL; memcpy(s,pp->pat+start,len); s[len]=0;
+        n->lit=s; n->lit_len=len; pp->pos++; return n;
+    }
+    if(c=='['){
+        pp->pos++; int neg=0; if(pp->pos<pp->pat_len && pp->pat[pp->pos]=='^'){ neg=1; pp->pos++; }
+        unsigned char cls[32]={0};
+        size_t start=pp->pos;
+        while(pp->pos<pp->pat_len && pp->pat[pp->pos]!=']') pp->pos++;
+        if(pp->pos>=pp->pat_len){ snprintf(pp->err,sizeof(pp->err),"unterminated class"); return NULL; }
+        // parse class content between start and pp->pos
+        size_t i=start;
+        while(i<pp->pos){
+            unsigned char a=(unsigned char)pp->pat[i];
+            if(i+2<pp->pos && pp->pat[i+1]=='-' && pp->pat[i+2]!=']'){
+                unsigned char b=(unsigned char)pp->pat[i+2];
+                if(a<=b){ for(int ch=a;ch<=b;ch++) cls[ch>>3]|=(1u<<(ch&7)); i+=3; continue; }
+            }
+            cls[a>>3]|=(1u<<(a&7)); i++;
+        }
+        peg_node_t *n=peg_new(pp,PEG_CLASS); if(!n) return NULL; memcpy(n->cls,cls,32); n->cls_neg=neg; pp->pos++; return n;
+    }
+    if(c=='.'){
+        pp->pos++; peg_node_t *n=peg_new(pp,PEG_DOT); return n;
+    }
+    snprintf(pp->err,sizeof(pp->err),"unexpected char '%c'",c); return NULL;
+}
+static int peg_match_node(peg_node_t *n, const char *inp, size_t ilen, size_t *pos);
+static int peg_match_node(peg_node_t *n, const char *inp, size_t ilen, size_t *pos){
+    if(!n) return 1;
+    size_t cur=*pos;
+    switch(n->kind){
+        case PEG_LIT: {
+            if(n->lit_len==0) return 1;
+            if(cur + n->lit_len > ilen) return 0;
+            if(memcmp(inp+cur,n->lit,n->lit_len)!=0) return 0;
+            *pos += n->lit_len; return 1;
+        }
+        case PEG_DOT: { if(cur>=ilen) return 0; (*pos)++; return 1; }
+        case PEG_CLASS: {
+            if(cur>=ilen) return 0; unsigned char ch=(unsigned char)inp[cur]; int hit=(n->cls[ch>>3]>> (ch&7))&1; if(n->cls_neg) hit=!hit; if(!hit) return 0; (*pos)++; return 1;
+        }
+        case PEG_SEQ: {
+            for(peg_node_t *c=n->child;c;c=c->next){ if(!peg_match_node(c,inp,ilen,pos)) return 0; } return 1;
+        }
+        case PEG_CHOICE: {
+            for(peg_node_t *alt=n->child;alt;alt=alt->next){ size_t save=*pos; if(peg_match_node(alt,inp,ilen,pos)) return 1; *pos=save; } return 0;
+        }
+        case PEG_STAR: {
+            while(1){ size_t save=*pos; if(!peg_match_node(n->child,inp,ilen,pos)){ *pos=save; break; } if(*pos==save) break; if(*pos>=ilen) break; } return 1;
+        }
+        case PEG_PLUS: {
+            if(!peg_match_node(n->child,inp,ilen,pos)) return 0; while(1){ size_t save=*pos; if(!peg_match_node(n->child,inp,ilen,pos)){ *pos=save; break; } if(*pos==save) break; } return 1;
+        }
+        case PEG_QUESTION: { size_t save=*pos; if(!peg_match_node(n->child,inp,ilen,pos)) *pos=save; return 1; }
+        case PEG_AND: { size_t save=*pos; int ok=peg_match_node(n->child,inp,ilen,&save); (void)ok; return ok; }
+        case PEG_NOT: { size_t save=*pos; int ok=peg_match_node(n->child,inp,ilen,&save); return !ok; }
+    }
+    return 0;
+}
+static void peg_free_lits(peg_parser_t *pp){ for(int i=0;i<pp->used;i++) if(pp->pool[i].kind==PEG_LIT && pp->pool[i].lit && pp->pool[i].lit_len>0) free(pp->pool[i].lit); }
+
 sds tools_run(const char *name, cJSON *args, const char *cwd) {
+
     if (!name) return sdsnew("ERROR: no tool name");
     if (!args) args = cJSON_CreateObject();
 
@@ -5873,8 +6037,61 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         cJSON_Delete(data);
         return sdscatprintf(sdsempty(), "ERROR: unknown json_query action '%s' (use query/filter/project/aggregate)", action);
     }
+    if (strcmp(name, "peg_match")==0 || strcmp(name,"peg")==0 || strcmp(name,"packcc_match")==0){
+        const char *pattern=cJSON_GetStringValue(cJSON_GetObjectItem(args,"pattern"));
+        if(!pattern) pattern=cJSON_GetStringValue(cJSON_GetObjectItem(args,"text"));
+        const char *input=cJSON_GetStringValue(cJSON_GetObjectItem(args,"input"));
+        if(!input) input="";
+        if(!pattern || !pattern[0]) return sdsnew("ERROR: 'pattern' (PEG expression) required");
+        size_t pat_len=strlen(pattern), inp_len=strlen(input);
+        if(pat_len>4096) return sdsnew("ERROR: pattern exceeds 4096 bytes");
+        if(inp_len>8192) return sdsnew("ERROR: input exceeds 8192 bytes");
+        cJSON *js=cJSON_GetObjectItem(args,"start");
+        long start=0;
+        if(js && cJSON_IsNumber(js)){
+            double v=js->valuedouble;
+            if(v<0) return sdsnew("ERROR: 'start' must be >= 0");
+            if(v > (double)inp_len) return sdsnew("ERROR: 'start' out of bounds");
+            start=(long)v;
+            if((size_t)start>inp_len) return sdsnew("ERROR: 'start' out of bounds");
+            // overflow-safe: ensure start+remaining does not wrap
+            if(start<0) return sdsnew("ERROR: 'start' must be >= 0");
+        }
+        for(size_t i=0;i<pat_len;i++){ unsigned char c=(unsigned char)pattern[i]; if(c<32||c>126) return sdsnew("ERROR: pattern contains invalid control/non-ascii character"); }
+        peg_parser_t pp; memset(&pp,0,sizeof(pp)); pp.pat=pattern; pp.pat_len=pat_len; pp.pos=0;
+        peg_node_t *root=peg_parse_choice(&pp);
+        if(!root){
+            if(pp.err[0]) return sdscatprintf(sdsempty(),"ERROR: PEG parse error at %zu: %s", pp.pos, pp.err);
+            return sdscatprintf(sdsempty(),"ERROR: PEG parse error at %zu", pp.pos);
+        }
+        peg_skip(&pp);
+        if(pp.pos!=pp.pat_len){ peg_free_lits(&pp); return sdscatprintf(sdsempty(),"ERROR: PEG parse error: unexpected trailing '%c' at %zu", pp.pat[pp.pos], pp.pos); }
+        size_t pos=(size_t)start;
+        int ok=peg_match_node(root, input, inp_len, &pos);
+        size_t matched_len = ok ? pos - (size_t)start : 0;
+        // extract matched text safely
+        char *matched_text=NULL;
+        if(ok && matched_len>0){
+            matched_text=(char*)malloc(matched_len+1);
+            if(matched_text){ memcpy(matched_text, input+start, matched_len); matched_text[matched_len]=0; }
+        }
+        cJSON *obj=cJSON_CreateObject();
+        cJSON_AddStringToObject(obj,"pattern",pattern);
+        cJSON_AddStringToObject(obj,"input",input);
+        cJSON_AddNumberToObject(obj,"start", (double)start);
+        cJSON_AddBoolToObject(obj,"matched", ok);
+        cJSON_AddNumberToObject(obj,"end", (double)pos);
+        cJSON_AddNumberToObject(obj,"length", (double)matched_len);
+        if(matched_text){ cJSON_AddStringToObject(obj,"text",matched_text); free(matched_text); }
+        else cJSON_AddStringToObject(obj,"text", ok?"":"");
+        char *js2=cJSON_PrintUnformatted(obj);
+        sds res=sdsnew(js2?js2:"{}");
+        free(js2); cJSON_Delete(obj); peg_free_lits(&pp);
+        return res;
+    }
 
     return sdscatprintf(sdsempty(), "ERROR: unknown tool %s", name);
+
 }
 
 cJSON *tools_schema(void) {
@@ -5922,7 +6139,7 @@ cJSON *tools_schema(void) {
         "{\"type\":\"function\",\"function\":{\"name\":\"code_clone_detector\",\"description\":\"Fast MinHash Fingerprinting & Locality-Sensitive Hashing (LSH) for Code Clones & Near-Duplicate Detection from DeusData/codebase-memory-mcp. Computes K=64 MinHash vector (512-hex chars), Jaccard similarity estimation, and 32-band LSH candidate retrieval.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"fingerprint\",\"jaccard\",\"lsh_match\"]},\"text\":{\"type\":\"string\",\"description\":\"Source code text to fingerprint\"},\"a\":{\"type\":\"string\",\"description\":\"First signature or text for Jaccard compare\"},\"b\":{\"type\":\"string\",\"description\":\"Second signature or text for Jaccard compare\"},\"query\":{\"type\":\"string\",\"description\":\"Query text or fingerprint for LSH search\"},\"corpus\":{\"type\":\"array\",\"description\":\"Corpus array of {id, text} items to match against\"},\"threshold\":{\"type\":\"number\",\"description\":\"Similarity threshold [0.0..1.0] (default 0.8)\"}},\"required\":[]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"url_codec_parser\",\"description\":\"RFC 3986 URL & Query String Parser, Percent Codec, and Levenshtein Distance Matrix from php/php-src. Actions: 'parse' (extracts scheme/user/pass/host/port/path/query/fragment/params), 'build' (constructs canonical URL), 'encode'/'decode' (percent codec), 'levenshtein' (weighted edit distance & similarity).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"parse\",\"build\",\"encode\",\"decode\",\"levenshtein\"]},\"url\":{\"type\":\"string\",\"description\":\"URL string to parse\"},\"text\":{\"type\":\"string\",\"description\":\"Text to encode or decode\"},\"scheme\":{\"type\":\"string\"},\"host\":{\"type\":\"string\"},\"port\":{\"type\":\"integer\"},\"path\":{\"type\":\"string\"},\"query\":{\"type\":\"string\"},\"fragment\":{\"type\":\"string\"},\"a\":{\"type\":\"string\",\"description\":\"First string for levenshtein\"},\"b\":{\"type\":\"string\",\"description\":\"Second string for levenshtein\"},\"cost_ins\":{\"type\":\"integer\"},\"cost_rep\":{\"type\":\"integer\"},\"cost_del\":{\"type\":\"integer\"}},\"required\":[]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"geom_spatial_2d3d\",\"description\":\"3D Vector/Quaternion Transformations, 2D Geometric Collisions, Color RGBA/HSV/Hex Codec & Penner Easing Curves from raysan5/raylib. Actions: 'vector' (dot/cross/dist/lerp/angle/reflect), 'quaternion' (from_euler/rotate_vector), 'collision_2d' (rect_rect/circle_circle), 'color' (RGB/HSV/Hex), 'easing' (bounce/sine/expo/elastic).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"vector\",\"quaternion\",\"collision_2d\",\"color\",\"easing\"]},\"op\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\"},\"type\":{\"type\":\"string\"},\"x1\":{\"type\":\"number\"},\"y1\":{\"type\":\"number\"},\"z1\":{\"type\":\"number\"},\"x2\":{\"type\":\"number\"},\"y2\":{\"type\":\"number\"},\"z2\":{\"type\":\"number\"},\"r\":{\"type\":\"integer\"},\"g\":{\"type\":\"integer\"},\"b\":{\"type\":\"integer\"},\"a\":{\"type\":\"integer\"},\"hex\":{\"type\":\"string\"},\"t\":{\"type\":\"number\"}},\"required\":[]}}},"
-        "{\"type\":\"function\",\"function\":{\"name\":\"base64_codec\",\"description\":\"RFC 4648 Base64 & Base64URL + Hex codec (pure C). Actions: encode (std), decode, encode_url, decode_url, hex_encode, hex_decode. Handles padding, whitespace-tolerant decode, and binary-safe output.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"encode\",\"decode\",\"encode_url\",\"decode_url\",\"hex_encode\",\"hex_decode\"]},\"data\":{\"type\":\"string\",\"description\":\"Input string to encode/decode\"},\"text\":{\"type\":\"string\"},\"input\":{\"type\":\"string\"}},\"required\":[]}}}"
+        "{\"type\":\"function\",\"function\":{\"name\":\"peg_match\",\"description\":\"PackCC-inspired PEG pattern matcher (pure C). PEG ops: quoted string literals, [a-z] and [^...] char classes, . any char, / ordered choice, adjacency sequence, * + ? repetition, ! and & predicates, () grouping. Returns matched, length, text, end.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"description\":\"PEG expression\"},\"input\":{\"type\":\"string\"},\"start\":{\"type\":\"integer\"}},\"required\":[\"pattern\",\"input\"]}}},""{\"type\":\"function\",\"function\":{\"name\":\"base64_codec\",\"description\":\"RFC 4648 Base64 & Base64URL + Hex codec (pure C). Actions: encode (std), decode, encode_url, decode_url, hex_encode, hex_decode. Handles padding, whitespace-tolerant decode, and binary-safe output.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"encode\",\"decode\",\"encode_url\",\"decode_url\",\"hex_encode\",\"hex_decode\"]},\"data\":{\"type\":\"string\",\"description\":\"Input string to encode/decode\"},\"text\":{\"type\":\"string\"},\"input\":{\"type\":\"string\"}},\"required\":[]}}}"
         "]";
     return cJSON_Parse(json);
 }
