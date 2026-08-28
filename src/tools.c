@@ -3097,6 +3097,60 @@ static sds phone_tool_run(cJSON *args, const char *cwd) {
     return sdscatprintf(sdsempty(), "ERROR: unknown phone action '%s'", action);
 }
 
+static int checksum_hex_nibble(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Decode a hex string into a freshly malloc'd buffer. Returns 0 on success,
+ * -1 on odd length, -2 on non-hex characters. */
+static int checksum_hex_decode(const char *hex, uint8_t **out, size_t *outlen) {
+    if (!hex || !out || !outlen) return -2;
+    size_t n = strlen(hex);
+    if (n % 2 != 0) return -1;
+    uint8_t *buf = malloc(n / 2 + 1);
+    if (!buf) return -2;
+    for (size_t i = 0; i < n; i += 2) {
+        int hi = checksum_hex_nibble((unsigned char)hex[i]);
+        int lo = checksum_hex_nibble((unsigned char)hex[i + 1]);
+        if (hi < 0 || lo < 0) { free(buf); return -2; }
+        buf[i / 2] = (uint8_t)((hi << 4) | lo);
+    }
+    *out = buf;
+    *outlen = n / 2;
+    return 0;
+}
+
+static uint32_t checksum_crc32(const uint8_t *buf, size_t len) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)-(int32_t)(crc & 1));
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static uint32_t checksum_adler32(const uint8_t *buf, size_t len) {
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < len; i++) {
+        a = (a + buf[i]) % 65521u;
+        b = (b + a) % 65521u;
+    }
+    return (b << 16) | a;
+}
+
+static uint64_t checksum_fnv1a64(const uint8_t *buf, size_t len) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < len; i++) {
+        h ^= buf[i];
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
 sds tools_run(const char *name, cJSON *args, const char *cwd) {
     if (!name) return sdsnew("ERROR: no tool name");
     if (!args) args = cJSON_CreateObject();
@@ -4229,6 +4283,57 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
         free(json_str);
         return out;
     }
+    if (strcmp(name, "checksum") == 0) {
+        const char *algo = cJSON_GetStringValue(cJSON_GetObjectItem(args, "algorithm"));
+        const char *data_hex = cJSON_GetStringValue(cJSON_GetObjectItem(args, "data"));
+        const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(args, "text"));
+        if (!algo)
+            return sdsnew("ERROR: algorithm required for checksum (crc32, adler32, fnv1a64)");
+        if (strcmp(algo, "crc32") != 0 && strcmp(algo, "adler32") != 0 &&
+            strcmp(algo, "fnv1a64") != 0)
+            return sdscatprintf(sdsempty(),
+                "ERROR: unknown checksum algorithm %s (use crc32, adler32, or fnv1a64)", algo);
+
+        uint8_t *decoded = NULL;
+        const uint8_t *buf;
+        size_t len;
+        if (data_hex) {
+            int rc = checksum_hex_decode(data_hex, &decoded, &len);
+            if (rc == -1)
+                return sdsnew("ERROR: hex data length must be an even number of characters");
+            if (rc != 0)
+                return sdsnew("ERROR: data contains non-hex characters");
+            buf = decoded;
+        } else if (text) {
+            buf = (const uint8_t *)text;
+            len = strlen(text);
+        } else {
+            return sdsnew("ERROR: data (hex) or text input required for checksum");
+        }
+
+        sds out;
+        if (strcmp(algo, "crc32") == 0) {
+            uint32_t v = checksum_crc32(buf, len);
+            out = sdscatprintf(sdsempty(),
+                "{\"action\":\"checksum\",\"algorithm\":\"crc32\",\"input_bytes\":%zu,"
+                "\"value\":%lu,\"hex\":\"%08lx\"}",
+                len, (unsigned long)v, (unsigned long)v);
+        } else if (strcmp(algo, "adler32") == 0) {
+            uint32_t v = checksum_adler32(buf, len);
+            out = sdscatprintf(sdsempty(),
+                "{\"action\":\"checksum\",\"algorithm\":\"adler32\",\"input_bytes\":%zu,"
+                "\"value\":%lu,\"hex\":\"%08lx\"}",
+                len, (unsigned long)v, (unsigned long)v);
+        } else {
+            uint64_t v = checksum_fnv1a64(buf, len);
+            out = sdscatprintf(sdsempty(),
+                "{\"action\":\"checksum\",\"algorithm\":\"fnv1a64\",\"input_bytes\":%zu,"
+                "\"value\":%llu,\"hex\":\"%016llx\"}",
+                len, (unsigned long long)v, (unsigned long long)v);
+        }
+        free(decoded);
+        return out;
+    }
     return sdscatprintf(sdsempty(), "ERROR: unknown tool %s", name);
 }
 
@@ -4271,7 +4376,8 @@ cJSON *tools_schema(void) {
         "{\"type\":\"function\",\"function\":{\"name\":\"mdesk_tokenize\",\"description\":\"Fast Metadesk Lexer & Code Tokenizer from EpicGames/raddebugger. Scans text, C/C++ code, and DSLs into structured tokens with identifiers, numerics, strings, triplet quotes, symbols, comments, and offset spans.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\",\"description\":\"Source code or data text to tokenize\"},\"skip_whitespace\":{\"type\":\"boolean\",\"description\":\"Filter out whitespace and newline tokens (default true)\"}},\"required\":[\"text\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"cpp_symbol_extract\",\"description\":\"Fast C/C++ AST Symbol Extractor from colbymchenry/codegraph. Scans source code and extracts functions, qualified methods (Class::method), classes, structs, enums, macros, and include headers.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\",\"description\":\"C/C++ source code text to analyze\"}},\"required\":[\"text\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"mesh_spatial_codec\",\"description\":\"Fast 3D Morton Space-Filling Curve & Spatial Quantizer from zeux/meshoptimizer. Actions: 'morton' (encodes 3D coordinates into 64-bit interleaved Z-order Morton spatial codes), 'batch_order' (computes AABB 3D bounding box and spatial codes for vertex arrays), 'half_float' (quantizes 32-bit floats to 16-bit IEEE-754 half floats with denormal flush and NaN preservation).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"morton\",\"batch_order\",\"half_float\"]},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"z\":{\"type\":\"number\"},\"value\":{\"type\":\"number\"},\"points\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"z\":{\"type\":\"number\"}}}}},\"required\":[]}}},"
-        "{\"type\":\"function\",\"function\":{\"name\":\"working_diff\",\"description\":\"Collect a git diff of the working directory. Modes: 'working' (unstaged + untracked, default), 'staged' (git diff --cached), 'all' (everything since HEAD + untracked). Untracked files are shown as new-file diffs via git diff --no-index /dev/null <file>. Returns the diff as text.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"working\",\"staged\",\"all\"],\"description\":\"Diff mode: working (default), staged, or all\"}},\"required\":[]}}}"
+        "{\"type\":\"function\",\"function\":{\"name\":\"working_diff\",\"description\":\"Collect a git diff of the working directory. Modes: 'working' (unstaged + untracked, default), 'staged' (git diff --cached), 'all' (everything since HEAD + untracked). Untracked files are shown as new-file diffs via git diff --no-index /dev/null <file>. Returns the diff as text.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"working\",\"staged\",\"all\"],\"description\":\"Diff mode: working (default), staged, or all\"}},\"required\":[]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"checksum\",\"description\":\"Fast Checksum & Hash Suite from FFmpeg. Computes CRC-32 (IEEE reflected), Adler-32, and FNV-1a 64-bit digests over hex-encoded binary buffers or raw text.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"algorithm\":{\"type\":\"string\",\"enum\":[\"crc32\",\"adler32\",\"fnv1a64\"],\"description\":\"Digest algorithm\"},\"data\":{\"type\":\"string\",\"description\":\"Hex-encoded binary buffer to digest\"},\"text\":{\"type\":\"string\",\"description\":\"Raw text to digest (used when data is absent)\"}},\"required\":[\"algorithm\"]}}}"
         "]";
     return cJSON_Parse(json);
 }
