@@ -794,8 +794,8 @@ static sds build_prompt(const char *root, const char *goal, int gen) {
         "3. PRESERVE THE GATE: `make -j4 && make test` must pass. Never edit the sealed harness files (Makefile, src/evolve.c, src/warden.c, etc.).\n"
         "4. POSIX & APPLE SILICON: Write clean C11 (-Wall -Wextra clean) using native Darwin/BSD and POSIX APIs.\n\n"
         "STEP BY STEP (follow in order, do not skip, do not stop early):\n"
-        "1. SURVEY (Turn 1): Read `include/alpha.h` and `src/tools.c` to see existing tools and structures.\n"
-        "2. DECIDE & IMPLEMENT (Turns 2-4): Choose ONE capability to build (e.g., regex search, fast JSON query, embedded KV cache, AST code parser, diff-patch engine, process supervisor). Write clean C11 code in `src/tools.c` or a new module in `src/`.\n"
+        "1. SURVEY (Turn 1): Read `include/alpha.h`, `src/tools.c`, and inspect `src/tools/`.\n"
+        "2. DECIDE & IMPLEMENT (Turns 2-4): Choose ONE capability to build. Write clean C11 code in a new file `src/tools/tool_<name>.c` using `alpha_tool_t`, include it in `src/tools.c`, and register it in `g_registered_tools[]`.\n"
         "3. TEST (Turn 5): Create `tests/custom/test_<name>.c` with real assertions certifying your new logic.\n"
         "4. VERIFY: Run `make -j4 && make test` to prove that all test suites pass.\n"
         "Always invoke tools using your native function-calling interface. Your final diff MUST be non-empty.\n\n"
@@ -994,8 +994,8 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
             } else if (empty_gen) {
                 fix_prompt = sdscatprintf(sdsempty(),
                     "You surveyed the repository but have NOT written any code or test files yet (empty generation).\n\n"
-                    "You have a repair attempt now: immediately implement your chosen capability in `src/tools.c`, "
-                    "wire it in `tools_run()` and `tools_schema()`, and create `tests/custom/test_<name>.c`. "
+                    "You have a repair attempt now: immediately implement your chosen capability in `src/tools/tool_<name>.c` "
+                    "using `alpha_tool_t`, include it in `src/tools.c`, register it in `g_registered_tools[]`, and create `tests/custom/test_<name>.c`. "
                     "Then verify with `make -j4 && make test`!");
             } else {
                 fix_prompt = sdscatprintf(sdsempty(),
