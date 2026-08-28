@@ -4514,7 +4514,7 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
             } else {
                 const char *exit_marker = strstr(r, "__ALPHA_EXIT:");
                 if (exit_marker) {
-                    int ec = atoi(exit_marker + 12);
+                    int ec = atoi(exit_marker + 13);
                     if (ec != 0) failures++;
                 }
             }
@@ -5476,6 +5476,180 @@ sds tools_run(const char *name, cJSON *args, const char *cwd) {
     }
 
     /* ======================================================================
+     * base64_codec — RFC 4648 Base64 & Base64URL + Hex codec (pure C).
+     * Actions: encode (std), decode, encode_url, decode_url, hex_encode, hex_decode
+     * ====================================================================== */
+    if (strcmp(name, "base64_codec") == 0 || strcmp(name, "base64") == 0 || strcmp(name, "b64") == 0) {
+        const char *action = cJSON_GetStringValue(cJSON_GetObjectItem(args, "action"));
+        if (!action || !action[0]) action = "encode";
+        const char *input = cJSON_GetStringValue(cJSON_GetObjectItem(args, "data"));
+        if (!input) input = cJSON_GetStringValue(cJSON_GetObjectItem(args, "text"));
+        if (!input) input = cJSON_GetStringValue(cJSON_GetObjectItem(args, "input"));
+        if (!input) input = "";
+        size_t in_len = strlen(input);
+
+        if (strcmp(action, "encode") == 0 || strcmp(action, "encode_std") == 0) {
+            static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            size_t out_len = ((in_len + 2) / 3) * 4;
+            char *out = (char*)malloc(out_len + 1);
+            if (!out) return sdsnew("ERROR: alloc failed");
+            size_t oi = 0;
+            for (size_t i = 0; i < in_len; i += 3) {
+                uint32_t a = (unsigned char)input[i];
+                uint32_t b = (i + 1 < in_len) ? (unsigned char)input[i+1] : 0;
+                uint32_t c = (i + 2 < in_len) ? (unsigned char)input[i+2] : 0;
+                uint32_t triple = (a << 16) | (b << 8) | c;
+                out[oi++] = tbl[(triple >> 18) & 0x3F];
+                out[oi++] = tbl[(triple >> 12) & 0x3F];
+                out[oi++] = (i + 1 < in_len) ? tbl[(triple >> 6) & 0x3F] : '=';
+                out[oi++] = (i + 2 < in_len) ? tbl[triple & 0x3F] : '=';
+            }
+            out[oi] = 0;
+            cJSON *obj = cJSON_CreateObject();
+            cJSON_AddStringToObject(obj, "action", "encode");
+            cJSON_AddStringToObject(obj, "encoding", "base64_std");
+            cJSON_AddNumberToObject(obj, "input_len", (double)in_len);
+            cJSON_AddStringToObject(obj, "data", out);
+            char *js = cJSON_PrintUnformatted(obj);
+            sds res = sdsnew(js ? js : "{}");
+            free(js); cJSON_Delete(obj); free(out);
+            return res;
+        }
+        if (strcmp(action, "encode_url") == 0 || strcmp(action, "encodeurl") == 0) {
+            static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            size_t out_len = ((in_len + 2) / 3) * 4;
+            char *out = (char*)malloc(out_len + 1);
+            if (!out) return sdsnew("ERROR: alloc failed");
+            size_t oi = 0;
+            for (size_t i = 0; i < in_len; i += 3) {
+                uint32_t a = (unsigned char)input[i];
+                uint32_t b = (i + 1 < in_len) ? (unsigned char)input[i+1] : 0;
+                uint32_t c = (i + 2 < in_len) ? (unsigned char)input[i+2] : 0;
+                uint32_t triple = (a << 16) | (b << 8) | c;
+                out[oi++] = tbl[(triple >> 18) & 0x3F];
+                out[oi++] = tbl[(triple >> 12) & 0x3F];
+                out[oi++] = (i + 1 < in_len) ? tbl[(triple >> 6) & 0x3F] : '=';
+                out[oi++] = (i + 2 < in_len) ? tbl[triple & 0x3F] : '=';
+            }
+            out[oi] = 0;
+            cJSON *obj = cJSON_CreateObject();
+            cJSON_AddStringToObject(obj, "action", "encode_url");
+            cJSON_AddStringToObject(obj, "encoding", "base64url");
+            cJSON_AddNumberToObject(obj, "input_len", (double)in_len);
+            cJSON_AddStringToObject(obj, "data", out);
+            char *js = cJSON_PrintUnformatted(obj);
+            sds res = sdsnew(js ? js : "{}");
+            free(js); cJSON_Delete(obj); free(out);
+            return res;
+        }
+        if (strcmp(action, "hex_encode") == 0 || strcmp(action, "hex") == 0) {
+            static const char hx[] = "0123456789abcdef";
+            char *out = (char*)malloc(in_len * 2 + 1);
+            if (!out) return sdsnew("ERROR: alloc failed");
+            for (size_t i = 0; i < in_len; i++) {
+                out[i*2] = hx[((unsigned char)input[i] >> 4) & 0xF];
+                out[i*2+1] = hx[(unsigned char)input[i] & 0xF];
+            }
+            out[in_len*2] = 0;
+            cJSON *obj = cJSON_CreateObject();
+            cJSON_AddStringToObject(obj, "action", "hex_encode");
+            cJSON_AddNumberToObject(obj, "input_len", (double)in_len);
+            cJSON_AddStringToObject(obj, "data", out);
+            char *js = cJSON_PrintUnformatted(obj);
+            sds res = sdsnew(js ? js : "{}");
+            free(js); cJSON_Delete(obj); free(out);
+            return res;
+        }
+        if (strcmp(action, "decode") == 0 || strcmp(action, "decode_std") == 0 ||
+            strcmp(action, "decode_url") == 0 || strcmp(action, "decodeurl") == 0 ||
+            strcmp(action, "hex_decode") == 0) {
+            int is_hex = (strcmp(action, "hex_decode") == 0);
+            int is_url = (strcmp(action, "decode_url") == 0 || strcmp(action, "decodeurl") == 0);
+            if (is_hex) {
+                if (in_len % 2 != 0) return sdsnew("ERROR: hex_decode requires even-length hex string");
+                size_t out_len = in_len / 2;
+                char *out = (char*)malloc(out_len + 1);
+                if (!out) return sdsnew("ERROR: alloc failed");
+                for (size_t i = 0; i < out_len; i++) {
+                    char hi = input[i*2], lo = input[i*2+1];
+                    int hv = -1, lv = -1;
+                    if (hi >= '0' && hi <= '9') hv = hi - '0';
+                    else if (hi >= 'a' && hi <= 'f') hv = hi - 'a' + 10;
+                    else if (hi >= 'A' && hi <= 'F') hv = hi - 'A' + 10;
+                    if (lo >= '0' && lo <= '9') lv = lo - '0';
+                    else if (lo >= 'a' && lo <= 'f') lv = lo - 'a' + 10;
+                    else if (lo >= 'A' && lo <= 'F') lv = lo - 'A' + 10;
+                    if (hv < 0 || lv < 0) { free(out); return sdscatprintf(sdsempty(), "ERROR: invalid hex char at pos %zu", i*2); }
+                    out[i] = (char)((hv << 4) | lv);
+                }
+                out[out_len] = 0;
+                cJSON *obj = cJSON_CreateObject();
+                cJSON_AddStringToObject(obj, "action", "hex_decode");
+                cJSON_AddNumberToObject(obj, "input_len", (double)in_len);
+                cJSON_AddNumberToObject(obj, "output_len", (double)out_len);
+                cJSON_AddStringToObject(obj, "data", out);
+                // also provide hex repr for binary safety
+                char *js = cJSON_PrintUnformatted(obj);
+                sds res = sdsnew(js ? js : "{}");
+                free(js); cJSON_Delete(obj); free(out);
+                return res;
+            }
+            // base64 decode
+            // Build reverse table
+            int rev[256];
+            for (int i = 0; i < 256; i++) rev[i] = -1;
+            const char *tbl_std = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            const char *tbl_url = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            const char *tbl = is_url ? tbl_url : tbl_std;
+            for (int i = 0; i < 64; i++) rev[(unsigned char)tbl[i]] = i;
+            rev[(unsigned char)'='] = 0;
+            // count valid chars (ignore whitespace)
+            size_t valid = 0;
+            for (size_t i = 0; i < in_len; i++) {
+                unsigned char c = input[i];
+                if (c==' '||c=='\n'||c=='\r'||c=='\t') continue;
+                if (rev[c]==-1) return sdscatprintf(sdsempty(), "ERROR: invalid base64 character '%c' at pos %zu", c, i);
+                valid++;
+            }
+            if (valid % 4 != 0) return sdsnew("ERROR: base64 length must be multiple of 4 (after trimming whitespace)");
+            size_t out_cap = (valid / 4) * 3;
+            char *out = (char*)malloc(out_cap + 1);
+            if (!out) return sdsnew("ERROR: alloc failed");
+            size_t oi = 0;
+            // collect filtered chars
+            char *filt = (char*)malloc(valid + 1);
+            size_t fi = 0;
+            for (size_t i = 0; i < in_len; i++) {
+                unsigned char c = input[i];
+                if (c==' '||c=='\n'||c=='\r'||c=='\t') continue;
+                filt[fi++] = c;
+            }
+            for (size_t i = 0; i < valid; i += 4) {
+                int a = rev[(unsigned char)filt[i]];
+                int b = rev[(unsigned char)filt[i+1]];
+                int c = rev[(unsigned char)filt[i+2]];
+                int d = rev[(unsigned char)filt[i+3]];
+                uint32_t triple = ((uint32_t)a << 18) | ((uint32_t)b << 12) | ((uint32_t)c << 6) | (uint32_t)d;
+                out[oi++] = (char)((triple >> 16) & 0xFF);
+                if (filt[i+2] != '=') out[oi++] = (char)((triple >> 8) & 0xFF);
+                if (filt[i+3] != '=') out[oi++] = (char)(triple & 0xFF);
+            }
+            free(filt);
+            out[oi] = 0;
+            cJSON *obj = cJSON_CreateObject();
+            cJSON_AddStringToObject(obj, "action", is_url ? "decode_url" : "decode");
+            cJSON_AddNumberToObject(obj, "input_len", (double)in_len);
+            cJSON_AddNumberToObject(obj, "output_len", (double)oi);
+            cJSON_AddStringToObject(obj, "data", out);
+            char *js = cJSON_PrintUnformatted(obj);
+            sds res = sdsnew(js ? js : "{}");
+            free(js); cJSON_Delete(obj); free(out);
+            return res;
+        }
+        return sdscatprintf(sdsempty(), "ERROR: unknown base64_codec action '%s' (use encode/decode/encode_url/decode_url/hex_encode/hex_decode)", action);
+    }
+
+    /* ======================================================================
      * json_query — embedded JSON query, filter, project, and aggregate.
      *
      * A self-contained JSON query engine using the already-linked cJSON
@@ -5747,7 +5921,8 @@ cJSON *tools_schema(void) {
         "{\"type\":\"function\",\"function\":{\"name\":\"intset\",\"description\":\"Compact sorted integer set ported from redis/src/intset.c. Auto-upgrades encoding int16→int32→int64. Serialized as 8-byte LE header + packed elements, hex-encoded. Actions: create, add, remove, get, find, random, stats, list.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"create\",\"add\",\"remove\",\"get\",\"find\",\"random\",\"stats\",\"list\"],\"description\":\"Operation\"},\"data\":{\"type\":\"string\",\"description\":\"Hex-encoded intset blob\"},\"value\":{\"type\":\"string\",\"description\":\"Single integer value\"},\"values\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Array of integer values\"},\"index\":{\"type\":\"integer\",\"description\":\"Positional index for get\"},\"seed\":{\"type\":\"integer\",\"description\":\"Seed for random\"}},\"required\":[\"action\"]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"code_clone_detector\",\"description\":\"Fast MinHash Fingerprinting & Locality-Sensitive Hashing (LSH) for Code Clones & Near-Duplicate Detection from DeusData/codebase-memory-mcp. Computes K=64 MinHash vector (512-hex chars), Jaccard similarity estimation, and 32-band LSH candidate retrieval.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"fingerprint\",\"jaccard\",\"lsh_match\"]},\"text\":{\"type\":\"string\",\"description\":\"Source code text to fingerprint\"},\"a\":{\"type\":\"string\",\"description\":\"First signature or text for Jaccard compare\"},\"b\":{\"type\":\"string\",\"description\":\"Second signature or text for Jaccard compare\"},\"query\":{\"type\":\"string\",\"description\":\"Query text or fingerprint for LSH search\"},\"corpus\":{\"type\":\"array\",\"description\":\"Corpus array of {id, text} items to match against\"},\"threshold\":{\"type\":\"number\",\"description\":\"Similarity threshold [0.0..1.0] (default 0.8)\"}},\"required\":[]}}},"
         "{\"type\":\"function\",\"function\":{\"name\":\"url_codec_parser\",\"description\":\"RFC 3986 URL & Query String Parser, Percent Codec, and Levenshtein Distance Matrix from php/php-src. Actions: 'parse' (extracts scheme/user/pass/host/port/path/query/fragment/params), 'build' (constructs canonical URL), 'encode'/'decode' (percent codec), 'levenshtein' (weighted edit distance & similarity).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"parse\",\"build\",\"encode\",\"decode\",\"levenshtein\"]},\"url\":{\"type\":\"string\",\"description\":\"URL string to parse\"},\"text\":{\"type\":\"string\",\"description\":\"Text to encode or decode\"},\"scheme\":{\"type\":\"string\"},\"host\":{\"type\":\"string\"},\"port\":{\"type\":\"integer\"},\"path\":{\"type\":\"string\"},\"query\":{\"type\":\"string\"},\"fragment\":{\"type\":\"string\"},\"a\":{\"type\":\"string\",\"description\":\"First string for levenshtein\"},\"b\":{\"type\":\"string\",\"description\":\"Second string for levenshtein\"},\"cost_ins\":{\"type\":\"integer\"},\"cost_rep\":{\"type\":\"integer\"},\"cost_del\":{\"type\":\"integer\"}},\"required\":[]}}},"
-        "{\"type\":\"function\",\"function\":{\"name\":\"geom_spatial_2d3d\",\"description\":\"3D Vector/Quaternion Transformations, 2D Geometric Collisions, Color RGBA/HSV/Hex Codec & Penner Easing Curves from raysan5/raylib. Actions: 'vector' (dot/cross/dist/lerp/angle/reflect), 'quaternion' (from_euler/rotate_vector), 'collision_2d' (rect_rect/circle_circle), 'color' (RGB/HSV/Hex), 'easing' (bounce/sine/expo/elastic).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"vector\",\"quaternion\",\"collision_2d\",\"color\",\"easing\"]},\"op\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\"},\"type\":{\"type\":\"string\"},\"x1\":{\"type\":\"number\"},\"y1\":{\"type\":\"number\"},\"z1\":{\"type\":\"number\"},\"x2\":{\"type\":\"number\"},\"y2\":{\"type\":\"number\"},\"z2\":{\"type\":\"number\"},\"r\":{\"type\":\"integer\"},\"g\":{\"type\":\"integer\"},\"b\":{\"type\":\"integer\"},\"a\":{\"type\":\"integer\"},\"hex\":{\"type\":\"string\"},\"t\":{\"type\":\"number\"}},\"required\":[]}}}"
+        "{\"type\":\"function\",\"function\":{\"name\":\"geom_spatial_2d3d\",\"description\":\"3D Vector/Quaternion Transformations, 2D Geometric Collisions, Color RGBA/HSV/Hex Codec & Penner Easing Curves from raysan5/raylib. Actions: 'vector' (dot/cross/dist/lerp/angle/reflect), 'quaternion' (from_euler/rotate_vector), 'collision_2d' (rect_rect/circle_circle), 'color' (RGB/HSV/Hex), 'easing' (bounce/sine/expo/elastic).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"vector\",\"quaternion\",\"collision_2d\",\"color\",\"easing\"]},\"op\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\"},\"type\":{\"type\":\"string\"},\"x1\":{\"type\":\"number\"},\"y1\":{\"type\":\"number\"},\"z1\":{\"type\":\"number\"},\"x2\":{\"type\":\"number\"},\"y2\":{\"type\":\"number\"},\"z2\":{\"type\":\"number\"},\"r\":{\"type\":\"integer\"},\"g\":{\"type\":\"integer\"},\"b\":{\"type\":\"integer\"},\"a\":{\"type\":\"integer\"},\"hex\":{\"type\":\"string\"},\"t\":{\"type\":\"number\"}},\"required\":[]}}},"
+        "{\"type\":\"function\",\"function\":{\"name\":\"base64_codec\",\"description\":\"RFC 4648 Base64 & Base64URL + Hex codec (pure C). Actions: encode (std), decode, encode_url, decode_url, hex_encode, hex_decode. Handles padding, whitespace-tolerant decode, and binary-safe output.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"encode\",\"decode\",\"encode_url\",\"decode_url\",\"hex_encode\",\"hex_decode\"]},\"data\":{\"type\":\"string\",\"description\":\"Input string to encode/decode\"},\"text\":{\"type\":\"string\"},\"input\":{\"type\":\"string\"}},\"required\":[]}}}"
         "]";
     return cJSON_Parse(json);
 }
