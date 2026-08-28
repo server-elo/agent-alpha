@@ -23,7 +23,7 @@ touch "$STREAM_LOG"
 LANGUAGES=("c" "cpp" "csharp")
 TIMEFRAMES=("daily" "weekly" "monthly")
 
-BLOCKLIST=("torvalds/linux" "microsoft/PowerToys" "tensorflow/tensorflow" "electron/electron" "dotnet/aspnetcore")
+BLOCKLIST=("torvalds/linux" "microsoft/PowerToys" "tensorflow/tensorflow" "electron/electron" "dotnet/aspnetcore" "php/php-src" "coolsnowwolf/lede" "git/git" "freebsd/freebsd" "netdata/netdata")
 
 log() {
     echo -e "\033[1;34m[alpha-harvester]\033[0m $(date '+%H:%M:%S') $*" | tee -a "$STREAM_LOG"
@@ -108,14 +108,18 @@ Follow the exact Generation 211 blueprint:
 4. [Turns 7-9 - Real Unit Test & Verification]: Write a genuine unit test suite in tests/custom/test_<name>.c with 8+ rigorous assertions testing real edge cases AND mandatory adversarial negative tests (e.g. negative integers, invalid/corrupted strings, out-of-bounds checks). Run execute_bash with 'make -j4 && make test'. If any compiler warning or test fails, fix it immediately.
 Your final diff must be non-empty and must include real working code + real tests."
 
-    log "Launching self-evolution synthesis for $repo..."
+    log "Launching self-evolution synthesis for $repo with BytePlus Ark Coding..."
     cd "$ROOT_DIR" || exit 1
 
     local ts
     ts=$(date +%s)
-    export ALPHA_BASE_URL="http://127.0.0.1:8125/v1"
-    export ALPHA_MODEL="opencode-go/glm-5.3-flash"
-    ./alpha -m "opencode-go/glm-5.3-flash" --evolve "$goal" --generations 1 2>&1 | tee -a "$STREAM_LOG"
+    export ALPHA_BASE_URL="${ALPHA_BASE_URL:-https://ark.ap-southeast.bytepluses.com/api/coding/v3}"
+    export ALPHA_MODEL="${ALPHA_MODEL:-ark-code-latest}"
+    if [ -z "${ALPHA_API_KEY:-}" ] && [ -f "$HOME/.openclaw/openclaw.json" ]; then
+        ALPHA_API_KEY=$(grep -o '"apiKey": *"[^"]*"' "$HOME/.openclaw/openclaw.json" | head -n 1 | cut -d'"' -f4)
+    fi
+    export ALPHA_API_KEY
+    ./alpha -u "$ALPHA_BASE_URL" -m "$ALPHA_MODEL" -k "$ALPHA_API_KEY" --evolve "$goal" --generations 1 2>&1 | tee -a "$STREAM_LOG"
 
     local outcome="revert"
     local last_log
