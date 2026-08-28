@@ -28,6 +28,8 @@
 
 /* --- safe string helpers --------------------------------------------------- */
 
+static const alpha_cfg_t *g_evolve_active_cfg = NULL;
+
 /* Shell-escape a string for safe interpolation into sh -c commands.
  * Prevents command injection when model-controlled strings enter run_capture. */
 static sds shell_escape(const char *s) {
@@ -39,6 +41,30 @@ static sds shell_escape(const char *s) {
             out = sdscatlen(out, p, 1);
     }
     return sdscat(out, "'");
+}
+
+static sds evolve_alpha_cli_prefix(const char *model) {
+    const char *m = (model && model[0]) ? model : "local";
+    const char *url = (g_evolve_active_cfg && g_evolve_active_cfg->base_url && g_evolve_active_cfg->base_url[0])
+                        ? g_evolve_active_cfg->base_url : getenv("ALPHA_BASE_URL");
+    const char *key = (g_evolve_active_cfg && g_evolve_active_cfg->api_key && g_evolve_active_cfg->api_key[0])
+                        ? g_evolve_active_cfg->api_key : getenv("ALPHA_API_KEY");
+
+    sds safe_m = shell_escape(m);
+    sds cmd = sdscatprintf(sdsempty(), "./alpha -m %s", safe_m);
+    sdsfree(safe_m);
+
+    if (url && url[0]) {
+        sds safe_u = shell_escape(url);
+        cmd = sdscatprintf(cmd, " -u %s", safe_u);
+        sdsfree(safe_u);
+    }
+    if (key && key[0]) {
+        sds safe_k = shell_escape(key);
+        cmd = sdscatprintf(cmd, " -k %s", safe_k);
+        sdsfree(safe_k);
+    }
+    return cmd;
 }
 
 /* --- source root ----------------------------------------------------------- */
@@ -230,9 +256,11 @@ static int run_domain_benchmark(const char *dir, const char *model, sds *report)
     sdsfree(memdir);
 
     if (is_memory) {
+        sds prefix = evolve_alpha_cli_prefix(model);
         sds cmd = sdscatprintf(sdsempty(),
-            "ALPHA_MEMORY_DIR=%s ./alpha -m %s 'Use memory tool to add entry test_key_999=domain_bench_value then retrieve memory' 2>&1",
-            safe_memdir, safe_model);
+            "ALPHA_MEMORY_DIR=%s %s 'Use memory tool to add entry test_key_999=domain_bench_value then retrieve memory' 2>&1",
+            safe_memdir, prefix);
+        sdsfree(prefix);
         sds out = run_capture(dir, cmd, 120, &rc);
         sdsfree(cmd);
         if (rc != 0 || !out || strstr(out, "ERROR") || !strstr(out, "domain_bench_value")) {
@@ -243,9 +271,11 @@ static int run_domain_benchmark(const char *dir, const char *model, sds *report)
         }
         sdsfree(out);
     } else if (is_search) {
+        sds prefix = evolve_alpha_cli_prefix(model);
         sds cmd = sdscatprintf(sdsempty(),
-            "./alpha -m %s 'Use web_search to find latest C11 standard details' 2>&1",
-            safe_model);
+            "%s 'Use web_search to find latest C11 standard details' 2>&1",
+            prefix);
+        sdsfree(prefix);
         sds out = run_capture(dir, cmd, 120, &rc);
         sdsfree(cmd);
         if (rc != 0 || !out || strstr(out, "ERROR")) {
@@ -256,9 +286,11 @@ static int run_domain_benchmark(const char *dir, const char *model, sds *report)
         }
         sdsfree(out);
     } else if (is_tools) {
+        sds prefix = evolve_alpha_cli_prefix(model);
         sds cmd = sdscatprintf(sdsempty(),
-            "./alpha -m %s 'List files in current dir and report count' 2>&1",
-            safe_model);
+            "%s 'List files in current dir and report count' 2>&1",
+            prefix);
+        sdsfree(prefix);
         sds out = run_capture(dir, cmd, 120, &rc);
         sdsfree(cmd);
         if (rc != 0 || !out || strstr(out, "ERROR")) {
@@ -504,13 +536,30 @@ static int evolve_warden_smoke(const char *dir, sds *report) {
 
 static int evolve_warden_model_bench(const char *dir, const char *model, sds *report) {
     const char *m = (model && model[0]) ? model : "local";
+    const char *url = (g_evolve_active_cfg && g_evolve_active_cfg->base_url && g_evolve_active_cfg->base_url[0])
+                        ? g_evolve_active_cfg->base_url : getenv("ALPHA_BASE_URL");
+    const char *key = (g_evolve_active_cfg && g_evolve_active_cfg->api_key && g_evolve_active_cfg->api_key[0])
+                        ? g_evolve_active_cfg->api_key : getenv("ALPHA_API_KEY");
+
     warden_limits_t lim = warden_limits_default();
     lim.timeout_ms = 300000; /* 5 minutes (300s) to allow reasoning models sufficient time */
     char out[8192];
 
-    char *const argv[] = {
-        (char *)"./alpha", (char *)"-m", (char *)m, (char *)"hi", NULL
-    };
+    char *argv[16];
+    int argc = 0;
+    argv[argc++] = (char *)"./alpha";
+    if (url && url[0]) {
+        argv[argc++] = (char *)"-u";
+        argv[argc++] = (char *)url;
+    }
+    if (key && key[0]) {
+        argv[argc++] = (char *)"-k";
+        argv[argc++] = (char *)key;
+    }
+    argv[argc++] = (char *)"-m";
+    argv[argc++] = (char *)m;
+    argv[argc++] = (char *)"hi";
+    argv[argc] = NULL;
 
     int rc = warden_execute_capture(dir, "./alpha", argv, &lim, out, sizeof(out));
     if (rc != WARDEN_OK || out[0] == '\0' || strstr(out, "ERROR")) {
@@ -819,6 +868,7 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
     cfg->cwd = root;
     if (cfg->max_turns <= 0) cfg->max_turns = 64;
     setenv("ALPHA_EVOLVE", "1", 1);
+    g_evolve_active_cfg = cfg;
 
     char evdir[PATH_MAX];
     snprintf(evdir, sizeof(evdir), "%s/evolution", root);
@@ -924,9 +974,11 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
         int before_rc = -1;
         struct timespec b_t0, b_t1;
         clock_gettime(CLOCK_MONOTONIC, &b_t0);
+        sds prefix_before = evolve_alpha_cli_prefix(cfg->model);
         sds before_cmd = sdscatprintf(sdsempty(),
-            "ALPHA_MEMORY_DIR=%s ./alpha -m %s 'Use memory tool to add entry bench_before=val_before then retrieve memory' 2>&1",
-            safe_bench_memdir, safe_bm);
+            "ALPHA_MEMORY_DIR=%s %s 'Use memory tool to add entry bench_before=val_before then retrieve memory' 2>&1",
+            safe_bench_memdir, prefix_before);
+        sdsfree(prefix_before);
         sds before_bench = run_capture(sandbox, before_cmd, 300, &before_rc);
         sdsfree(before_cmd); sdsfree(safe_bm);
         clock_gettime(CLOCK_MONOTONIC, &b_t1);
@@ -1032,9 +1084,11 @@ int evolve_run(alpha_cfg_t *cfg, const char *goal, int generations, int reexec) 
             int after_rc = -1;
             struct timespec a_t0, a_t1;
             clock_gettime(CLOCK_MONOTONIC, &a_t0);
+            sds prefix_after = evolve_alpha_cli_prefix(cfg->model);
             sds after_cmd = sdscatprintf(sdsempty(),
-                "ALPHA_MEMORY_DIR=%s ./alpha -m %s 'Use memory tool to add entry bench_after=val_after then retrieve memory' 2>&1",
-                safe_bench_memdir, safe_bm2);
+                "ALPHA_MEMORY_DIR=%s %s 'Use memory tool to add entry bench_after=val_after then retrieve memory' 2>&1",
+                safe_bench_memdir, prefix_after);
+            sdsfree(prefix_after);
             sds after_bench = run_capture(sandbox, after_cmd, 300, &after_rc);
             sdsfree(after_cmd); sdsfree(safe_bm2);
             clock_gettime(CLOCK_MONOTONIC, &a_t1);
