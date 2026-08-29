@@ -36,93 +36,30 @@ static void json_print_escaped(FILE *out, const char *s) {
 }
 
 static cJSON *get_mcp_tools_schema(void) {
+    /* Same 4-tool surface as before, but the schemas come from the tool
+     * registry (tools_schema_window) instead of hand-built copies, so MCP and
+     * the CLI can never drift apart. The registry speaks the OpenAI
+     * {"type":"function","function":{...}} shape; MCP wants
+     * {name, description, inputSchema}. */
+    static const char *names[] = {
+        "execute_powershell", "execute_bash", "read_file", "write_file"
+    };
+    cJSON *window = tools_schema_window(names, 4);
     cJSON *tools = cJSON_CreateArray();
-
-    // 1. execute_powershell
-    {
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, window) {
+        cJSON *fn = cJSON_GetObjectItem(item, "function");
+        if (!fn) continue;
+        const char *name = cJSON_GetStringValue(cJSON_GetObjectItem(fn, "name"));
+        const char *desc = cJSON_GetStringValue(cJSON_GetObjectItem(fn, "description"));
+        cJSON *params = cJSON_GetObjectItem(fn, "parameters");
         cJSON *t = cJSON_CreateObject();
-        cJSON_AddStringToObject(t, "name", "execute_powershell");
-        cJSON_AddStringToObject(t, "description", "Execute PowerShell 7+ commands, pipelines, and scripts on macOS via pwsh.");
-        cJSON *schema = cJSON_CreateObject();
-        cJSON_AddStringToObject(schema, "type", "object");
-        cJSON *props = cJSON_CreateObject();
-        cJSON *cmd = cJSON_CreateObject();
-        cJSON_AddStringToObject(cmd, "type", "string");
-        cJSON_AddStringToObject(cmd, "description", "PowerShell command or script block to run");
-        cJSON_AddItemToObject(props, "command", cmd);
-        cJSON_AddItemToObject(schema, "properties", props);
-        cJSON *req = cJSON_CreateArray();
-        cJSON_AddItemToArray(req, cJSON_CreateString("command"));
-        cJSON_AddItemToObject(schema, "required", req);
-        cJSON_AddItemToObject(t, "inputSchema", schema);
+        if (name) cJSON_AddStringToObject(t, "name", name);
+        if (desc) cJSON_AddStringToObject(t, "description", desc);
+        if (params) cJSON_AddItemToObject(t, "inputSchema", cJSON_Duplicate(params, 1));
         cJSON_AddItemToArray(tools, t);
     }
-
-    // 2. execute_bash
-    {
-        cJSON *t = cJSON_CreateObject();
-        cJSON_AddStringToObject(t, "name", "execute_bash");
-        cJSON_AddStringToObject(t, "description", "Run any terminal/shell command on macOS (zsh, brew, git, curl, docker, etc.) with process tracking.");
-        cJSON *schema = cJSON_CreateObject();
-        cJSON_AddStringToObject(schema, "type", "object");
-        cJSON *props = cJSON_CreateObject();
-        cJSON *cmd = cJSON_CreateObject();
-        cJSON_AddStringToObject(cmd, "type", "string");
-        cJSON_AddStringToObject(cmd, "description", "Shell command to run");
-        cJSON_AddItemToObject(props, "command", cmd);
-        cJSON_AddItemToObject(schema, "properties", props);
-        cJSON *req = cJSON_CreateArray();
-        cJSON_AddItemToArray(req, cJSON_CreateString("command"));
-        cJSON_AddItemToObject(schema, "required", req);
-        cJSON_AddItemToObject(t, "inputSchema", schema);
-        cJSON_AddItemToArray(tools, t);
-    }
-
-    // 3. read_file
-    {
-        cJSON *t = cJSON_CreateObject();
-        cJSON_AddStringToObject(t, "name", "read_file");
-        cJSON_AddStringToObject(t, "description", "Read a file from disk with binary detection.");
-        cJSON *schema = cJSON_CreateObject();
-        cJSON_AddStringToObject(schema, "type", "object");
-        cJSON *props = cJSON_CreateObject();
-        cJSON *p = cJSON_CreateObject();
-        cJSON_AddStringToObject(p, "type", "string");
-        cJSON_AddStringToObject(p, "description", "Path to the file to read");
-        cJSON_AddItemToObject(props, "path", p);
-        cJSON_AddItemToObject(schema, "properties", props);
-        cJSON *req = cJSON_CreateArray();
-        cJSON_AddItemToArray(req, cJSON_CreateString("path"));
-        cJSON_AddItemToObject(schema, "required", req);
-        cJSON_AddItemToObject(t, "inputSchema", schema);
-        cJSON_AddItemToArray(tools, t);
-    }
-
-    // 4. write_file
-    {
-        cJSON *t = cJSON_CreateObject();
-        cJSON_AddStringToObject(t, "name", "write_file");
-        cJSON_AddStringToObject(t, "description", "Write full contents to a file (creates parent directories if needed).");
-        cJSON *schema = cJSON_CreateObject();
-        cJSON_AddStringToObject(schema, "type", "object");
-        cJSON *props = cJSON_CreateObject();
-        cJSON *p = cJSON_CreateObject();
-        cJSON_AddStringToObject(p, "type", "string");
-        cJSON_AddStringToObject(p, "description", "Path to the file to write");
-        cJSON_AddItemToObject(props, "path", p);
-        cJSON *c = cJSON_CreateObject();
-        cJSON_AddStringToObject(c, "type", "string");
-        cJSON_AddStringToObject(c, "description", "Full content to write");
-        cJSON_AddItemToObject(props, "content", c);
-        cJSON_AddItemToObject(schema, "properties", props);
-        cJSON *req = cJSON_CreateArray();
-        cJSON_AddItemToArray(req, cJSON_CreateString("path"));
-        cJSON_AddItemToArray(req, cJSON_CreateString("content"));
-        cJSON_AddItemToObject(schema, "required", req);
-        cJSON_AddItemToObject(t, "inputSchema", schema);
-        cJSON_AddItemToArray(tools, t);
-    }
-
+    cJSON_Delete(window);
     return tools;
 }
 

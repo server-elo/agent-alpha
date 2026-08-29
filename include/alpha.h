@@ -147,9 +147,50 @@ typedef struct alpha_tool_s {
     sds (*run)(cJSON *args, const char *cwd);
 } alpha_tool_t;
 
-/* Tool dispatch: name + args JSON object → result text (caller frees with sdsfree). */
+/* Tool dispatch: name + args JSON object → result text (caller frees with sdsfree).
+ * Dispatch goes through a hash registry (name + aliases), not a linear scan. */
 sds tools_run(const char *name, cJSON *args, const char *cwd);
+
+/* Build the OpenAI-style tools array describing every registered tool.
+ * The result is a cJSON array of function objects, each with name, description,
+ * and parameters schema. Caller must cJSON_Delete the result.
+ *
+ * The array is cached across calls (each tool's schema_json is parsed once);
+ * the cache is invalidated when a new tool is registered. */
 cJSON *tools_schema(void);
+
+/* --- runtime tool registry ---------------------------------------------------
+ * g_registered_tools[] in src/tools.c is the built-in bootstrap manifest; the
+ * registry below is populated lazily from it on first use, and tools_register()
+ * adds more at runtime. All lookup paths (dispatch, schema, search, window)
+ * read the registry, so a registered tool is immediately live. */
+int tools_register(const alpha_tool_t *t);   /* 1 ok / idempotent, 0 rejected (duplicate name/alias) */
+const alpha_tool_t *tools_find(const char *name);   /* name or alias → tool, else NULL */
+int tools_count(void);
+int tools_all(const alpha_tool_t ***out);    /* registration order; do not free */
+
+/* Schema array containing only the named tools (aliases resolve; unknown names
+ * are skipped). Caller must cJSON_Delete the result. */
+cJSON *tools_schema_window(const char **names, int n);
+
+/* The schema to actually send with an LLM request, per ALPHA_TOOLS_MODE:
+ *   full   — always every tool;
+ *   search — always the core window + tools activated via search_tools;
+ *   auto   — full while tools_count() <= ALPHA_TOOL_WINDOW (default 32),
+ *            the window once the catalog outgrows it.
+ * Windowing is safe: the server does not validate tool_calls against the tools
+ * list, and tools_run() dispatches any registered name. */
+cJSON *tools_schema_for_request(void);
+
+/* Session set of tools surfaced by search_tools; included in the window. */
+void tools_activate(const char *name);
+void tools_activation_reset(void);
+
+/* BM25-lite search over name (3x), aliases (3x), category (2x), description
+ * (1x). Returns up to k hits sorted by score (caller free()s), *out_n set.
+ * An empty or matching-nothing query returns NULL with *out_n == 0. */
+typedef struct { const alpha_tool_t *tool; double score; } alpha_tool_hit_t;
+alpha_tool_hit_t *tools_search(const char *query, int k, int *out_n);
 
 /* Persistent memory: load from disk at startup, format for system prompt. */
 void memory_init(void);
@@ -169,14 +210,6 @@ sds memory_format_for_prompt(const char *target);
  * args is a JSON object with the browser action and parameters.
  * Returns the browser output as an sds string (caller frees). */
 sds browser_tool_run(cJSON *args);
-
-/* Build the OpenAI-style tools array describing every tool Alpha supports.
- * The result is a cJSON array of function objects, each with name, description,
- * and parameters schema. Caller must cJSON_Delete the result.
- *
- * The schema is built once per call (not cached) so the tool descriptions can
- * be updated at runtime if needed. */
-cJSON *tools_schema(void);
 
 /* One-shot (no memory). */
 sds agent_run(alpha_cfg_t *cfg, const char *user_text);

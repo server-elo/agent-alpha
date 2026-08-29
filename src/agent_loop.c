@@ -10,6 +10,8 @@ static const char *SYSTEM_PROMPT =
     " in pure C.\n"
     " \n"
     " TOOLS: execute_bash, read_file, write_file, edit_file, list_dir, web_search, browser, memory.\n"
+    " More tools exist than are listed here — discover them with search_tools and fetch\n"
+    " exact schemas with describe_tools; a found tool can be called immediately.\n"
     " Call a tool before claiming any disk or web work. Never report a result you\n"
     " did not observe. If a tool fails, say so and quote the error.\n"
     " You may call several tools at once; each gets its own result.\n"
@@ -469,7 +471,8 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
                 messages_add_text(messages, "user",
                     "[ACTION REQUIRED] You replied with conversational text, but you have NOT modified `src/tools.c` "
                     "or created `tests/custom/test_<name>.c` yet. Evolution requires real code + test diffs. "
-                    "Do NOT reply with text alone. Invoke your tool calls NOW (`write_file`, `edit_file`, or `execute_bash`)!");
+                    "Do NOT reply with text alone. Invoke your tool calls NOW (`write_file`, `edit_file`, or `execute_bash`)! "
+                    "Tools beyond the core set are discovered via `search_tools`.");
                 sdsfree(content);
                 continue;
             }
@@ -509,6 +512,20 @@ static sds run_tool_loop(alpha_cfg_t *cfg, cJSON *messages, sds *tool_notes) {
                                 (double)(t1.tv_sec - t0.tv_sec) +
                                 (double)(t1.tv_nsec - t0.tv_nsec) / 1e9);
             notes_append(tool_notes, name, result);
+
+            /* search_tools hits join the session's tool window (see
+             * tools_schema_for_request), so the model can keep calling a tool
+             * it discovered without searching again on every turn. */
+            if (name && strcmp(name, "search_tools") == 0 &&
+                result && result[0] == '[') {
+                cJSON *hits = cJSON_Parse(result);
+                cJSON *h = NULL;
+                cJSON_ArrayForEach(h, hits) {
+                    const char *hn = cJSON_GetStringValue(cJSON_GetObjectItem(h, "name"));
+                    if (hn) tools_activate(hn);
+                }
+                if (hits) cJSON_Delete(hits);
+            }
 
             cJSON *tr = cJSON_CreateObject();
             cJSON_AddStringToObject(tr, "role", "tool");

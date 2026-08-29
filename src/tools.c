@@ -943,6 +943,7 @@ static void resolve_path(char out[PATH_MAX], const char *path, const char *cwd) 
 #include "tools/tool_gorilla.c"
 #include "tools/tool_scc_dag.c"
 #include "tools/tool_fse_ans.c"
+#include "tools/tool_toolsearch.c"
 
 /* Master Registry Table for all modular C11 tools */
 static const alpha_tool_t *g_registered_tools[] = {
@@ -1010,39 +1011,412 @@ static const alpha_tool_t *g_registered_tools[] = {
     &tool_gorilla,
     &tool_scc_dag,
     &tool_fse_ans,
+    &tool_search_tools,
+    &tool_describe_tools,
     NULL
 };
 
-/* Unified Table-Driven Tool Dispatcher */
+/* ======================================================================
+ * Runtime tool registry, schema cache, BM25 search and windowed delivery
+ * ======================================================================
+ *
+ * g_registered_tools[] above is only the bootstrap manifest. Everything —
+ * dispatch, schema, search — reads the runtime registry below: an
+ * open-addressing FNV-1a hash from name/alias to registry entry. The registry
+ * is populated lazily on first use, so lookup cost is O(1) no matter how large
+ * the catalog grows (the linear scan it replaced was O(n) per tool call, and
+ * tools_schema() re-parsed every schema_json literal on EVERY LLM request). */
+
+typedef struct {
+    const alpha_tool_t *tool;
+    cJSON *schema;      /* schema_json parsed once, on first schema access */
+    char **toks;        /* BM25 index: lowercase tokens, built on first search */
+    double *tokw;       /* per-token field weight: name/alias 3, category 2, desc 1 */
+    int ntok;
+    double doclen;      /* sum of tokw — the BM25 document length */
+} tool_entry_t;
+
+static tool_entry_t *g_entries;
+static int g_nentries;
+static int g_entries_cap;
+
+static const char **g_hkey;     /* slot key — points into the tool's own strings */
+static int *g_hent;             /* slot value: index into g_entries */
+static size_t g_hcap;           /* power of two, 0 = not yet allocated */
+static int g_hused;
+
+static cJSON *g_schema_cache;           /* full schema array; NULL = dirty */
+static const alpha_tool_t **g_all_cache;
+static int g_all_count = -1;
+
+static int g_registry_booted;
+static void tools_registry_boot(void);
+
+static uint32_t tool_hash(const char *s) {
+    uint32_t h = 2166136261u;
+    for (; *s; s++) { h ^= (unsigned char)*s; h *= 16777619u; }
+    return h;
+}
+
+static int reg_lookup(const char *key) {
+    if (!g_hcap) return -1;
+    size_t i = tool_hash(key) & (g_hcap - 1);
+    while (g_hkey[i]) {
+        if (strcmp(g_hkey[i], key) == 0) return g_hent[i];
+        i = (i + 1) & (g_hcap - 1);
+    }
+    return -1;
+}
+
+static void reg_slot_insert(const char **keys, int *ents, size_t cap,
+                            const char *key, int ent) {
+    size_t i = tool_hash(key) & (cap - 1);
+    while (keys[i]) i = (i + 1) & (cap - 1);
+    keys[i] = key;
+    ents[i] = ent;
+}
+
+static void reg_insert(const char *key, int ent) {
+    /* grow at 70% load */
+    if ((size_t)(g_hused + 1) * 10 >= g_hcap * 7) {
+        size_t ncap = g_hcap ? g_hcap * 2 : 128;
+        const char **nk = calloc(ncap, sizeof(*nk));
+        int *ne = malloc(ncap * sizeof(*ne));
+        if (!nk || !ne) { free(nk); free(ne); return; }
+        for (size_t i = 0; i < g_hcap; i++)
+            if (g_hkey[i]) reg_slot_insert(nk, ne, ncap, g_hkey[i], g_hent[i]);
+        free(g_hkey);
+        free(g_hent);
+        g_hkey = nk;
+        g_hent = ne;
+        g_hcap = ncap;
+    }
+    reg_slot_insert(g_hkey, g_hent, g_hcap, key, ent);
+    g_hused++;
+}
+
+/* Registration invalidates every derived structure: the schema array, the
+ * tools_all() view. Per-entry parsed schemas and search tokens survive — they
+ * describe the tool, not the set. */
+static void registry_invalidate(void) {
+    if (g_schema_cache) { cJSON_Delete(g_schema_cache); g_schema_cache = NULL; }
+    g_all_count = -1;
+}
+
+int tools_register(const alpha_tool_t *t) {
+    if (!g_registry_booted) tools_registry_boot();
+    if (!t || !t->name || !t->name[0]) return 0;
+    int existing = reg_lookup(t->name);
+    if (existing >= 0) {
+        if (g_entries[existing].tool == t) return 1;   /* idempotent re-register */
+        fprintf(stderr, "[tools] registration rejected: name '%s' already taken by '%s'\n",
+                t->name, g_entries[existing].tool->name);
+        return 0;
+    }
+    if (g_nentries == g_entries_cap) {
+        int ncap = g_entries_cap ? g_entries_cap * 2 : 64;
+        tool_entry_t *ne = realloc(g_entries, (size_t)ncap * sizeof(*ne));
+        if (!ne) return 0;
+        g_entries = ne;
+        g_entries_cap = ncap;
+    }
+    int idx = g_nentries++;
+    memset(&g_entries[idx], 0, sizeof(g_entries[idx]));
+    g_entries[idx].tool = t;
+    reg_insert(t->name, idx);
+    for (int a = 0; a < 4 && t->aliases[a]; a++) {
+        int clash = reg_lookup(t->aliases[a]);
+        if (clash >= 0 && g_entries[clash].tool != t) {
+            fprintf(stderr, "[tools] registration rejected: alias '%s' of '%s' already "
+                    "used by '%s'\n", t->aliases[a], t->name, g_entries[clash].tool->name);
+            g_nentries--;   /* roll the entry back out */
+            return 0;
+        }
+        reg_insert(t->aliases[a], idx);
+    }
+    registry_invalidate();
+    return 1;
+}
+
+static void tools_registry_boot(void) {
+    if (g_registry_booted) return;
+    g_registry_booted = 1;      /* set first: tools_register() re-enters here */
+    for (int i = 0; g_registered_tools[i]; i++)
+        tools_register(g_registered_tools[i]);
+}
+
+const alpha_tool_t *tools_find(const char *name) {
+    if (!name || !name[0]) return NULL;
+    if (!g_registry_booted) tools_registry_boot();
+    int idx = reg_lookup(name);
+    return idx >= 0 ? g_entries[idx].tool : NULL;
+}
+
+int tools_count(void) {
+    if (!g_registry_booted) tools_registry_boot();
+    return g_nentries;
+}
+
+int tools_all(const alpha_tool_t ***out) {
+    if (!g_registry_booted) tools_registry_boot();
+    if (g_all_count != g_nentries) {
+        free(g_all_cache);
+        g_all_cache = malloc((size_t)(g_nentries ? g_nentries : 1) * sizeof(*g_all_cache));
+        for (int i = 0; i < g_nentries; i++) g_all_cache[i] = g_entries[i].tool;
+        g_all_count = g_nentries;
+    }
+    if (out) *out = g_all_cache;
+    return g_nentries;
+}
+
+/* Unified Tool Dispatcher — hash lookup instead of the old linear scan. */
 sds tools_run(const char *name, cJSON *args, const char *cwd) {
     if (!name || !name[0]) return sdsnew("ERROR: no tool name");
     if (!args) args = cJSON_CreateObject();
-
-    for (int i = 0; g_registered_tools[i]; i++) {
-        const alpha_tool_t *t = g_registered_tools[i];
-        if (strcmp(name, t->name) == 0) {
-            return t->run(args, cwd);
-        }
-        for (int a = 0; a < 4 && t->aliases[a]; a++) {
-            if (strcmp(name, t->aliases[a]) == 0) {
-                return t->run(args, cwd);
-            }
-        }
-    }
-
+    const alpha_tool_t *t = tools_find(name);
+    if (t) return t->run(args, cwd);
     return sdscatprintf(sdsempty(), "ERROR: unknown tool %s", name);
 }
 
-/* Master Tool Schema Builder */
-cJSON *tools_schema(void) {
-    cJSON *root = cJSON_CreateArray();
+static cJSON *tool_schema_cached(tool_entry_t *e) {
+    if (!e->schema && e->tool->schema_json)
+        e->schema = cJSON_Parse(e->tool->schema_json);
+    return e->schema;
+}
 
-    for (int i = 0; g_registered_tools[i]; i++) {
-        if (g_registered_tools[i]->schema_json) {
-            cJSON *item = cJSON_Parse(g_registered_tools[i]->schema_json);
-            if (item) cJSON_AddItemToArray(root, item);
+/* Master Tool Schema Builder — served from a cache; each tool's schema_json is
+ * parsed exactly once, and the assembled array survives until a registration
+ * invalidates it. Callers still own the returned copy. */
+cJSON *tools_schema(void) {
+    if (!g_registry_booted) tools_registry_boot();
+    if (!g_schema_cache) {
+        g_schema_cache = cJSON_CreateArray();
+        for (int i = 0; i < g_nentries; i++) {
+            cJSON *s = tool_schema_cached(&g_entries[i]);
+            if (s) cJSON_AddItemToArray(g_schema_cache, cJSON_Duplicate(s, 1));
         }
     }
+    return cJSON_Duplicate(g_schema_cache, 1);
+}
 
+cJSON *tools_schema_window(const char **names, int n) {
+    if (!g_registry_booted) tools_registry_boot();
+    cJSON *root = cJSON_CreateArray();
+    for (int i = 0; names && i < n; i++) {
+        if (!names[i]) continue;
+        int idx = reg_lookup(names[i]);
+        if (idx < 0) continue;
+        /* the same tool can be named twice (name + alias): skip repeats */
+        int dup = 0;
+        cJSON *it = NULL;
+        cJSON_ArrayForEach(it, root) {
+            const char *nm = cJSON_GetStringValue(cJSON_GetObjectItem(
+                cJSON_GetObjectItem(it, "function"), "name"));
+            if (nm && strcmp(nm, g_entries[idx].tool->name) == 0) { dup = 1; break; }
+        }
+        if (dup) continue;
+        cJSON *s = tool_schema_cached(&g_entries[idx]);
+        if (s) cJSON_AddItemToArray(root, cJSON_Duplicate(s, 1));
+    }
     return root;
+}
+
+/* --- session-activated tools -------------------------------------------------
+ * search_tools hits join the tool window on subsequent turns, so a model that
+ * discovered a tool keeps its schema instead of having to re-search every turn. */
+static const char **g_activated;
+static int g_nactivated;
+static int g_activated_cap;
+
+void tools_activate(const char *name) {
+    const alpha_tool_t *t = tools_find(name);
+    if (!t) return;
+    for (int i = 0; i < g_nactivated; i++)
+        if (strcmp(g_activated[i], t->name) == 0) return;
+    if (g_nactivated == g_activated_cap) {
+        int ncap = g_activated_cap ? g_activated_cap * 2 : 16;
+        const char **na = realloc(g_activated, (size_t)ncap * sizeof(*na));
+        if (!na) return;
+        g_activated = na;
+        g_activated_cap = ncap;
+    }
+    g_activated[g_nactivated++] = t->name;   /* static string, no copy needed */
+}
+
+void tools_activation_reset(void) {
+    g_nactivated = 0;
+}
+
+/* The window sent when the catalog outgrows ALPHA_TOOL_WINDOW: the everyday
+ * core set plus the discovery meta-tools themselves. */
+static const char *g_core_window[] = {
+    "execute_bash", "read_file", "write_file", "edit_file", "list_dir",
+    "web_search", "browser", "memory", "todo", "code_search",
+    "search_tools", "describe_tools", NULL
+};
+
+cJSON *tools_schema_for_request(void) {
+    if (!g_registry_booted) tools_registry_boot();
+    const char *mode = getenv("ALPHA_TOOLS_MODE");
+    if (!mode || !mode[0]) mode = "auto";
+    int window = 32;
+    const char *w = getenv("ALPHA_TOOL_WINDOW");
+    if (w && atoi(w) > 0) window = atoi(w);
+    if (strcmp(mode, "full") == 0) return tools_schema();
+    if (strcmp(mode, "search") != 0 && g_nentries <= window) return tools_schema();
+
+    int ncore = (int)(sizeof(g_core_window) / sizeof(g_core_window[0])) - 1;
+    const char **names = malloc((size_t)(ncore + g_nactivated) * sizeof(*names));
+    if (!names) return tools_schema();
+    int n = 0;
+    for (int i = 0; i < ncore; i++)
+        if (tools_find(g_core_window[i])) names[n++] = g_core_window[i];
+    for (int i = 0; i < g_nactivated; i++) {
+        int seen = 0;
+        for (int j = 0; j < n; j++)
+            if (strcmp(names[j], g_activated[i]) == 0) { seen = 1; break; }
+        if (!seen) names[n++] = g_activated[i];
+    }
+    cJSON *out = tools_schema_window(names, n);
+    free(names);
+    return out;
+}
+
+/* --- BM25-lite tool search ----------------------------------------------------
+ * One document per tool: name (3x) + aliases (3x) + category (2x) +
+ * description (1x), tokenized lowercase on non-alphanumeric runs. Scoring is
+ * BM25 with document-frequency saturation (k1=1.5, b=0.75); df/idf are computed
+ * per query rather than cached, so registration never invalidates an index. */
+
+/* Append lowercase alnum tokens of `text` to the entry, each at weight `w`. */
+static void tool_index_add(tool_entry_t *e, const char *text, double w) {
+    if (!text) return;
+    char tok[256];
+    int tl = 0;
+    for (const char *p = text; ; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (isalnum(c)) {
+            if (tl < (int)sizeof(tok) - 1) tok[tl++] = (char)tolower(c);
+        } else {
+            if (tl) {
+                tok[tl] = 0;
+                char *cp = malloc((size_t)tl + 1);
+                char **nt = realloc(e->toks, (size_t)(e->ntok + 1) * sizeof(*nt));
+                double *nw = realloc(e->tokw, (size_t)(e->ntok + 1) * sizeof(*nw));
+                if (cp && nt && nw) {
+                    memcpy(cp, tok, (size_t)tl + 1);
+                    e->toks = nt;
+                    e->tokw = nw;
+                    e->toks[e->ntok] = cp;
+                    e->tokw[e->ntok] = w;
+                    e->ntok++;
+                    e->doclen += w;
+                } else {
+                    /* allocation failure: skip the token, keep the old arrays
+                     * (a successful realloc of the other array is harmless —
+                     * the count did not change) */
+                    free(cp);
+                    if (nt) e->toks = nt;
+                    if (nw) e->tokw = nw;
+                }
+                tl = 0;
+            }
+            if (!c) break;
+        }
+    }
+}
+
+static void tool_index_build(tool_entry_t *e) {
+    if (e->toks || !e->tool) return;
+    const alpha_tool_t *t = e->tool;
+    tool_index_add(e, t->name, 3.0);
+    for (int a = 0; a < 4 && t->aliases[a]; a++)
+        tool_index_add(e, t->aliases[a], 3.0);
+    tool_index_add(e, t->category, 2.0);
+    tool_index_add(e, t->description, 1.0);
+}
+
+static double tool_tf(const tool_entry_t *e, const char *term) {
+    double tf = 0;
+    for (int i = 0; i < e->ntok; i++)
+        if (strcmp(e->toks[i], term) == 0) tf += e->tokw[i];
+    return tf;
+}
+
+static int hit_cmp(const void *a, const void *b) {
+    double d = ((const alpha_tool_hit_t *)b)->score - ((const alpha_tool_hit_t *)a)->score;
+    if (d > 0) return 1;
+    if (d < 0) return -1;
+    return strcmp(((const alpha_tool_hit_t *)a)->tool->name,
+                  ((const alpha_tool_hit_t *)b)->tool->name);
+}
+
+alpha_tool_hit_t *tools_search(const char *query, int k, int *out_n) {
+    if (out_n) *out_n = 0;
+    if (!query || !query[0]) return NULL;
+    if (!g_registry_booted) tools_registry_boot();
+    if (k <= 0) k = 8;
+
+    /* tokenize the query; dedupe so a repeated term does not score twice */
+    char qtok[16][64];
+    int qn = 0;
+    {
+        char tok[64];
+        int tl = 0;
+        for (const char *p = query; ; p++) {
+            unsigned char c = (unsigned char)*p;
+            if (isalnum(c)) {
+                if (tl < (int)sizeof(tok) - 1) tok[tl++] = (char)tolower(c);
+            } else {
+                if (tl) {
+                    tok[tl] = 0;
+                    int seen = 0;
+                    for (int i = 0; i < qn; i++)
+                        if (strcmp(qtok[i], tok) == 0) { seen = 1; break; }
+                    if (!seen && qn < 16) {
+                        snprintf(qtok[qn], sizeof(qtok[qn]), "%s", tok);
+                        qn++;
+                    }
+                    tl = 0;
+                }
+                if (!c) break;
+            }
+        }
+    }
+    if (qn == 0) return NULL;
+
+    for (int i = 0; i < g_nentries; i++) tool_index_build(&g_entries[i]);
+
+    double avgdl = 0;
+    for (int i = 0; i < g_nentries; i++) avgdl += g_entries[i].doclen;
+    if (g_nentries) avgdl /= g_nentries;
+    if (avgdl <= 0) avgdl = 1;
+
+    const double k1 = 1.5, b = 0.75;
+    alpha_tool_hit_t *hits = malloc((size_t)g_nentries * sizeof(*hits));
+    if (!hits) return NULL;
+    int nh = 0;
+    for (int i = 0; i < g_nentries; i++) {
+        double score = 0;
+        for (int q = 0; q < qn; q++) {
+            double tf = tool_tf(&g_entries[i], qtok[q]);
+            if (tf <= 0) continue;
+            int df = 0;
+            for (int j = 0; j < g_nentries; j++)
+                if (tool_tf(&g_entries[j], qtok[q]) > 0) df++;
+            double idf = log(1.0 + (g_nentries - df + 0.5) / (df + 0.5));
+            double dl = g_entries[i].doclen > 0 ? g_entries[i].doclen : 1;
+            score += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avgdl));
+        }
+        if (score > 0) {
+            hits[nh].tool = g_entries[i].tool;
+            hits[nh].score = score;
+            nh++;
+        }
+    }
+    if (nh == 0) { free(hits); return NULL; }
+    qsort(hits, (size_t)nh, sizeof(*hits), hit_cmp);
+    if (nh > k) nh = k;
+    if (out_n) *out_n = nh;
+    return hits;
 }

@@ -201,24 +201,13 @@ static int llm_progress_cb(void *ud, curl_off_t dt, curl_off_t dn,
  *
  * Well-formed markup is recovered here into real tool calls. Bare "[Calling
  * tool" loops carry no payload and cannot be recovered; the agent loop nudges
- * the model to re-issue those. Only names from tools_schema() (plus the aliases
- * tools_run accepts) are honoured, so prose merely showing an example call can
- * never fire a real tool. */
+ * the model to re-issue those. Only names from the full tool registry (plus the
+ * aliases tools_run accepts) are honoured, so prose merely showing an example
+ * call can never fire a real tool. Validation goes through tools_find(), NOT
+ * the windowed schema that was sent: the model may legitimately call any tool
+ * search_tools surfaced, even one outside the delivered window. */
 static int salvage_name_known(const char *name) {
-    if (!name || !name[0]) return 0;
-    static const char *alias[] = { "bash", "ls", "web_browser", "diff", NULL };
-    for (int i = 0; alias[i]; i++)
-        if (strcmp(name, alias[i]) == 0) return 1;
-    int found = 0;
-    cJSON *schema = tools_schema();
-    cJSON *t = NULL;
-    cJSON_ArrayForEach(t, schema) {
-        const char *n = cJSON_GetStringValue(cJSON_GetObjectItem(
-            cJSON_GetObjectItem(t, "function"), "name"));
-        if (n && strcmp(n, name) == 0) { found = 1; break; }
-    }
-    cJSON_Delete(schema);
-    return found;
+    return tools_find(name) != NULL;
 }
 
 /* Extract name="..." (or name='...') from a tag starting at `tag`.
@@ -459,7 +448,9 @@ static sds build_request_body(const alpha_cfg_t *cfg, cJSON *messages, int with_
     int stream = cfg->stream;
     sds body;
     if (with_tools) {
-        cJSON *tools = tools_schema();
+        /* Windowed delivery: the full catalog once it fits ALPHA_TOOL_WINDOW,
+         * core + search-activated tools otherwise (see tools_schema_for_request). */
+        cJSON *tools = tools_schema_for_request();
         char *tools_s = cJSON_PrintUnformatted(tools);
         cJSON_Delete(tools);
         /* parallel_tool_calls is rejected outright by some OpenAI-compatible
