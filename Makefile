@@ -2,12 +2,12 @@ CC = clang
 CFLAGS = -std=c11 -Wall -Wextra -Werror=return-type -O2 -Iinclude -Ideps -pthread
 LDFLAGS = -lcurl -pthread
 
-SRC = src/main.c src/agent_loop.c src/llm.c src/tools.c src/browser.c src/telegram.c \
+SRC = src/main.c src/agent_loop.c src/llm.c src/tools.c src/web.c src/browser.c src/telegram.c \
       src/provider.c src/ui.c src/evolve.c src/warden.c deps/cJSON.c deps/sds.c
 OBJ = $(SRC:.c=.o)
 TARGET = alpha
 
-MCP_SRC = src/mcp_main.c src/tools.c src/browser.c src/provider.c src/ui.c deps/cJSON.c deps/sds.c
+MCP_SRC = src/mcp_main.c src/tools.c src/web.c src/browser.c src/provider.c src/ui.c deps/cJSON.c deps/sds.c
 MCP_OBJ = $(MCP_SRC:.c=.o)
 MCP_TARGET = alpha-mcp
 
@@ -43,7 +43,7 @@ TEST_BIN = $(TEST_SRC:tests/%.c=tests/bin/%)
 # ran ZERO test binaries and still printed ALL TESTS PASSED — and the evolve
 # gate (which requires the "=== tests/bin/" marker) reverted every generation.
 ALL_TEST_BINS = $(TEST_BIN) $(patsubst tests/custom/%.c,tests/bin/%,$(wildcard tests/custom/test_*.c))
-TEST_DEPS = src/browser.o src/provider.o deps/cJSON.o deps/sds.o
+TEST_DEPS = src/web.o src/browser.o src/provider.o deps/cJSON.o deps/sds.o
 # tests/test_util.h holds the assertion macros: a change there alters what every
 # CHECK means, yet nothing listed it as a prerequisite, so make reported the
 # suite "up to date" and re-ran binaries built against the old definitions.

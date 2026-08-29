@@ -1,7 +1,8 @@
-/* tool_search.c — Web Search (DuckDuckGo HTML) and Code Search */
+/* tool_search.c — c-web keyless web engine + Code Search */
 #include <fnmatch.h>
 #include <regex.h>
 #include <ctype.h>
+#include "../include/web.h"
 
 #define ALPHA_GREP_DEFAULT_MAX 1000
 
@@ -15,204 +16,6 @@ static int file_is_binary(const char *path) {
     return has_nul(buf, n);
 }
 
-struct ws_buf { sds data; };
-static size_t ws_write_cb(char *ptr, size_t sz, size_t nmemb, void *ud) {
-    struct ws_buf *b = ud;
-    size_t n = sz * nmemb;
-    b->data = sdscatlen(b->data, ptr, n);
-    return n;
-}
-
-static size_t url_decode_inplace(char *s) {
-    char *w = s;
-    for (const char *r = s; *r; r++) {
-        if (*r == '%' && r[1] && r[2]) {
-            int hi = r[1] >= 'a' ? r[1] - 'a' + 10 : r[1] >= 'A' ? r[1] - 'A' + 10 : r[1] - '0';
-            int lo = r[2] >= 'a' ? r[2] - 'a' + 10 : r[2] >= 'A' ? r[2] - 'A' + 10 : r[2] - '0';
-            *w++ = (char)((hi << 4) | lo);
-            r += 2;
-        } else if (*r == '+') {
-            *w++ = ' ';
-        } else {
-            *w++ = *r;
-        }
-    }
-    *w = 0;
-    return (size_t)(w - s);
-}
-
-static sds ddg_decode_url(const char *href) {
-    if (!href) return sdsempty();
-    const char *p = strstr(href, "uddg=");
-    if (!p) {
-        if (href[0] == '/' && href[1] == '/') href += 2;
-        return sdsnew(href);
-    }
-    p += 5;
-    sds enc = sdsempty();
-    while (*p && *p != '&') { enc = sdscatlen(enc, p, 1); p++; }
-    url_decode_inplace(enc);
-    return enc;
-}
-
-static void strip_html(char *s) {
-    char *w = s;
-    int in_tag = 0;
-    for (const char *r = s; *r; r++) {
-        if (*r == '<') { in_tag = 1; continue; }
-        if (*r == '>') { in_tag = 0; continue; }
-        if (in_tag) continue;
-        if (strncmp(r, "&amp;", 5) == 0) { *w++ = '&'; r += 4; continue; }
-        if (strncmp(r, "&lt;", 4) == 0)  { *w++ = '<'; r += 3; continue; }
-        if (strncmp(r, "&gt;", 4) == 0)  { *w++ = '>'; r += 3; continue; }
-        if (strncmp(r, "&quot;", 6) == 0) { *w++ = '"'; r += 5; continue; }
-        if (strncmp(r, "&#x27;", 6) == 0) { *w++ = '\''; r += 5; continue; }
-        if (strncmp(r, "&#39;", 5) == 0) { *w++ = '\''; r += 4; continue; }
-        *w++ = *r;
-    }
-    *w = 0;
-}
-
-static void collapse_ws(char *s) {
-    char *w = s;
-    int space = 0;
-    for (const char *r = s; *r; r++) {
-        if (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r') {
-            if (w > s) space = 1;
-            continue;
-        }
-        if (space) { *w++ = ' '; space = 0; }
-        *w++ = *r;
-    }
-    *w = 0;
-    while (w > s && (w[-1] == ' ' || w[-1] == '\t')) { w--; *w = 0; }
-}
-
-static sds web_search(const char *query, int max_results) {
-    if (!query || !query[0])
-        return sdsnew("ERROR: query required for web_search");
-
-    if (max_results <= 0 || max_results > 20) max_results = 10;
-
-    sds enc = sdsempty();
-    for (const unsigned char *p = (const unsigned char *)query; *p; p++) {
-        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
-            (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.' ||
-            *p == '~')
-            enc = sdscatlen(enc, (const char *)p, 1);
-        else if (*p == ' ')
-            enc = sdscatlen(enc, "+", 1);
-        else
-            enc = sdscatprintf(enc, "%%%02X", *p);
-    }
-
-    sds post_body = sdscatprintf(sdsempty(), "q=%s", enc);
-    sdsfree(enc);
-
-    CURL *curl = curl_easy_init();
-    if (!curl) { sdsfree(post_body); return sdsnew("ERROR: curl_easy_init failed"); }
-
-    struct ws_buf buf = { .data = sdsempty() };
-    curl_easy_setopt(curl, CURLOPT_URL, "https://html.duckduckgo.com/html/");
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_body);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ws_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36");
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 12L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-
-    CURLcode res = curl_easy_perform(curl);
-    sdsfree(post_body);
-
-    if (res != CURLE_OK) {
-        sds err = sdscatprintf(sdsempty(), "ERROR: web search request failed: %s",
-                               curl_easy_strerror(res));
-        curl_easy_cleanup(curl);
-        sdsfree(buf.data);
-        return err;
-    }
-
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    curl_easy_cleanup(curl);
-
-    if (http_code != 200) {
-        sds err = sdscatprintf(sdsempty(), "ERROR: web search returned HTTP %ld", http_code);
-        sdsfree(buf.data);
-        return err;
-    }
-
-    sds out = sdsempty();
-    int found = 0;
-    const char *p = buf.data;
-
-    while (found < max_results) {
-        const char *rstart = strstr(p, "class=\"result ");
-        if (!rstart) rstart = strstr(p, "class=\"result__body");
-        if (!rstart) break;
-
-        const char *tlink = strstr(rstart, "class=\"result__a\"");
-        if (!tlink) { p = rstart + 14; continue; }
-
-        const char *hstart = strstr(rstart, "href=\"");
-        if (!hstart || hstart > tlink + 40) { p = tlink + 17; continue; }
-        hstart += 6;
-        const char *hend = strchr(hstart, '"');
-        if (!hend) { p = tlink + 17; continue; }
-
-        sds raw_href = sdsnewlen(hstart, (size_t)(hend - hstart));
-        sds real_url = ddg_decode_url(raw_href);
-        sdsfree(raw_href);
-
-        const char *title_start = strchr(tlink, '>');
-        if (!title_start) { sdsfree(real_url); p = hend + 1; continue; }
-        title_start++;
-        const char *title_end = strstr(title_start, "</a>");
-        if (!title_end) { sdsfree(real_url); p = hend + 1; continue; }
-
-        sds title = sdsnewlen(title_start, (size_t)(title_end - title_start));
-        strip_html(title);
-        collapse_ws(title);
-
-        sds snippet = sdsempty();
-        const char *slink = strstr(title_end, "class=\"result__snippet\"");
-        if (slink) {
-            const char *snip_start = strchr(slink, '>');
-            if (snip_start) {
-                snip_start++;
-                const char *snip_end = strstr(snip_start, "</a>");
-                if (!snip_end) snip_end = strstr(snip_start, "</div>");
-                if (snip_end) {
-                    snippet = sdscatlen(snippet, snip_start, (size_t)(snip_end - snip_start));
-                    strip_html(snippet);
-                    collapse_ws(snippet);
-                }
-            }
-        }
-
-        if (sdslen(title) > 0 && sdslen(real_url) > 0) {
-            found++;
-            out = sdscatprintf(out, "%d. %s\n   URL: %s\n", found, title, real_url);
-            if (sdslen(snippet) > 0)
-                out = sdscatprintf(out, "   %s\n", snippet);
-            out = sdscat(out, "\n");
-        }
-
-        sdsfree(title);
-        sdsfree(real_url);
-        sdsfree(snippet);
-
-        p = title_end + 4;
-    }
-
-    sdsfree(buf.data);
-
-    if (found == 0)
-        out = sdscat(out, "(no results)\n");
-
-    return out;
-}
 
 static sds tool_web_search_run(cJSON *args, const char *cwd) {
     (void)cwd;
@@ -225,13 +28,119 @@ static sds tool_web_search_run(cJSON *args, const char *cwd) {
     return web_search(query, max_results);
 }
 
+static sds tool_web_fetch_run(cJSON *args, const char *cwd) {
+    (void)cwd;
+    const char *url = cJSON_GetStringValue(cJSON_GetObjectItem(args, "url"));
+    if (!url || !url[0]) return sdsnew("ERROR: url required for web_fetch");
+    cJSON *mc = cJSON_GetObjectItem(args, "max_chars");
+    size_t max_chars = (mc && cJSON_IsNumber(mc)) ? (size_t)mc->valueint : 0;
+    return web_fetch(url, max_chars);
+}
+
+static sds tool_web_browse_run(cJSON *args, const char *cwd) {
+    (void)cwd;
+    const char *query = cJSON_GetStringValue(cJSON_GetObjectItem(args, "query"));
+    if (!query || !query[0]) return sdsnew("ERROR: query required for web_browse");
+    int max_results = 4;
+    cJSON *mr = cJSON_GetObjectItem(args, "max_results");
+    if (cJSON_IsNumber(mr)) max_results = mr->valueint;
+    cJSON *mc = cJSON_GetObjectItem(args, "max_chars");
+    size_t max_chars = (mc && cJSON_IsNumber(mc)) ? (size_t)mc->valueint : 0;
+    return web_browse(query, max_results, max_chars);
+}
+
+static sds tool_web_fetch_parallel_run(cJSON *args, const char *cwd) {
+    (void)cwd;
+    cJSON *urls = cJSON_GetObjectItem(args, "urls");
+    if (!urls || !cJSON_IsArray(urls)) return sdsnew("ERROR: urls array required for web_fetch_parallel");
+    int n = cJSON_GetArraySize(urls);
+    if (n == 0) return sdsnew("ERROR: urls array empty");
+    if (n > 8) n = 8;
+    const char *arr[8] = {NULL};
+    for (int i = 0; i < n; i++) {
+        cJSON *u = cJSON_GetArrayItem(urls, i);
+        arr[i] = (u && cJSON_IsString(u)) ? u->valuestring : "";
+    }
+    cJSON *mc = cJSON_GetObjectItem(args, "max_chars");
+    size_t max_chars = (mc && cJSON_IsNumber(mc)) ? (size_t)mc->valueint : 0;
+    return web_fetch_parallel(arr, n, max_chars);
+}
+
+static sds tool_web_job_run(cJSON *args, const char *cwd) {
+    (void)cwd;
+    const char *question = cJSON_GetStringValue(cJSON_GetObjectItem(args, "question"));
+    if (!question) question = cJSON_GetStringValue(cJSON_GetObjectItem(args, "query"));
+    if (!question || !question[0]) return sdsnew("ERROR: question required for web_job");
+    int max_results = 4;
+    cJSON *mr = cJSON_GetObjectItem(args, "max_results");
+    if (cJSON_IsNumber(mr)) max_results = mr->valueint;
+    cJSON *mc = cJSON_GetObjectItem(args, "max_chars");
+    size_t max_chars = (mc && cJSON_IsNumber(mc)) ? (size_t)mc->valueint : 0;
+    return web_job(question, max_results, max_chars);
+}
+
+static sds tool_github_search_run(cJSON *args, const char *cwd) {
+    (void)cwd;
+    const char *query = cJSON_GetStringValue(cJSON_GetObjectItem(args, "query"));
+    if (!query || !query[0]) return sdsnew("ERROR: query required for github_search");
+    int max_results = 5;
+    cJSON *mr = cJSON_GetObjectItem(args, "max_results");
+    if (cJSON_IsNumber(mr)) max_results = mr->valueint;
+    return github_search(query, max_results);
+}
+
 static const alpha_tool_t tool_web_search = {
     .name = "web_search",
     .aliases = {NULL},
     .category = "search",
-    .description = "Search the web via DuckDuckGo HTML (no API key, no JS). Returns title, URL, and snippet for each result. Fast: one HTTP GET, ~0.5-2s.",
-    .schema_json = "{\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"description\":\"Search the web via DuckDuckGo HTML (no API key, no JS). Returns title, URL, and snippet for each result. Fast: one HTTP GET, ~0.5-2s.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Search query\"},\"max_results\":{\"type\":\"integer\",\"description\":\"Max results (1-20, default 10)\"}},\"required\":[\"query\"]}}}",
+    .description = "Keyless web search (Startpage primary, DDG fallback, known-docs seeds, no Brave API). Use web_job for research.",
+    .schema_json = "{\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"description\":\"Keyless web search (Startpage primary, DDG fallback, known-docs seeds, no Brave API). Use web_job for research.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Search query\"},\"max_results\":{\"type\":\"integer\",\"description\":\"Max results (1-20, default 10)\"}},\"required\":[\"query\"]}}}",
     .run = tool_web_search_run
+};
+
+static const alpha_tool_t tool_web_fetch = {
+    .name = "web_fetch",
+    .aliases = {NULL},
+    .category = "web",
+    .description = "Keyless Elo-style fetch: direct HTTP + readability-lite markdown (no Brave).",
+    .schema_json = "{\"type\":\"function\",\"function\":{\"name\":\"web_fetch\",\"description\":\"Keyless Elo-style fetch: direct HTTP + readability-lite markdown (no Brave).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"URL to fetch\"},\"max_chars\":{\"type\":\"integer\",\"description\":\"Max chars to extract\"}},\"required\":[\"url\"]}}}",
+    .run = tool_web_fetch_run
+};
+
+static const alpha_tool_t tool_web_browse = {
+    .name = "web_browse",
+    .aliases = {NULL},
+    .category = "web",
+    .description = "Keyless browse: web_search + parallel fetch as columns (keyless, no Brave).",
+    .schema_json = "{\"type\":\"function\",\"function\":{\"name\":\"web_browse\",\"description\":\"Keyless browse: web_search + parallel fetch as columns (keyless, no Brave).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Search query\"},\"max_results\":{\"type\":\"integer\"},\"max_chars\":{\"type\":\"integer\"}},\"required\":[\"query\"]}}}",
+    .run = tool_web_browse_run
+};
+
+static const alpha_tool_t tool_web_fetch_parallel = {
+    .name = "web_fetch_parallel",
+    .aliases = {NULL},
+    .category = "web",
+    .description = "Fetch multiple URLs in parallel (pthread), each Elo-style markdown.",
+    .schema_json = "{\"type\":\"function\",\"function\":{\"name\":\"web_fetch_parallel\",\"description\":\"Fetch multiple URLs in parallel (pthread), each Elo-style markdown.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"urls\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"max_chars\":{\"type\":\"integer\"}},\"required\":[\"urls\"]}}}",
+    .run = tool_web_fetch_parallel_run
+};
+
+static const alpha_tool_t tool_web_job = {
+    .name = "web_job",
+    .aliases = {NULL},
+    .category = "web",
+    .description = "PRIMARY research one-shot: multi-search + parallel columns + ranked answer pack. Host must not re-search.",
+    .schema_json = "{\"type\":\"function\",\"function\":{\"name\":\"web_job\",\"description\":\"PRIMARY research one-shot: multi-search + parallel columns + ranked answer pack. Host must not re-search.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"question\":{\"type\":\"string\",\"description\":\"Research question\"},\"max_results\":{\"type\":\"integer\"},\"max_chars\":{\"type\":\"integer\"}},\"required\":[\"question\"]}}}",
+    .run = tool_web_job_run
+};
+
+static const alpha_tool_t tool_github_search = {
+    .name = "github_search",
+    .aliases = {NULL},
+    .category = "search",
+    .description = "GitHub repo search (public API, no key).",
+    .schema_json = "{\"type\":\"function\",\"function\":{\"name\":\"github_search\",\"description\":\"GitHub repo search (public API, no key).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Search query\"},\"max_results\":{\"type\":\"integer\"}},\"required\":[\"query\"]}}}",
+    .run = tool_github_search_run
 };
 
 /* Code search */

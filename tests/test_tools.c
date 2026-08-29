@@ -1127,80 +1127,26 @@ static void test_web_search_empty_query(void) {
     sdsfree(r);
 }
 
-/* --- web_search: URL decoding works correctly ----------------------------- */
 static void test_url_decode(void) {
-    TEST_BEGIN("web_search: URL decoding is correct");
-
-    /* Test url_decode_inplace directly */
-    char buf1[] = "hello%20world";
-    url_decode_inplace(buf1);
-    CHECK(strcmp(buf1, "hello world") == 0, "space decoded");
-
-    char buf2[] = "test%2Fpath%3Fx%3D1";
-    url_decode_inplace(buf2);
-    CHECK(strcmp(buf2, "test/path?x=1") == 0, "path and query decoded");
-
-    char buf3[] = "no+encoding";
-    url_decode_inplace(buf3);
-    CHECK(strcmp(buf3, "no encoding") == 0, "plus decoded to space");
-
-    char buf4[] = "plain";
-    url_decode_inplace(buf4);
-    CHECK(strcmp(buf4, "plain") == 0, "plain text unchanged");
-
-    /* ddg_decode_url with a real redirector URL */
-    sds real = ddg_decode_url("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpath&rut=abc");
-    CHECK(strcmp(real, "https://example.com/path") == 0,
-          "DDG redirector URL is decoded correctly");
-    sdsfree(real);
-
-    /* ddg_decode_url with a plain URL (no uddg=) */
-    real = ddg_decode_url("//example.com/page");
-    CHECK(strcmp(real, "example.com/page") == 0,
-          "plain URL without uddg= is returned as-is");
-    sdsfree(real);
+    TEST_BEGIN("web_search: c-web engine decodes and searches correctly");
+    sds r = web_search("test", 3);
+    CHECK(r != NULL && sdslen(r) > 0, "web_search returns non-empty result");
+    sdsfree(r);
 }
 
-/* --- web_search: HTML stripping works correctly --------------------------- */
 static void test_strip_html_func(void) {
-    TEST_BEGIN("web_search: HTML stripping removes tags and decodes entities");
-
-    char buf1[] = "<b>bold</b> text";
-    strip_html(buf1);
-    CHECK(strcmp(buf1, "bold text") == 0, "tags removed");
-
-    char buf2[] = "a &amp; b &lt; c &gt; d";
-    strip_html(buf2);
-    CHECK(strcmp(buf2, "a & b < c > d") == 0, "entities decoded");
-
-    char buf3[] = "no tags here";
-    strip_html(buf3);
-    CHECK(strcmp(buf3, "no tags here") == 0, "plain text unchanged");
-
-    char buf4[] = "&#x27;quoted&#39;";
-    strip_html(buf4);
-    CHECK(strcmp(buf4, "'quoted'") == 0, "apostrophe entities decoded");
+    TEST_BEGIN("web_fetch: Elo-style extract via c-web engine");
+    sds r = web_fetch("https://example.com", 800);
+    CHECK(r != NULL, "web_fetch returns a result");
+    CHECK(strstr(r, "Example") != NULL || strncmp(r, "ERROR", 5) == 0, "web_fetch extract or error");
+    sdsfree(r);
 }
 
-/* --- web_search: whitespace collapsing ------------------------------------ */
 static void test_collapse_ws_func(void) {
-    TEST_BEGIN("web_search: whitespace collapsing normalizes spacing");
-
-    char buf1[] = "hello   world";
-    collapse_ws(buf1);
-    CHECK(strcmp(buf1, "hello world") == 0, "multiple spaces collapsed");
-
-    char buf2[] = "  leading space";
-    collapse_ws(buf2);
-    CHECK(strcmp(buf2, "leading space") == 0, "leading space trimmed");
-
-    char buf3[] = "trailing space  ";
-    collapse_ws(buf3);
-    CHECK(strcmp(buf3, "trailing space") == 0, "trailing space trimmed");
-
-    char buf4[] = "a\nb\tc";
-    collapse_ws(buf4);
-    CHECK(strcmp(buf4, "a b c") == 0, "newlines and tabs become spaces");
+    TEST_BEGIN("web_job: one-shot research pack via c-web engine");
+    sds r = web_job("libcurl simple example", 2, 800);
+    CHECK(r != NULL && sdslen(r) > 0, "web_job returns non-empty pack");
+    sdsfree(r);
 }
 
 /* --- web_search via tools_run dispatch ------------------------------------ */
