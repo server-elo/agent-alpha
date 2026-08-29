@@ -934,6 +934,7 @@ static void resolve_path(char out[PATH_MAX], const char *path, const char *cwd) 
 #include "tools/tool_tokenizer.c"
 #include "tools/tool_tswindow.c"
 #include "tools/tool_wildmatch.c"
+#include "tools/tool_colormap.c"
 #include "tools/tool_html_codec.c"
 #include "tools/tool_colormath.c"
 #include "tools/tool_imhex_struct.c"
@@ -995,6 +996,7 @@ static const alpha_tool_t *g_registered_tools[] = {
     &tool_tokenizer,
     &tool_tswindow,
     &tool_wildmatch,
+    &tool_colormap,
     &tool_html_codec,
     &tool_colormath,
     &tool_imhex_struct,
