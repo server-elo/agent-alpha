@@ -175,10 +175,18 @@ static size_t plain_write_cb(char *ptr, size_t size, size_t nmemb, void *ud) {
 }
 
 /* Ctrl-C during a long generation must abort the HTTP request, not wait for
- * the stall timeout. Returning non-zero from the progress callback does that. */
+ * the stall timeout. Returning non-zero from the progress callback does that.
+ *
+ * The other abort trigger is [DONE]: some servers keep the socket open after
+ * it (observed: an SSE bridge sending keep-alive comments instead of closing).
+ * The heartbeats reset the stall timer, so the turn would hang forever on a
+ * reply that already arrived complete. [DONE] is the stream terminator --
+ * stop reading there. */
 static int llm_progress_cb(void *ud, curl_off_t dt, curl_off_t dn,
                            curl_off_t ut, curl_off_t un) {
-    (void)ud; (void)dt; (void)dn; (void)ut; (void)un;
+    (void)dt; (void)dn; (void)ut; (void)un;
+    stream_state_t *st = ud;
+    if (st && st->done) return 1;
     return alpha_cancel ? 1 : 0;
 }
 
@@ -534,6 +542,7 @@ sds llm_chat_ex(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message,
                      stream ? stream_write_cb : plain_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &st);
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, llm_progress_cb);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &st);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     if (stream) {
         /* No CURLOPT_TIMEOUT: with streaming, a long reply is not a failure.
@@ -554,6 +563,11 @@ sds llm_chat_ex(const alpha_cfg_t *cfg, cJSON *messages, cJSON **out_message,
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
     CURLcode rc = curl_easy_perform(curl);
+    /* The progress callback also aborts on [DONE] (a server holding the socket
+     * open after it). That abort means the stream ended cleanly, so it is a
+     * success, not the user-interrupt path below. */
+    if (rc == CURLE_ABORTED_BY_CALLBACK && st.done && !alpha_cancel)
+        rc = CURLE_OK;
     if (!stream && rc == CURLE_OK) stream_handle_payload(&st, st.pending);
     long http = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http);

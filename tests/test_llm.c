@@ -566,6 +566,20 @@ static void test_salvage_multiple_blocks(void) {
     stream_state_free(&st);
 }
 
+/* A server that holds the socket open after [DONE] (keep-alive comments
+ * instead of closing) must not hang the turn: the progress callback aborts
+ * the transfer once [DONE] has been parsed. */
+static void test_progress_callback_aborts_after_done(void) {
+    TEST_BEGIN("stream: progress callback aborts once [DONE] is seen");
+    stream_state_t st;
+    stream_state_init(&st);
+    CHECK(llm_progress_cb(&st, 0, 0, 0, 0) == 0, "mid-stream: keep reading");
+    feed_in_chunks(&st, "data: [DONE]\n\n", 4);
+    CHECK(st.done == 1, "[DONE] observed");
+    CHECK(llm_progress_cb(&st, 0, 0, 0, 0) == 1, "post-[DONE]: abort the transfer");
+    stream_state_free(&st);
+}
+
 int main(void) {
     test_content_is_independent_of_chunk_boundaries();
     test_utf8_survives_a_split_character();
@@ -590,5 +604,6 @@ int main(void) {
     test_salvage_ignores_payloadless_spam();
     test_salvage_never_overrides_structured_calls();
     test_salvage_multiple_blocks();
+    test_progress_callback_aborts_after_done();
     return test_report("llm");
 }
