@@ -924,6 +924,16 @@ static void resolve_path(char out[PATH_MAX], const char *path, const char *cwd) 
 #include "tools/tool_graph.c"
 #include "tools/tool_semver.c"
 #include "tools/tool_duration.c"
+#include "tools/tool_der.c"
+#include "tools/tool_linkage.c"
+#include "tools/tool_railroad.c"
+#include "tools/tool_resp.c"
+#include "tools/tool_rules.c"
+#include "tools/tool_scope_check.c"
+#include "tools/tool_timecode.c"
+#include "tools/tool_tokenizer.c"
+#include "tools/tool_tswindow.c"
+#include "tools/tool_wildmatch.c"
 
 /* Master Registry Table for all modular C11 tools */
 static const alpha_tool_t *g_registered_tools[] = {
@@ -967,6 +977,16 @@ static const alpha_tool_t *g_registered_tools[] = {
     &tool_graph,
     &tool_semver,
     &tool_duration,
+    &tool_der,
+    &tool_linkage,
+    &tool_railroad,
+    &tool_resp,
+    &tool_rules,
+    &tool_scope_check,
+    &tool_timecode,
+    &tool_tokenizer,
+    &tool_tswindow,
+    &tool_wildmatch,
     NULL
 };
 
