@@ -184,6 +184,85 @@ int main(void) {
     sdsfree(report);
     system("rm -rf /tmp/alpha_cov_root");
 
+    /* --- seal: dynamic protected list ---------------------------------------
+     * SEALED = Makefile, src/evolve.c, src/warden.c + every pre-existing
+     * tests/*.c and tests/custom/*.c. src/agent_loop.c and src/llm.c are now
+     * editable; NEW test files are allowed because they are not snapshotted. */
+    system("rm -rf /tmp/alpha_seal_root && mkdir -p /tmp/alpha_seal_root/src "
+           "/tmp/alpha_seal_root/tests/custom /tmp/alpha_seal_root/sandbox/gen_s/src "
+           "/tmp/alpha_seal_root/sandbox/gen_s/tests/custom");
+    write_file("/tmp/alpha_seal_root/Makefile", "all:\n\t@true\n");
+    write_file("/tmp/alpha_seal_root/src/evolve.c", "/* evolve */\n");
+    write_file("/tmp/alpha_seal_root/src/warden.c", "/* warden */\n");
+    write_file("/tmp/alpha_seal_root/src/agent_loop.c", "/* loop */\n");
+    write_file("/tmp/alpha_seal_root/src/llm.c", "/* llm */\n");
+    write_file("/tmp/alpha_seal_root/tests/test_evolve.c", "/* te */\n");
+    write_file("/tmp/alpha_seal_root/tests/custom/test_old.c", "/* old */\n");
+    system("cp /tmp/alpha_seal_root/Makefile /tmp/alpha_seal_root/sandbox/gen_s/ && "
+           "cp /tmp/alpha_seal_root/src/*.c /tmp/alpha_seal_root/sandbox/gen_s/src/ && "
+           "cp /tmp/alpha_seal_root/tests/test_evolve.c /tmp/alpha_seal_root/sandbox/gen_s/tests/ && "
+           "cp /tmp/alpha_seal_root/tests/custom/test_old.c /tmp/alpha_seal_root/sandbox/gen_s/tests/custom/ && "
+           "cd /tmp/alpha_seal_root && git init -q");
+
+    evolve_hash_table seal;
+    report = NULL;
+    CHECK(evolve_seal_snapshot("/tmp/alpha_seal_root/sandbox/gen_s", &seal, &report) == 1,
+          "seal snapshot succeeds on a clean sandbox");
+    sdsfree(report);
+    CHECK_EQ_INT(seal.count, 5, "seal covers 3 harness files + every pre-existing test file");
+    int has_agent_loop = 0, has_llm = 0, has_test_old = 0, has_test_evolve = 0;
+    for (int i = 0; i < seal.count; i++) {
+        if (strcmp(seal.entries[i].relpath, "src/agent_loop.c") == 0) has_agent_loop = 1;
+        if (strcmp(seal.entries[i].relpath, "src/llm.c") == 0) has_llm = 1;
+        if (strcmp(seal.entries[i].relpath, "tests/custom/test_old.c") == 0) has_test_old = 1;
+        if (strcmp(seal.entries[i].relpath, "tests/test_evolve.c") == 0) has_test_evolve = 1;
+    }
+    CHECK(!has_agent_loop && !has_llm, "src/agent_loop.c and src/llm.c are no longer sealed");
+    CHECK(has_test_old && has_test_evolve, "pre-existing test files are sealed");
+
+    report = NULL;
+    CHECK(evolve_seal_verify("/tmp/alpha_seal_root/sandbox/gen_s", &seal, &report) == 1,
+          "seal verify passes on an untouched sandbox");
+    sdsfree(report);
+
+    /* (b) Editing formerly-protected source files must NOT trip the seal. */
+    write_file("/tmp/alpha_seal_root/sandbox/gen_s/src/agent_loop.c", "/* improved */\n");
+    write_file("/tmp/alpha_seal_root/sandbox/gen_s/src/llm.c", "/* improved */\n");
+    report = NULL;
+    CHECK(evolve_seal_verify("/tmp/alpha_seal_root/sandbox/gen_s", &seal, &report) == 1,
+          "editing src/agent_loop.c and src/llm.c does not trip the seal");
+    sdsfree(report);
+
+    /* (c) Adding a NEW test file must NOT trip the seal. */
+    write_file("/tmp/alpha_seal_root/sandbox/gen_s/tests/custom/test_new.c", "/* new */\n");
+    report = NULL;
+    CHECK(evolve_seal_verify("/tmp/alpha_seal_root/sandbox/gen_s", &seal, &report) == 1,
+          "adding a new test file does not trip the seal");
+    sdsfree(report);
+
+    /* The gate-level check shares the same dynamic list: agent_loop/llm edits
+     * and a new test file must pass it. */
+    report = NULL;
+    CHECK(evolve_git_protected_clean("/tmp/alpha_seal_root/sandbox/gen_s", &report) == 1,
+          "gate accepts agent_loop/llm edits plus a new test file");
+    sdsfree(report);
+
+    /* (a) Modifying an EXISTING test file must fail the seal and the gate. */
+    write_file("/tmp/alpha_seal_root/sandbox/gen_s/tests/custom/test_old.c", "/* tampered */\n");
+    report = NULL;
+    CHECK(evolve_seal_verify("/tmp/alpha_seal_root/sandbox/gen_s", &seal, &report) == 0,
+          "editing a pre-existing test file trips the seal");
+    CHECK(report && strstr(report, "tests/custom/test_old.c"),
+          "seal report names the tampered test file");
+    sdsfree(report);
+    report = NULL;
+    CHECK(evolve_git_protected_clean("/tmp/alpha_seal_root/sandbox/gen_s", &report) == 0,
+          "gate rejects a tampered pre-existing test file");
+    CHECK(report && strstr(report, "tests/custom/test_old.c"),
+          "gate report names the tampered test file");
+    sdsfree(report);
+    system("rm -rf /tmp/alpha_seal_root");
+
     system("rm -rf " FIX " /tmp/alpha_evolve_log /tmp/alpha_evolve_empty");
     return test_report("test_evolve");
 }

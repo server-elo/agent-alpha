@@ -9,7 +9,8 @@
  * - True Sandbox Confinement: cfg->cwd = sandbox during turn execution.
  * - Shell Injection Defense: shell_escape on all interpolated arguments.
  * - Signal & FD Hygiene: SIGCHLD masking around fork/setpgid, fd cleanup 3..1024.
- * - Constant-Time SHA-256 Seal: bitwise XOR comparison across all 6 protected files.
+ * - Constant-Time SHA-256 Seal: bitwise XOR comparison across the sealed
+ *   harness files and every pre-existing test file.
  * - POSIX Advisory File Locking: fcntl(F_SETLKW) on evolution/log.jsonl.
  * - Sanitized Minimal Re-exec: execve with explicit environment whitelist.
  */
@@ -20,6 +21,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <errno.h>
+#include <glob.h>
 #include <signal.h>
 #include <sys/wait.h>
 #ifdef __APPLE__
@@ -308,16 +310,57 @@ static int run_domain_benchmark(const char *dir, const char *model, sds *report)
 
 /* --- Warden cryptographic seal ----------------------------------------------
  * Constant-time comparison prevents timing side-channels.
- * Covers all 6 mission-critical harness files. */
+ * SEALED set: the gate machinery (Makefile, src/evolve.c, src/warden.c) plus
+ * EVERY pre-existing test file (the *.c files under tests/ and tests/custom/
+ * as found in the tree when the generation starts). Everything else — including
+ * src/agent_loop.c and src/llm.c — is editable: the model may improve any
+ * source file as long as the real suite still passes. New test files are
+ * allowed precisely because they are not in the snapshot. */
 
-#define EVOLVE_PROTECTED_COUNT 6
-static const char *EVOLVE_PROTECTED_FILES[EVOLVE_PROTECTED_COUNT] = {
-    "Makefile", "src/evolve.c", "src/agent_loop.c",
-    "tests/test_evolve.c", "src/warden.c", "src/llm.c"
+#define EVOLVE_SEAL_MAX 512
+
+typedef struct { char relpath[256]; char hex[65]; } seal_entry_t;
+typedef struct { seal_entry_t entries[EVOLVE_SEAL_MAX]; int count; } evolve_hash_table;
+
+static const char *EVOLVE_SEAL_STATIC[] = {
+    "Makefile", "src/evolve.c", "src/warden.c"
 };
 
-typedef struct { char hex[65]; } seal_hash_t;
-typedef struct { seal_hash_t files[EVOLVE_PROTECTED_COUNT]; } evolve_hash_table;
+static int evolve_seal_add(evolve_hash_table *t, const char *relpath) {
+    if (t->count >= EVOLVE_SEAL_MAX) return 0;
+    snprintf(t->entries[t->count].relpath,
+             sizeof(t->entries[t->count].relpath), "%s", relpath);
+    t->count++;
+    return 1;
+}
+
+/* Build the sealed-file list for the tree rooted at `root`: the static gate
+ * files plus a sorted glob() of the *.c files under tests/ and tests/custom/.
+ * Entries are root-relative paths. Returns the entry count, 0 on overflow. */
+static int evolve_seal_enumerate(const char *root, evolve_hash_table *t) {
+    memset(t, 0, sizeof(*t));
+    for (size_t i = 0; i < sizeof(EVOLVE_SEAL_STATIC) / sizeof(EVOLVE_SEAL_STATIC[0]); i++)
+        if (!evolve_seal_add(t, EVOLVE_SEAL_STATIC[i])) return 0;
+
+    static const char *globs[] = { "tests/*.c", "tests/custom/*.c" };
+    size_t rl = strlen(root);
+    for (size_t gi = 0; gi < sizeof(globs) / sizeof(globs[0]); gi++) {
+        char pat[PATH_MAX];
+        if (snprintf(pat, sizeof(pat), "%s/%s", root, globs[gi]) >= (int)sizeof(pat))
+            return 0;
+        glob_t g;
+        memset(&g, 0, sizeof(g));
+        /* glob() sorts matches by default; GLOB_NOMATCH (no tests dir) is fine */
+        if (glob(pat, 0, NULL, &g) != 0) { globfree(&g); continue; }
+        for (size_t i = 0; i < g.gl_pathc; i++) {
+            const char *p = g.gl_pathv[i];
+            const char *rel = (strncmp(p, root, rl) == 0 && p[rl] == '/') ? p + rl + 1 : p;
+            if (!evolve_seal_add(t, rel)) { globfree(&g); return 0; }
+        }
+        globfree(&g);
+    }
+    return t->count;
+}
 
 /* Constant-time hex comparison: prevents timing oracle */
 static int seal_hashes_equal(const char *a, const char *b) {
@@ -330,17 +373,23 @@ static int evolve_seal_snapshot(const char *sandbox_dir,
                                 evolve_hash_table *table,
                                 sds *report) {
     if (!sandbox_dir || !table) return 0;
+    /* Enumerate from the sandbox right after setup — at that point it is a
+     * byte-copy of the main tree, so this is the same sealed set. */
+    if (evolve_seal_enumerate(sandbox_dir, table) <= 0) {
+        report_append(report, "FAIL: Warden seal initialization: seal list overflow\n");
+        return 0;
+    }
     sds errors = sdsempty();
     int ok = 1;
-    for (int i = 0; i < EVOLVE_PROTECTED_COUNT; i++) {
+    for (int i = 0; i < table->count; i++) {
         char full[PATH_MAX];
-        snprintf(full, sizeof(full), "%s/%s", sandbox_dir, EVOLVE_PROTECTED_FILES[i]);
+        snprintf(full, sizeof(full), "%s/%s", sandbox_dir, table->entries[i].relpath);
         char hex[65];
         if (warden_sha256_file(full, hex) != WARDEN_OK) {
-            errors = sdscatprintf(errors, "seal: cannot hash %s; ", EVOLVE_PROTECTED_FILES[i]);
+            errors = sdscatprintf(errors, "seal: cannot hash %s; ", table->entries[i].relpath);
             ok = 0;
         } else {
-            memcpy(table->files[i].hex, hex, 65);
+            memcpy(table->entries[i].hex, hex, 65);
         }
     }
     if (!ok) {
@@ -353,20 +402,20 @@ static int evolve_seal_snapshot(const char *sandbox_dir,
 static int evolve_seal_verify(const char *sandbox_dir,
                               evolve_hash_table *table,
                               sds *report) {
-    if (!sandbox_dir || !table) return 0;
+    if (!sandbox_dir || !table || table->count <= 0) return 0;
     sds errors = sdsempty();
     int ok = 1;
-    for (int i = 0; i < EVOLVE_PROTECTED_COUNT; i++) {
+    for (int i = 0; i < table->count; i++) {
         char full[PATH_MAX];
-        snprintf(full, sizeof(full), "%s/%s", sandbox_dir, EVOLVE_PROTECTED_FILES[i]);
+        snprintf(full, sizeof(full), "%s/%s", sandbox_dir, table->entries[i].relpath);
         char hex[65];
         if (warden_sha256_file(full, hex) != WARDEN_OK) {
-            errors = sdscatprintf(errors, "tamper: %s deleted/unreadable; ", EVOLVE_PROTECTED_FILES[i]);
+            errors = sdscatprintf(errors, "tamper: %s deleted/unreadable; ", table->entries[i].relpath);
             ok = 0;
             continue;
         }
-        if (!seal_hashes_equal(table->files[i].hex, hex)) {
-            errors = sdscatprintf(errors, "tamper: %s modified; ", EVOLVE_PROTECTED_FILES[i]);
+        if (!seal_hashes_equal(table->entries[i].hex, hex)) {
+            errors = sdscatprintf(errors, "tamper: %s modified; ", table->entries[i].relpath);
             ok = 0;
         }
     }
@@ -391,25 +440,29 @@ static int evolve_git_protected_clean(const char *build_dir, sds *report) {
     snprintf(gitprobe, sizeof(gitprobe), "%s/.git", root);
     if (!file_exists(gitprobe)) return 1;
 
-    static const char *paths[] = {
-        "Makefile", "src/evolve.c", "src/agent_loop.c",
-        "src/warden.c", "src/llm.c", "tests/test_evolve.c"
-    };
+    /* Same dynamic list as the seal: enumerate from the main tree root and
+     * compare against the sandbox copy. No second hardcoded list. */
+    evolve_hash_table seal;
+    if (evolve_seal_enumerate(root, &seal) <= 0) {
+        report_append(report, "FAIL: protected harness enumeration overflow\n");
+        return 0;
+    }
     int ok = 1;
     sds errors = sdsempty();
-    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+    for (int i = 0; i < seal.count; i++) {
+        const char *rel = seal.entries[i].relpath;
         char a[PATH_MAX], b[PATH_MAX];
         char ha[65], hb[65];
-        snprintf(a, sizeof(a), "%s/%s", root, paths[i]);
-        snprintf(b, sizeof(b), "%s/%s", build_dir, paths[i]);
+        snprintf(a, sizeof(a), "%s/%s", root, rel);
+        snprintf(b, sizeof(b), "%s/%s", build_dir, rel);
         int ra = warden_sha256_file(a, ha);
         int rb = warden_sha256_file(b, hb);
         if (ra != WARDEN_OK || rb != WARDEN_OK) {
-            errors = sdscatprintf(errors, "%s missing/unreadable (%s); ", paths[i],
+            errors = sdscatprintf(errors, "%s missing/unreadable (%s); ", rel,
                                   ra != WARDEN_OK ? "main" : "sandbox");
             ok = 0;
         } else if (!seal_hashes_equal(ha, hb)) {
-            errors = sdscatprintf(errors, "%s modified in sandbox; ", paths[i]);
+            errors = sdscatprintf(errors, "%s modified in sandbox; ", rel);
             ok = 0;
         }
     }
@@ -540,9 +593,9 @@ static int evolve_sandbox_test_coverage(const char *build_dir, sds *report) {
 
     int rc = -1;
     char cmd[PATH_MAX * 4 + 256];
-    /* Behavior changed? The seal already verified the protected harness files
-     * byte-identical, so any remaining src/ or include/ diff is agent-written
-     * feature code. */
+    /* Behavior changed? The seal already verified the sealed harness and
+     * pre-existing test files byte-identical, so any remaining src/ or
+     * include/ diff is agent-written feature code. */
     snprintf(cmd, sizeof(cmd),
         "diff -rq -x '*.o' '%s/src' '%s/src' >/dev/null 2>&1 && "
         "diff -rq '%s/include' '%s/include' >/dev/null 2>&1",
@@ -844,6 +897,24 @@ static int setup_sandbox(const char *root, char sandbox[PATH_MAX], int gen) {
     int ok = (rc == 0);
     sdsfree(out);
 
+    /* Make the sealed files read-only in the sandbox, so an edit_file/
+     * write_file against them fails with EACCES immediately instead of being
+     * discovered by the seal after a full build+test+benchmark cycle. This is
+     * early feedback, not enforcement: the model has execute_bash and could
+     * chmod +w them back, so the driver-side seal remains the real gate. */
+    if (ok) {
+        evolve_hash_table seal;
+        if (evolve_seal_enumerate(sandbox, &seal) > 0) {
+            sds ro_cmd = sdsnew("chmod -w");
+            for (int i = 0; i < seal.count; i++)
+                ro_cmd = sdscatprintf(ro_cmd, " '%s/%s'", sandbox, seal.entries[i].relpath);
+            ro_cmd = sdscat(ro_cmd, " 2>/dev/null; true");
+            sds ro_out = run_capture(root, ro_cmd, 10, &rc);
+            sdsfree(ro_out);
+            sdsfree(ro_cmd);
+        }
+    }
+
     return ok;
 }
 
@@ -861,7 +932,9 @@ static sds build_prompt(const char *root, const char *goal, int gen) {
         "You decide yourself which ONE missing capability is worth porting, and you implement it yourself.\n\n"
         "HARNESS & VERIFICATION:\n"
         "1. DYNAMIC TEST RUNNER: Any test you create in `tests/custom/test_*.c` is automatically compiled and executed by `make test`.\n"
-        "2. PRESERVE THE GATE: `make -j4 && make test` must pass. Never edit the sealed harness files (Makefile, src/evolve.c, src/warden.c, etc.).\n"
+        "2. PRESERVE THE GATE: `make -j4 && make test` must pass. You may improve ANY source file (including src/agent_loop.c and src/llm.c), "
+        "but the gate machinery (Makefile, src/evolve.c, src/warden.c) and every EXISTING test file (tests/*.c, tests/custom/*.c) are read-only "
+        "and hash-sealed — touching one fails the generation. New tests must be added as NEW files.\n"
         "3. POSIX & APPLE SILICON: Write clean C11 (-Wall -Wextra clean) using native Darwin/BSD and POSIX APIs.\n\n"
         "STEP BY STEP (follow in order, do not skip, do not stop early):\n"
         "1. SURVEY (Turn 1): Read `include/alpha.h`, `src/tools.c`, and inspect `src/tools/`.\n"
