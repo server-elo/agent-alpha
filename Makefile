@@ -11,7 +11,7 @@ MCP_SRC = src/mcp_main.c src/tools.c src/browser.c src/provider.c src/ui.c deps/
 MCP_OBJ = $(MCP_SRC:.c=.o)
 MCP_TARGET = alpha-mcp
 
-.PHONY: all clean run telegram repl install test alpha-mcp
+.PHONY: all clean run telegram repl install test alpha-mcp sanitize
 
 all: $(TARGET) $(MCP_TARGET)
 
@@ -119,6 +119,21 @@ run-tests: $(ALL_TEST_BINS)
 		echo "=== $$t ==="; ./$$t || fail=1; \
 	done; \
 	if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; exit 1; fi
+
+# AddressSanitizer + UBSan sweep over the whole suite. Deliberately separate
+# from `test` (which the evolve gate runs on every generation) because it
+# rebuilds the world. The trailing clean+all is not optional: without it the
+# tree is left full of sanitizer-instrumented objects, and the next plain
+# `make` would link them without the sanitizer runtime — the same
+# stale-binary hazard documented above.
+SANITIZE_FLAGS = -fsanitize=address,undefined
+sanitize:
+	@$(MAKE) --no-print-directory clean
+	@$(MAKE) --no-print-directory all CFLAGS="$(CFLAGS) $(SANITIZE_FLAGS)" LDFLAGS="$(LDFLAGS) $(SANITIZE_FLAGS)"
+	@$(MAKE) --no-print-directory $(ALL_TEST_BINS) CFLAGS="$(CFLAGS) $(SANITIZE_FLAGS)" LDFLAGS="$(LDFLAGS) $(SANITIZE_FLAGS)"
+	@$(MAKE) --no-print-directory run-tests
+	@$(MAKE) --no-print-directory clean
+	@$(MAKE) --no-print-directory all
 
 clean:
 	rm -f $(OBJ) $(TARGET)

@@ -1,6 +1,7 @@
 #include "alpha.h"
 #include <curl/curl.h>
 #include <fcntl.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -183,6 +184,59 @@ static void cdp_activate(const char *tab_id) {
     if (body) sdsfree(body);
 }
 
+/* Random per-connection WebSocket key (RFC 6455): 16 bytes from
+ * /dev/urandom, base64-encoded into out[25]. The key used to be the
+ * hardcoded RFC example nonce, so every connection sent the same one. */
+static void ws_gen_key(char out[25]) {
+    unsigned char rnd[16];
+    int ok = 0;
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f) {
+        ok = fread(rnd, 1, sizeof(rnd), f) == sizeof(rnd);
+        fclose(f);
+    }
+    if (!ok) {
+        /* Last-resort fallback when /dev/urandom is missing: mix time, pid
+         * and a stack address through xorshift64. */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t s = (uint64_t)ts.tv_nsec ^ ((uint64_t)ts.tv_sec << 20) ^
+                     ((uint64_t)getpid() << 8) ^ (uint64_t)(uintptr_t)&f;
+        for (size_t i = 0; i < sizeof(rnd); i++) {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            rnd[i] = (unsigned char)(s & 0xff);
+        }
+    }
+    static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int o = 0;
+    for (int i = 0; i < 16; i += 3) {
+        unsigned v = (unsigned)rnd[i] << 16;
+        if (i + 1 < 16) v |= (unsigned)rnd[i + 1] << 8;
+        if (i + 2 < 16) v |= (unsigned)rnd[i + 2];
+        out[o++] = b64[(v >> 18) & 63];
+        out[o++] = b64[(v >> 12) & 63];
+        out[o++] = (i + 1 < 16) ? b64[(v >> 6) & 63] : '=';
+        out[o++] = (i + 2 < 16) ? b64[v & 63] : '=';
+    }
+    out[o] = 0;
+}
+
+/* Validate the upgrade response: the status line must be HTTP/1.x 101 and a
+ * Sec-WebSocket-Accept header must be present. The old check was
+ * strstr(hbuf, "101") — any "101" byte run anywhere in the response passed.
+ * The Accept value itself is not verified against SHA1(key + GUID); there is
+ * no SHA-1 in the tree and the CDP peer is localhost Chrome. */
+static int ws_handshake_ok(const char *hbuf) {
+    if (strncmp(hbuf, "HTTP/", 5) != 0) return 0;
+    const char *sp = strchr(hbuf, ' ');
+    if (!sp || atoi(sp + 1) != 101) return 0;
+    for (const char *l = strchr(hbuf, '\n'); l; l = strchr(l + 1, '\n')) {
+        l++;
+        if (strncasecmp(l, "Sec-WebSocket-Accept:", 21) == 0) return 1;
+    }
+    return 0;
+}
+
 static sds cdp_ws_call_id(const char *ws_url, const char *json_msg, int expect_id) {
     if (!ws_url || strncmp(ws_url, "ws://", 5) != 0)
         return sdsnew("ERROR: need ws:// debugger URL");
@@ -219,17 +273,19 @@ static sds cdp_ws_call_id(const char *ws_url, const char *json_msg, int expect_i
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
+    char ws_key[25];
+    ws_gen_key(ws_key);
     char req[2048];
     snprintf(req, sizeof(req),
              "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-             path, host, port);
+             "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
+             path, host, port, ws_key);
     if (send(fd, req, strlen(req), 0) < 0) { close(fd); return sdsnew("ERROR: ws handshake send"); }
     char hbuf[8192];
     ssize_t hr = recv(fd, hbuf, sizeof(hbuf) - 1, 0);
     if (hr <= 0) { close(fd); return sdsnew("ERROR: ws handshake recv"); }
     hbuf[hr] = 0;
-    if (!strstr(hbuf, "101")) { close(fd); return sdscatprintf(sdsempty(), "ERROR: ws upgrade failed: %.200s", hbuf); }
+    if (!ws_handshake_ok(hbuf)) { close(fd); return sdscatprintf(sdsempty(), "ERROR: ws upgrade failed: %.200s", hbuf); }
 
     size_t plen = strlen(json_msg);
     unsigned char mask[4] = {0x12, 0x34, 0x56, 0x78};

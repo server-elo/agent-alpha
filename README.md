@@ -168,8 +168,9 @@ scripts/alpha-evolve.sh start "goal" 5   # same thing, in the background
   (`--no-reexec` disables). Configuration crosses the exec through the
   environment, never through argv.
 - **`evolution/log.jsonl` is the memory.** The agent reads it each generation
-  and is told not to repeat reverted mutations. `evolution/` is git-ignored,
-  which is also what protects it from the post-revert `git clean`.
+  and is told not to repeat reverted mutations. `evolution/` is git-ignored.
+  A revert restores tracked files with `git reset --hard` and moves untracked
+  files to `evolution/quarantine/gen-NNN/` instead of deleting them.
 
 `ALPHA_EVOLVE=1` is set in the agent's shell so commands can detect the mode.
 Environment: `ALPHA_EVOLVE_GENERATIONS`, `ALPHA_EVOLVE_REEXEC`.
@@ -201,8 +202,11 @@ Two limits worth knowing:
 make test
 ```
 
-665 checks over the tool layer, session handling, the SSE parser, provider
-resolution, config loading, the CDP WebSocket client and the Telegram loop.
+1,505 checks across 39 test binaries (9 core suites plus 30 generated suites
+under `tests/custom/`) over the tool layer, session handling, the SSE parser,
+provider resolution, config loading, the CDP WebSocket client and the
+Telegram loop. `make sanitize` runs the same suite under AddressSanitizer
+and UndefinedBehaviorSanitizer.
 Both the macOS and Linux process-tracking paths are exercised on either host.
 The suite discards its binaries before every
 run: macOS `make` compares mtimes by whole seconds, and a source edited less

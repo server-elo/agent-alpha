@@ -227,7 +227,10 @@ int main(void) {
 
             char cwd[PATH_MAX];
             if (!getcwd(cwd, sizeof(cwd))) {
-                strcpy(cwd, "/Users/lorenc");
+                /* Portable fallback: $HOME, else the filesystem root — never a
+                 * hardcoded user path. */
+                const char *home = getenv("HOME");
+                snprintf(cwd, sizeof(cwd), "%s", (home && home[0]) ? home : "/");
             }
 
             sds output = NULL;

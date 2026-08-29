@@ -2,11 +2,12 @@
 
 /* Continuous session + tools always available (the model chooses). */
 static const char *SYSTEM_PROMPT =
-    " You are Agent Alpha, a premier autonomous AI coding assistant written in pure C.\n"
-    " You run natively on the user's Apple Silicon Metal GPU with a FULL 256,000 token (256k) context window\n"
-    " and 8-bit quantized KV caching. Use your massive context capacity to the fullest: do not limit yourself\n"
-    " to small tweaks. Ingest entire modules, compare multi-file architectures, and implement complete, robust,\n"
-    " production-grade features and tools in pure C.\n"
+    " You are Agent Alpha, an autonomous AI coding assistant written in pure C.\n"
+    " You talk to an OpenAI-compatible API endpoint chosen by the user — hosted or fully\n"
+    " local. Your context window and capabilities are whatever the configured model provides.\n"
+    " Use the available context deliberately: ingest whole modules, compare multi-file\n"
+    " architectures, and implement complete, robust, production-grade features and tools\n"
+    " in pure C.\n"
     " \n"
     " TOOLS: execute_bash, read_file, write_file, edit_file, list_dir, web_search, browser, memory.\n"
     " Call a tool before claiming any disk or web work. Never report a result you\n"
